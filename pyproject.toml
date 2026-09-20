@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slam-lab"
+version = "0.1.0"
+description = "Cache SuperPoint features from videos and inspect them in Rerun."
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+  "av>=14,<19",
+  "numpy>=1.26,<3",
+  "Pillow>=10,<13",
+  "rerun-sdk>=0.38.1,<0.39",
+  "tqdm>=4.66,<5",
+]
+
+[project.optional-dependencies]
+matching = ["threadpoolctl>=3,<4"]
+reconstruction = ["opencv-python-headless>=4.10,<6", "scipy>=1.14,<2"]
+superpoint = [
+  "torch>=2.6,<3",
+  "torchvision>=0.21,<1",
+  "lightglue @ git+https://github.com/cvg/LightGlue.git@eb42fee2d71449efb0aa5c10549752b5d75384d8",
+]
+dev = ["pytest>=8,<10", "ruff>=0.11,<1"]
+
+[project.scripts]
+slam-lab = "slam_lab.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

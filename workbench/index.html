@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0b0e12" />
+    <title>SLAM Workbench</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true"></div>
+          <div>
+            <strong>SLAM Workbench</strong>
+            <span id="source-name">Opening artifact…</span>
+          </div>
+        </div>
+
+        <div class="run-summary">
+          <span id="run-state" class="status-pill status-idle">connecting</span>
+          <div class="progress-copy">
+            <span id="progress-label">0 / 0 pairs</span>
+            <div class="progress-track"><div id="progress-bar"></div></div>
+          </div>
+          <div class="matcher-summary">
+            <span class="eyebrow">Matcher</span>
+            <strong id="matcher-name">—</strong>
+          </div>
+          <span id="matcher-device" class="runtime-pill">—</span>
+        </div>
+      </header>
+
+      <main>
+        <section class="viewer-shell">
+          <div class="viewer-toolbar">
+            <form id="pair-form" class="pair-form">
+              <label>
+                <span>Frame row</span>
+                <input id="first-row" type="number" min="0" inputmode="numeric" required />
+              </label>
+              <span class="pair-arrow">→</span>
+              <label>
+                <span>Frame row</span>
+                <input id="second-row" type="number" min="0" inputmode="numeric" required />
+              </label>
+              <button type="submit">Load pair</button>
+            </form>
+
+            <div class="view-actions">
+              <label class="toggle">
+                <input id="show-lines" type="checkbox" checked />
+                <span>Links</span>
+              </label>
+              <button id="fit-view" class="ghost-button" type="button">Fit view</button>
+            </div>
+          </div>
+
+          <div id="viewport" aria-label="Image correspondence viewer">
+            <div class="frame-labels">
+              <span id="first-label">Frame —</span>
+              <span id="second-label">Frame —</span>
+            </div>
+            <div id="loading" class="loading hidden">Loading pair…</div>
+            <div id="empty-state" class="empty-state">
+              <strong>Select an image pair</strong>
+              <span>Matched features will appear on the image planes.</span>
+            </div>
+          </div>
+        </section>
+
+        <aside class="inspector">
+          <section>
+            <span class="eyebrow">Selected pair</span>
+            <h2 id="pair-title">No pair loaded</h2>
+            <dl class="stats-grid">
+              <div><dt>Matches</dt><dd id="match-count">—</dd></div>
+              <div><dt>Pair runtime</dt><dd id="pair-runtime">—</dd></div>
+              <div><dt>Frame gap</dt><dd id="frame-gap">—</dd></div>
+              <div><dt>Time gap</dt><dd id="time-gap">—</dd></div>
+            </dl>
+          </section>
+
+          <section>
+            <span class="eyebrow">Matcher contract</span>
+            <h3 id="matcher-title">—</h3>
+            <p id="matcher-description" class="muted">Matcher provenance will appear here.</p>
+            <dl id="matcher-fields" class="detail-list"></dl>
+          </section>
+
+          <section>
+            <span class="eyebrow">Feature match</span>
+            <div id="selection-empty" class="selection-empty">
+              Click a colored feature point to inspect its correspondence.
+            </div>
+            <dl id="selection-fields" class="detail-list hidden"></dl>
+          </section>
+
+          <section class="controls-help">
+            <span>Drag to pan</span><span>Scroll to zoom</span><span>Click to inspect</span>
+          </section>
+        </aside>
+      </main>
+
+      <div id="error-toast" class="error-toast hidden" role="alert"></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
