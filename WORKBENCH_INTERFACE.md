@@ -8,6 +8,8 @@ thread. The sections through "Current progress, cancellation and concurrency"
 describe the implemented solver v1. The final "Planned workbench contract" section
 specifies agreed directions from GUI feedback; those additions are **not implemented**.
 The ordered backend task list is [SOLVER_TODO.md](SOLVER_TODO.md).
+The verified result inventory is in [SESSION_HANDOFF.md](SESSION_HANDOFF.md), with
+inspection and experiment commands in [WORKFLOW.md](WORKFLOW.md).
 
 Keep SQLite/NPZ/JSON as the interchange formats. The backend should not emit Three.js
 objects or frontend-specific scene files. The workbench supervises CLI subprocesses,

@@ -79,7 +79,7 @@ Pairs become available while the job runs. Selected-frame rows 100 and 101 are a
 approximately 10.01 and 10.11 seconds in this Osaka cache:
 
 ```bash
-slam-lab view-matches recordings/osaka-allpairs-lightglue --pair 100 101
+.venv/bin/slam-lab view-matches recordings/osaka-allpairs-lightglue --pair 100 101
 ```
 
 Rerun opens a **Match coverage** tab: green points have an appearance match and red
@@ -103,9 +103,9 @@ track ID and observation count; `--min-track-length` only changes the display.
 To save a self-contained recording without opening a GUI:
 
 ```bash
-slam-lab view-matches recordings/osaka-allpairs-lightglue --pair 100 101 \
+.venv/bin/slam-lab view-matches recordings/osaka-allpairs-lightglue --pair 100 101 \
   --save recordings/osaka-lightglue-10s.rrd
-rerun recordings/osaka-lightglue-10s.rrd
+.venv/bin/rerun recordings/osaka-lightglue-10s.rrd
 ```
 
 When matching finishes, the command automatically associates tracks and exports
@@ -116,13 +116,13 @@ skips this optional export for workbench jobs.
 ## Exhaustive cosine baseline
 
 ```bash
-slam-lab match-all \
+.venv/bin/slam-lab match-all \
   .slam-cache/7065fae5d5e9bd54ae4e14d2d5f051960dfe2d14266d89d5e6771fa037786216 \
   --output recordings/osaka-allpairs-cosine \
   --matcher cosine --cosine-threshold 0.8 --workers 4 --max-frames 300 --background
 
-slam-lab match-status recordings/osaka-allpairs-cosine
-slam-lab view-matches recordings/osaka-allpairs-cosine --pair 100 101
+.venv/bin/slam-lab match-status recordings/osaka-allpairs-cosine
+.venv/bin/slam-lab view-matches recordings/osaka-allpairs-cosine --pair 100 101
 ```
 
 This run computes the complete cosine-similarity matrix for every image pair,

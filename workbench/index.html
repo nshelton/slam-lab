@@ -34,20 +34,27 @@
       <main>
         <section class="viewer-shell">
           <div class="viewer-toolbar">
-            <form id="pair-form" class="pair-form">
-              <label>
-                <span>Frame row</span>
-                <input id="first-row" type="number" min="0" inputmode="numeric" required />
-              </label>
-              <span class="pair-arrow">→</span>
-              <label>
-                <span>Frame row</span>
-                <input id="second-row" type="number" min="0" inputmode="numeric" required />
-              </label>
-              <button type="submit">Load pair</button>
-            </form>
+            <div class="toolbar-left">
+              <div id="run-switcher" class="segmented" aria-label="Matcher run"></div>
+              <form id="pair-form" class="pair-form">
+                <label>
+                  <span>Frame row</span>
+                  <input id="first-row" type="number" min="0" inputmode="numeric" required />
+                </label>
+                <span class="pair-arrow">→</span>
+                <label>
+                  <span>Frame row</span>
+                  <input id="second-row" type="number" min="0" inputmode="numeric" required />
+                </label>
+                <button type="submit">Load pair</button>
+              </form>
+            </div>
 
             <div class="view-actions">
+              <div class="segmented mode-switcher" aria-label="Viewer mode">
+                <button id="image-mode" class="active" type="button">Images</button>
+                <button id="matrix-mode" type="button">Matrix</button>
+              </div>
               <label class="toggle">
                 <input id="show-lines" type="checkbox" checked />
                 <span>Links</span>
@@ -62,6 +69,9 @@
               <span id="second-label">Frame —</span>
             </div>
             <div id="loading" class="loading hidden">Loading pair…</div>
+            <div id="matrix-legend" class="matrix-legend hidden">
+              <span>0</span><div></div><span id="matrix-max">max</span>
+            </div>
             <div id="empty-state" class="empty-state">
               <strong>Select an image pair</strong>
               <span>Matched features will appear on the image planes.</span>

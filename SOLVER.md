@@ -95,3 +95,6 @@ The tests check synthetic known poses/scale, outlier rejection, pure rotation,
 planar/low-parallax rejection, raw mask preservation, immutable source matches,
 resume/input invalidation, row-ID mapping, and self-contained Rerun exports.
 GUI schemas and APIs are documented in [WORKBENCH_INTERFACE.md](WORKBENCH_INTERFACE.md).
+The planned backend integration tasks are in [SOLVER_TODO.md](SOLVER_TODO.md).
+For the verified session state and the next LightGlue comparison, see
+[SESSION_HANDOFF.md](SESSION_HANDOFF.md) and [WORKFLOW.md](WORKFLOW.md).

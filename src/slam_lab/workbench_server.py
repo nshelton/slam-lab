@@ -9,7 +9,7 @@ import sqlite3
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from slam_lab.correspondence import MatchStore, match_status
 
@@ -17,8 +17,9 @@ from slam_lab.correspondence import MatchStore, match_status
 class WorkbenchData:
     """Translate an existing match artifact into browser-friendly values."""
 
-    def __init__(self, run: Path):
+    def __init__(self, run: Path, run_id: str | None = None):
         self.run = Path(run).expanduser().resolve()
+        self.run_id = run_id or self.run.name
         if not (self.run / "matches.sqlite3").is_file():
             raise ValueError(f"Not a matching run: {self.run}")
 
@@ -45,8 +46,7 @@ class WorkbenchData:
             ),
         }
 
-    @staticmethod
-    def _frame_info(row: int, frame: dict):
+    def _frame_info(self, row: int, frame: dict):
         return {
             "row": row,
             "frame_index": frame["index"],
@@ -54,7 +54,7 @@ class WorkbenchData:
             "width": frame["width"],
             "height": frame["height"],
             "keypoint_count": len(frame["keypoints"]),
-            "image_url": f"/api/frames/{row}/image",
+            "image_url": f"/api/frames/{row}/image?run={quote(self.run_id)}",
         }
 
     @staticmethod
@@ -102,12 +102,71 @@ class WorkbenchData:
             },
         }
 
+    def matrix(self):
+        with MatchStore(self.run / "matches.sqlite3") as store:
+            size = store.get("frames")
+            counts = [-1] * (size * size)
+            for row in range(size):
+                counts[row * size + row] = -2
+            maximum = 0
+            for first, second, count in store.db.execute(
+                "SELECT first,second,count FROM pairs ORDER BY first,second"
+            ):
+                counts[first * size + second] = count
+                counts[second * size + first] = count
+                maximum = max(maximum, count)
+        return {
+            "size": size,
+            "counts": counts,
+            "max_count": maximum,
+            "matcher": match_status(self.run)["matcher"],
+        }
+
     def image(self, row: int):
         with MatchStore(self.run / "matches.sqlite3") as store:
             return store.frame(row)["jpeg"]
 
 
-def make_handler(data: WorkbenchData, static_root: Path):
+class WorkbenchCatalog:
+    def __init__(self, runs: list[Path]):
+        self.runs = {}
+        for path in runs:
+            candidate = WorkbenchData(path)
+            matcher = candidate.overview()["status"]["matcher"]["name"]
+            base = {
+                "lightglue-superpoint": "lightglue",
+                "cosine-mutual-nearest-neighbor": "cosine",
+                "mutual-nearest-neighbor": "nn",
+            }.get(matcher, candidate.run.name)
+            run_id, suffix = base, 2
+            while run_id in self.runs:
+                run_id, suffix = f"{base}-{suffix}", suffix + 1
+            candidate.run_id = run_id
+            self.runs[run_id] = candidate
+        self.default = next(iter(self.runs))
+
+    def get(self, run_id: str | None):
+        if run_id is None:
+            return self.runs[self.default]
+        if run_id not in self.runs:
+            raise ValueError(f"Unknown matching run: {run_id}")
+        return self.runs[run_id]
+
+    def list(self):
+        return {
+            "default": self.default,
+            "runs": [
+                {
+                    "id": run_id,
+                    "run": str(data.run),
+                    "status": data.overview()["status"],
+                }
+                for run_id, data in self.runs.items()
+            ],
+        }
+
+
+def make_handler(catalog: WorkbenchCatalog, static_root: Path):
     static_root = static_root.resolve()
 
     class WorkbenchHandler(BaseHTTPRequestHandler):
@@ -119,7 +178,11 @@ def make_handler(data: WorkbenchData, static_root: Path):
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                # Browsers routinely abandon superseded status/image requests.
+                pass
 
         def _json(self, value, status=HTTPStatus.OK):
             self._bytes(
@@ -132,10 +195,19 @@ def make_handler(data: WorkbenchData, static_root: Path):
             self._json({"error": message}, status)
 
         def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler API
-            path = unquote(urlparse(self.path).path)
+            parsed = urlparse(self.path)
+            path = unquote(parsed.path)
+            run_id = parse_qs(parsed.query).get("run", [None])[0]
             try:
+                if path == "/api/runs":
+                    self._json(catalog.list())
+                    return
+                data = catalog.get(run_id)
                 if path == "/api/run":
                     self._json(data.overview())
+                    return
+                if path == "/api/matrix":
+                    self._json(data.matrix())
                     return
                 parts = path.strip("/").split("/")
                 if len(parts) == 4 and parts[:2] == ["api", "pairs"]:
@@ -178,7 +250,9 @@ def make_handler(data: WorkbenchData, static_root: Path):
 def parser():
     default_static = Path(__file__).resolve().parents[2] / "workbench" / "dist"
     result = argparse.ArgumentParser(description="Serve a matching run in the SLAM workbench")
-    result.add_argument("run", type=Path, help="Directory containing matches.sqlite3")
+    result.add_argument(
+        "runs", type=Path, nargs="+", help="One or more directories containing matches.sqlite3"
+    )
     result.add_argument("--host", default="127.0.0.1")
     result.add_argument("--port", type=int, default=8765)
     result.add_argument("--static", type=Path, default=default_static)
@@ -187,10 +261,11 @@ def parser():
 
 def main(argv=None):
     args = parser().parse_args(argv)
-    data = WorkbenchData(args.run)
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(data, args.static))
+    catalog = WorkbenchCatalog(args.runs)
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(catalog, args.static))
     print(f"SLAM workbench: http://{args.host}:{args.port}")
-    print(f"Matching run: {data.run}")
+    for run_id, data in catalog.runs.items():
+        print(f"{run_id}: {data.run}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
