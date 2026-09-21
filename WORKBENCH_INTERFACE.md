@@ -5,8 +5,8 @@ Rerun is a presentation adapter, not the processing engine. There is no HTTP/RPC
 service or live event bus. A GUI can supervise CLI subprocesses and read artifacts,
 or wrap the Python API in its own worker process. Avoid running compute in the UI
 thread. The sections through "Current progress, cancellation and concurrency"
-describe the implemented solver v1. The final "Planned workbench contract" section
-specifies agreed directions from GUI feedback; those additions are **not implemented**.
+describe the implemented solver. The final contract section marks implemented identity,
+lineage and status fields separately from the remaining job/snapshot/reader work.
 The ordered backend task list is [SOLVER_TODO.md](SOLVER_TODO.md).
 The verified result inventory is in [SESSION_HANDOFF.md](SESSION_HANDOFF.md), with
 inspection and experiment commands in [WORKFLOW.md](WORKFLOW.md).
@@ -19,6 +19,7 @@ uses reader APIs, and treats persisted state as authoritative.
 
 ```text
 video -> process -> feature cache
+feature cache -> track-online -> causal descriptor landmarks
 feature cache -> match-all -> raw pair matches + appearance-only tracks
 raw pair matches -> verify-matches -> F/E/H + verified tracks
 verified tracks -> solve -> camera poses + reconstructed points
@@ -31,6 +32,9 @@ The CPU environment is `.venv`; CUDA LightGlue uses `.venv-cuda`.
 ```bash
 .venv/bin/slam-lab list
 .venv/bin/slam-lab process /path/to/video.mp4 --max-frames 300 --stride 6
+.venv-cuda/bin/slam-lab track-online /path/to/feature-cache \
+  --output /path/to/online-tracks --device cuda
+.venv/bin/slam-lab track-status /path/to/online-tracks
 .venv-cuda/bin/slam-lab match-all /path/to/feature-cache \
   --output /path/to/matches --matcher lightglue --device cuda --workers 1 --no-rerun
 .venv/bin/slam-lab match-status /path/to/matches
@@ -49,31 +53,35 @@ and zero distortion. These are assumptions, not an estimated calibration.
 Feature extraction, matching and verification can resume. Repeat the same command
 and output path. Changed geometry settings require a new output. `solve` publishes
 a new output directory and refuses to overwrite an existing solution. `--no-rerun`
-is supported by `match-all`, `solve`, and the older `reconstruct` command. Viewer
+is supported by `match-all` and `solve`. Viewer
 commands are separate: `view`, `view-matches`, `view-geometry`, `view-reconstruction`.
 
-The older `reconstruct` command still runs the descriptor-based video-order mapper.
-The workbench should use **verify-matches -> solve** for precomputed correspondences.
+The only supported reconstruction path is **verify-matches -> solve**.
+
+`track-online` is independent of the reconstruction path. It consumes the same
+frame-level SuperPoint cache in order, compares each descriptor only with eligible
+landmark means from earlier frames, enforces one observation per landmark per
+frame, and commits each completed frame to `tracks.sqlite3`. The workbench can read
+the database while it is running through SQLite WAL snapshots. Completed outputs
+also contain `summary.json` and an immutable `manifest.json`. Online track artifacts
+do not copy preview JPEGs; the source feature cache remains their authoritative
+image store and is identified in metadata and lineage.
 
 ## Python entry points
 
 ```python
 from pathlib import Path
-from slam_lab.cache import FrameCache
-from slam_lab.correspondence import MatchStore, match_all, match_status
-from slam_lab.verification import GeometryStore, verify_matches, geometry_status
-from slam_lab.solver import ReconstructionProblem, solve_geometry
+from slam_lab.reader import ArtifactReader
 
-with MatchStore(Path("recordings/osaka-allpairs-lightglue/matches.sqlite3")) as store:
-    frame = store.frame(100)       # dict: index, timestamp_ns, width, height, jpeg, keypoints
-    matches = store.pair(100, 101) # PairMatches: indices[N,2], scores[N], distances[N]
+matches = ArtifactReader(Path("recordings/osaka-allpairs-lightglue"))
+frame = matches.frame(100)
+pair = matches.pair(100, 101)
 
-with GeometryStore(Path("recordings/osaka-cosine-geometry-step10/geometry.sqlite3")) as store:
-    arrays, diagnostics = store.pair(100, 110)
+geometry = ArtifactReader(Path("recordings/osaka-cosine-geometry-step10"))
+diagnostics = geometry.pair(100, 110)
 
-summary = verify_matches(Path("matches"), Path("geometry"), progress=False)
-problem = ReconstructionProblem.load(Path("geometry"))
-result_path = solve_geometry(Path("geometry"), Path("solution"), progress=False)
+solution = ArtifactReader(Path("recordings/osaka-lightglue-solver-v5"))
+arrays = solution.load_reconstruction()
 ```
 
 Core functions do not spawn a viewer. `match_all(..., export=False)` is the default
@@ -82,12 +90,13 @@ the output `Path`. Failures raise exceptions. The CLI returns nonzero on failure
 stdout is not uniformly a JSON protocol. Only `match-status` and `geometry-status`
 promise a single JSON object. Capture stdout/stderr as job logs for other commands.
 
-`ReconstructionProblem` carries a fixed camera, descriptor-free image observations,
+`ArtifactReader` is the only supported read interface. Compute functions remain available
+for workers and tests. `ReconstructionProblem` carries a fixed camera, descriptor-free image observations,
 observation-to-track IDs, track lengths, ranked seed candidates and provenance.
 The initial `GraphMapper` backend uses all available 2D–3D tracks for registration;
 it does not invoke SuperPoint, LightGlue, or nearest-neighbor matching. Other solver
 backends can consume the same observations and tracks. Full F/E/H view-graph records
-remain available through `GeometryStore`.
+remain available through the geometry artifact reader.
 
 ## IDs and coordinate conventions
 
@@ -116,27 +125,28 @@ The final reconstruction is also arbitrary-scale; seed baseline = 1, not meters.
 ## Current match artifacts
 
 `matches.sqlite3` is authoritative. Prefer the reader class over decoding blobs.
-The table descriptions below explain today's storage, not a guarantee that the raw
-SQLite schema is a stable public API. The planned reader facade isolates migrations.
+The table descriptions below explain today's storage; raw SQL remains internal.
 
 * `metadata(key TEXT PRIMARY KEY, value TEXT)` stores JSON values: identity, active
   matcher, phase, frame count, source/cache paths, timing and final summary.
-* `frames(row_id, frame_index, timestamp_ns, width, height, jpeg, keypoints,
-  keypoint_count)` contains JPEG bytes and raw little-endian float32 Nx2 coordinates.
+* `frames(row_id, frame_index, timestamp_ns, width, height, keypoints,
+  keypoint_count)` contains raw little-endian float32 Nx2 coordinates. Images are
+  addressed in the source video by timestamp.
 * `pairs(first, second, count, matches, elapsed_ms, runtime_id)` stores one upper
   triangle entry per pair. `matches` is zlib-compressed structured data with fields
   `first:int32`, `second:int32`, `score:float32`, `distance:float32` (little endian).
 * `match_runtimes(runtime_id, provenance)` identifies CPU/GPU/PyTorch provenance per
-  pair. Older runs may lack this table/column; use `MatchStore.runtime_summary()`.
+  pair.
 
 `tracks.npz` here contains **appearance-only** tracks. It is not solver input.
 `track_ids[offsets[i]:offsets[i+1]]` maps keypoints in matching row i to track IDs.
 Additional arrays: `track_lengths`, `pair_match_counts`, `frame_indices`, `timestamps_ns`.
+`manifest.json` identifies this root artifact and hashes the database, tracks and summary.
 
 ## Current geometry artifacts
 
-`geometry.sqlite3` contains its own selected previews/keypoints; it can be viewed
-without the feature cache or raw match run. Source matches remain unchanged.
+`geometry.sqlite3` contains its own selected keypoints and references the source video
+through its parent artifacts. Source matches remain unchanged.
 
 * `metadata` holds JSON: `identity` (source identity, selected rows, camera, config,
   estimator/OpenCV version), `phase`, `tracks_identity`, `source_match_run`, summary.
@@ -170,6 +180,8 @@ scalar `geometry_identity`. Unlike appearance tracks, these use only verified ed
 Association orders edges by geometric residual and enforces one feature per image.
 Raw pair records preserve the edges; individual union-conflict decisions are not yet
 exported (only counts). Tracks are candidates subject to multiview rejection.
+`manifest.json` binds this artifact to the exact matching parent and hashes its database,
+tracks and summary. Verification rejects missing, modified or mismatched parents.
 
 ## Current reconstruction artifacts
 
@@ -182,17 +194,22 @@ exported (only counts). Tracks are candidates subject to multiview rejection.
 | `registered` | F boolean mask; never interpolate missing poses implicitly |
 | `frame_indices`, `timestamps_ns` | F original frame IDs and nanosecond timestamps |
 | `K` | Shared fixed 3x3 pinhole intrinsic matrix |
-| `observations` | O x 3 integers: solution row, point ID, frame-local feature ID |
+| `observations` | O x 3 integers: solution row, point array row, frame-local feature ID |
 | `observation_xy` | O x 2 observed cached-image coordinates |
 | `reprojection_errors` | O residual lengths in pixels, after final filtering |
 | `track_lengths` | P surviving observation counts |
+| `frame_rows` | F original matching rows; present in new graph-solver artifacts |
+| `source_track_ids` | P verified geometry-track IDs; present in new graph-solver artifacts |
+| `point_ids` | P job-scoped stable point IDs; present in new graph-solver artifacts |
 
 `poses.json` holds per-frame status, pose or null, support and PnP counts.
 `metadata.json` records input paths/identity, camera assumptions, solver settings,
 seed/third-view decisions, BA report, counts and limitations. `points.ply` is a
 convenient point-cloud export. `ransac.npz`/`ransac.json` hold raw PnP/seed decisions
-separately from final retained observations. Original verified track IDs are not
-currently exported as a point-ID mapping; use `(solution row, feature ID)` to join.
+separately from final retained observations. Reconstruction artifacts also export
+`frame_rows`, `source_track_ids`, and stable `point_ids`.
+New outputs include `manifest.json` with their opaque reconstruction ID, producer job,
+declared capabilities, and SHA-256/size inventory for all core payloads.
 
 The first solver is a prototype graph-based incremental backend with final joint
 BA, not global SfM. It reconstructs one seed-connected component, tries up to 50
@@ -212,17 +229,15 @@ matcher/runtime provenance. `geometry-status`: `running`, `phase`, completed pai
 completion flag, last error and final summary. Check `running` as well as phase;
 a killed process can leave its last phase unchanged. Rate/ETA can also be stale.
 
-Verification can inspect a matching run that is still growing. It takes the available
-pair list at start; repeat the same command later to add newly matched pairs and
-rebuild tracks. `complete` means that geometry snapshot is complete, not that all
-possible image pairs were matched. Read tracks only when geometry is complete.
-Snapshot identity changes when more pairs are included. Avoid re-verifying the same
-geometry directory while solving from it; the GUI should serialize those jobs.
+Verification consumes only a completed, manifested matching artifact. Completed geometry
+is immutable: repeating the same command validates and returns it, while changed inputs,
+settings, payloads or parents require a new output directory.
 
 Send SIGINT for graceful cancellation of matching/verification. Committed pairs
-remain resumable. `solve` currently has no persistent progress endpoint or checkpoint;
-supervise its process and capture its progress/log output. It publishes the final
-artifact directory atomically after success; an interrupted solve must restart.
+remain resumable. `solve` now writes atomic structured progress under
+`jobs/<job-id>/status.json`; read it with `solve-status <output-or-job-directory>` or
+`ArtifactReader.status()`. It still has no checkpoint/resume support. It publishes
+the final artifact directory atomically after success; an interrupted solve must restart.
 
 `.rrd` files are optional exported snapshots, not live state or a data interchange
 requirement. Rerun calls live in `viewer.py`, `match_view.py`, `geometry_view.py`,
@@ -230,11 +245,10 @@ the viewing half of `reconstruction_io.py`, and `ransac_view.py` logging helpers
 
 ## Planned workbench contract — not yet implemented
 
-Prioritize cross-stage selection and structured solve status before the UI depends
-on them. Artifact identity is a prerequisite for trustworthy selection. Live
-snapshots and the shared job layout can follow without blocking an initial viewer
-of completed results. None of the proposed fields or reader methods below should
-be assumed present in existing recordings.
+Stable mappings, mandatory matching/geometry/reconstruction manifests, immutable
+cross-stage ancestry, structured solve status and the minimal reconstruction reader are
+implemented. Solve provenance and immutable published-artifact pagination are also
+implemented. Live snapshots, live draft pagination and crash reconciliation remain planned.
 
 ### Stable observation and point mappings
 
@@ -290,8 +304,8 @@ identity and explicit frame mapping; matching-row numbers alone are insufficient
 
 ### Artifact identities and ancestry
 
-Every newly published feature, matching, geometry and reconstruction artifact gets
-`manifest.json`. A minimal geometry example is:
+Every completed matching, geometry and reconstruction artifact gets `manifest.json`.
+A minimal geometry example is:
 
 ```json
 {
@@ -314,29 +328,18 @@ Every newly published feature, matching, geometry and reconstruction artifact ge
 Artifact IDs are opaque IDs reserved before computation and immutable after
 publication. They are not filesystem paths or hashes of configuration alone.
 Payload hashes verify content; existing selection/configuration hashes remain useful
-cache keys but do not replace artifact IDs. `schema_version` versions this new
-manifest envelope separately from legacy metadata; payload schema/capabilities must
-also be declared so readers can detect the new mapping arrays.
+cache keys but do not replace artifact IDs. `schema_version` versions the manifest
+envelope; capabilities declare optional payload fields such as reconstruction mappings.
 
-Use the direct immutable parent: features -> matches -> geometry -> reconstruction.
-Root/imported artifacts may have a null parent with explicit origin provenance.
+Use the direct immutable chain: matches -> geometry -> reconstruction. Matching is the
+self-contained root and records its feature-cache snapshot origin.
 Paths are locators and may change without changing IDs. Readers validate ancestry
 before joining data. Include `matching_artifact_id` in downstream metadata as a
 convenient, validated reference to the observation namespace.
 
-The current pipeline allows geometry to grow in place and rebuild its tracks after
-it reports complete. That is **legacy behavior**, not the target immutability rule.
-Under the new contract, resume may extend an unpublished job's draft. Extending a
-published result creates a new artifact ID and leaves the old result unchanged.
-An identical completed rerun may simply return the existing artifact.
-
-Geometry that consumes a still-growing match run must bind to a frozen matching
-artifact representing exactly the consumed pair set. Publication may seal a partial
-matching result first, while matching continues in a separate draft. Store coverage
-(`available_pairs`, `possible_pairs`, selection and policy) so `complete` describes
-publication of the declared scope, not exhaustive matching or successful registration
-of every image. A new frozen matching artifact is a new observation namespace;
-cross-version links require the explicit shared feature mapping described above.
+Resume may extend an unpublished matching or geometry draft. A published result is
+immutable; changed inputs or settings require a new output and artifact ID. An identical
+completed rerun validates and returns the existing artifact.
 
 ### Common lifecycle and solve progress
 
@@ -402,7 +405,7 @@ need an explicit compatibility adapter rather than silently changing their meani
 
 ### Jobs, invocation and optional snapshots
 
-Target layout (new behavior; existing `--output` paths remain legacy inputs):
+Target layout for the remaining job-workspace work:
 
 ```text
 workspace/
@@ -447,7 +450,7 @@ and must be marked as such rather than presented as the accepted reconstruction.
 
 ### Publication invariants
 
-These are implementation requirements, not guarantees of the legacy writer:
+These are implementation requirements:
 
 1. Finish and close payloads before a manifest/status references them. JSON updates
    use a temporary file in the same directory followed by atomic replacement.
@@ -469,7 +472,7 @@ These are implementation requirements, not guarantees of the legacy writer:
 7. `complete` guarantees all files referenced by the manifest are readable, even for
    a declared partial selection or a reconstruction with unregistered frames.
 
-### Reader facade and compatibility
+### Reader facade
 
 Provide a versioned facade over current storage, with capabilities by artifact type:
 
@@ -496,12 +499,22 @@ and validate that scope on reuse. Keep read transactions short and never mutate 
 from a reader.
 
 `load_snapshot(None)` reads status first and opens the referenced file; if none has
-been published it returns no snapshot. Readers must reject unsupported schema versions
-and expose unavailable legacy fields as unavailable, rather than fabricating ancestry
-or stable IDs from paths. Legacy recordings remain readable through an adapter. Any
-upgrade that assigns identities and mappings creates a new artifact rather than
-modifying a completed legacy result in place.
+been published it returns no snapshot. Readers reject unsupported schema versions,
+missing manifests, invalid payload hashes and mismatched ancestry.
 
-The facade is the supported GUI boundary. SQL tables, zlib layouts, internal mapper
-objects and progress-bar text are implementation details. Existing `frame()` and
-`pair()` methods work today; the shared facade and other methods above remain planned.
+`ArtifactReader` is the supported GUI boundary for published matching, geometry and
+reconstruction artifacts. SQL tables, zlib layouts, internal mapper objects and
+progress-bar text are implementation details. Pagination of immutable published frames
+and pairs is implemented; live draft cursors, `data_revision`, and snapshots remain planned.
+
+```python
+from pathlib import Path
+from slam_lab.reader import ArtifactReader
+
+reader = ArtifactReader(Path("recordings/osaka-lightglue-solver-v5"))
+status = reader.status()
+reconstruction = reader.load_reconstruction()
+point_row = 0
+stable_point_id = reconstruction["point_ids"][point_row]
+source_track_id = reconstruction["source_track_ids"][point_row]
+```

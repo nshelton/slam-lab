@@ -63,9 +63,7 @@ def log_pnp(data, row, frame, status):
     import rerun as rr
 
     trace = pnp_record(data, row)
-    rr.log("ransac/image", rr.EncodedImage(contents=frame.jpeg, media_type="image/jpeg"))
     rr.log("ransac/image/decisions", rr.Clear(recursive=True))
-    rr.log("fit/image", rr.EncodedImage(contents=frame.jpeg, media_type="image/jpeg"))
     rr.log("fit/image/residuals", rr.Clear(recursive=True))
     xy = trace.get("xy", np.empty((0, 2)))
     tested = bool(trace.get("ransac_ran", False))
@@ -139,7 +137,6 @@ def log_seed(data, frame, row):
         return
     side = "first" if row == seed_frames[0] else "second"
     root = f"seed_{side}/image"
-    rr.log(root, rr.EncodedImage(contents=frame.jpeg, media_type="image/jpeg"), static=True)
     xy, raw = data[f"seed/xy_{side}"], data["seed/ransac_inliers"]
     for name, chosen, color in (("inliers", raw, GREEN), ("outliers", ~raw, RED)):
         if chosen.any():

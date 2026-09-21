@@ -1,14 +1,15 @@
 """Inspect cached raw RANSAC decisions without re-estimating geometry."""
 
 import json
-from io import BytesIO
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
+from slam_lab.correspondence import MatchStore
 from slam_lab.rerun_support import init_recording
 from slam_lab.verification import GeometryStore
+from slam_lab.video import VideoReader
 
 
 def view_geometry(path, *, pair=None, output=None):
@@ -36,7 +37,24 @@ def view_geometry(path, *, pair=None, output=None):
             a, b = sorted(pair)
         data, summary = store.pair(a, b)
         first, second = store.frame(a), store.frame(b)
-        left, right = (Image.open(BytesIO(f["jpeg"])).convert("RGB") for f in (first, second))
+        match_run = Path(store.get("source_match_run"))
+        with MatchStore(match_run / "matches.sqlite3") as matches:
+            source = Path(matches.get("source"))
+        decoded = {}
+        if source.is_file():
+            wanted = {first["index"], second["index"]}
+            with VideoReader(source) as reader:
+                for frame in reader.frames(
+                    stride=1, max_side=max(first["width"], first["height"])
+                ):
+                    if frame.index in wanted:
+                        decoded[frame.index] = Image.fromarray(frame.image)
+                    if len(decoded) == 2:
+                        break
+        left = decoded.get(first["index"], Image.new("RGB", (first["width"], first["height"])))
+        right = decoded.get(
+            second["index"], Image.new("RGB", (second["width"], second["height"]))
+        )
         canvas = Image.new("RGB", (left.width + right.width, max(left.height, right.height)))
         canvas.paste(left, (0, 0))
         canvas.paste(right, (left.width, 0))

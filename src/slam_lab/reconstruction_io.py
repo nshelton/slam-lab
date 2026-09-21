@@ -2,12 +2,11 @@
 
 import json
 import tempfile
-from io import BytesIO
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
 
+from slam_lab.artifacts import opaque_id, write_manifest
 from slam_lab.cache import FrameCache, resolve_cache
 from slam_lab.ransac_view import load_diagnostics, log_pnp, log_seed, save_diagnostics
 
@@ -25,26 +24,28 @@ def reconstruction_frames(metadata, cache_path=None):
             yield from cache.frames(descriptors=False)
 
 
-def save_reconstruction(output, mapper, points, observations, xy, errors, metadata):
+def save_reconstruction(
+    output,
+    mapper,
+    points,
+    observations,
+    xy,
+    errors,
+    metadata,
+    *,
+    frame_rows=None,
+    point_ids=None,
+    source_track_ids=None,
+    artifact_id=None,
+    parent_artifact_id=None,
+    producer_job_id=None,
+):
     states = mapper.frames
     transforms = np.full((len(states), 4, 4), np.nan)
     valid = np.array([state.pose is not None for state in states])
     for index in np.flatnonzero(valid):
         transforms[index] = np.linalg.inv(states[index].pose)
-    colors = np.zeros((len(points), 3), dtype=np.uint8)
-    colored = np.zeros(len(points), bool)
-    for frame_id, state in enumerate(states):
-        selected = observations[:, 0] == frame_id
-        ids, pixels = observations[selected, 1], xy[selected]
-        fresh = ~colored[ids]
-        if not fresh.any():
-            continue
-        image = np.asarray(Image.open(BytesIO(state.frame.jpeg)).convert("RGB"))
-        pixels = np.rint(pixels[fresh]).astype(int)
-        pixels[:, 0] = np.clip(pixels[:, 0], 0, image.shape[1] - 1)
-        pixels[:, 1] = np.clip(pixels[:, 1], 0, image.shape[0] - 1)
-        colors[ids[fresh]] = image[pixels[:, 1], pixels[:, 0]]
-        colored[ids[fresh]] = True
+    colors = np.full((len(points), 3), 210, dtype=np.uint8)
     support = np.bincount(observations[:, 1], minlength=len(points))
     frame_support = np.bincount(observations[:, 0], minlength=len(states))
     poses = [
@@ -60,10 +61,16 @@ def save_reconstruction(output, mapper, points, observations, xy, errors, metada
         for index, state in enumerate(states)
     ]
     output.parent.mkdir(parents=True, exist_ok=True)
+    artifact_id = artifact_id or opaque_id("reconstruction")
+    metadata = {
+        **metadata,
+        "artifact_id": artifact_id,
+        "producer_job_id": producer_job_id,
+        "source_geometry_artifact_id": parent_artifact_id,
+    }
     with tempfile.TemporaryDirectory(prefix=f".{output.name}-", dir=output.parent) as temporary:
         root = Path(temporary)
-        np.savez_compressed(
-            root / "reconstruction.npz",
+        arrays = dict(
             points=points,
             colors=colors,
             track_lengths=support,
@@ -76,6 +83,17 @@ def save_reconstruction(output, mapper, points, observations, xy, errors, metada
             observation_xy=xy,
             reprojection_errors=errors,
         )
+        capabilities = []
+        if frame_rows is not None:
+            arrays["frame_rows"] = np.asarray(frame_rows, dtype=np.int64)
+            capabilities.append("matching_frame_rows")
+        if point_ids is not None:
+            arrays["point_ids"] = np.asarray(point_ids, dtype=np.int64)
+            capabilities.append("stable_point_ids")
+        if source_track_ids is not None:
+            arrays["source_track_ids"] = np.asarray(source_track_ids, dtype=np.int64)
+            capabilities.append("source_track_lineage")
+        np.savez_compressed(root / "reconstruction.npz", **arrays)
         (root / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
         (root / "poses.json").write_text(json.dumps(poses, indent=2) + "\n")
         (root / "matching.json").write_text(json.dumps(mapper.pair_counts, indent=2) + "\n")
@@ -87,6 +105,25 @@ def save_reconstruction(output, mapper, points, observations, xy, errors, metada
                 "property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n"
             )
             np.savetxt(file, np.column_stack((points, colors)), fmt="%.9g %.9g %.9g %d %d %d")
+        payloads = [
+            "matching.json",
+            "metadata.json",
+            "points.ply",
+            "poses.json",
+            "ransac.json",
+            "ransac.npz",
+            "reconstruction.npz",
+        ]
+        write_manifest(
+            root,
+            artifact_id=artifact_id,
+            artifact_type="reconstruction",
+            parent_artifact_id=parent_artifact_id,
+            producer_job_id=producer_job_id,
+            payloads=payloads,
+            capabilities=capabilities,
+            origin=None,
+        )
         # Publish only a complete artifact set. Existing runs are never overwritten.
         if output.exists():
             raise FileExistsError(f"Output already exists: {output}")
@@ -198,8 +235,6 @@ def view_reconstruction(path: Path, *, output: Path | None = None, cache_path: P
                 continue
             rr.set_time("frame", sequence=frame.index)
             rr.set_time("video_time", duration=np.timedelta64(frame.timestamp_ns, "ns"))
-            encoded = rr.EncodedImage(contents=frame.jpeg, media_type="image/jpeg")
-            rr.log("image", encoded)
             if diagnostics is not None:
                 log_pnp(diagnostics, row, frame, poses[row]["status"])
                 log_seed(diagnostics, frame, row)
@@ -232,7 +267,6 @@ def view_reconstruction(path: Path, *, output: Path | None = None, cache_path: P
                         image_plane_distance=0.3,
                     ),
                 )
-                rr.log("world/camera/pinhole/image", encoded)
             else:
                 rr.log("world/camera", rr.Clear(recursive=True))
             rr.log("metrics/retained_observations", rr.Scalars(len(pixels)))

@@ -2,10 +2,8 @@
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from io import BytesIO
 from pathlib import Path
 
-from PIL import Image
 from tqdm import tqdm
 
 from slam_lab.cache import CachedFrame, FrameCache
@@ -54,6 +52,7 @@ def process_video(
         new_frames = 0
         cached_frames = 0
         limited = False
+        cache.set(selection_complete=False, selection_max_frames=max_frames)
         with open_source(source) as reader:
             cache.set(video=reader.metadata())
             total = reader.total_frames
@@ -69,19 +68,15 @@ def process_video(
                         cached_frames += 1
                     else:
                         features = extractor(frame.image)
-                        image = Image.fromarray(frame.image)
-                        jpeg = BytesIO()
-                        image.save(jpeg, format="JPEG", quality=config.jpeg_quality)
                         cache.put(
                             CachedFrame(
                                 index=frame.index,
                                 timestamp_ns=frame.timestamp_ns,
                                 pts=frame.pts,
-                                width=image.width,
-                                height=image.height,
+                                width=frame.image.shape[1],
+                                height=frame.image.shape[0],
                                 original_width=frame.original_width,
                                 original_height=frame.original_height,
-                                jpeg=jpeg.getvalue(),
                                 **features,
                             )
                         )
@@ -99,5 +94,10 @@ def process_video(
             raise RuntimeError(
                 f"Input changed during processing; retry after copying finishes: {source}"
             )
-        cache.set(complete=not limited, updated_at=datetime.now(UTC).isoformat())
+        cache.set(
+            complete=not limited,
+            selection_complete=True,
+            selection_max_frames=max_frames,
+            updated_at=datetime.now(UTC).isoformat(),
+        )
         return ProcessResult(path, new_frames, cached_frames, not limited)

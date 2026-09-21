@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
+from slam_lab.artifacts import opaque_id, validate_manifest
 from slam_lab.cache import CachedFrame
 from slam_lab.geometry import Camera, camera_center, estimate_pose, project, triangulate
 from slam_lab.reconstruction import Mapper, ReconstructionConfig
@@ -27,7 +28,6 @@ def geometry_frames(store):
             frame["height"],
             frame["width"],
             frame["height"],
-            frame["jpeg"],
             frame["keypoints"],
             np.ones(n, np.float32),
             np.empty((n, 0), np.float32),
@@ -48,6 +48,7 @@ class ReconstructionProblem:
     @classmethod
     def load(cls, path, *, max_seed_candidates=50):
         path = Path(path).expanduser().resolve()
+        manifest = validate_manifest(path, artifact_type="geometry")
         with GeometryStore(path / "geometry.sqlite3") as store:
             if store.get("phase") != "complete":
                 raise ValueError("Finish pair verification and track building before solving")
@@ -85,6 +86,8 @@ class ReconstructionProblem:
                     "geometry_settings": store.get("identity")["config"],
                     "source_complete": store.get("source_complete", False),
                     "feature_cache": store.get("feature_cache"),
+                    "source_geometry_artifact_id": manifest["artifact_id"],
+                    "matching_artifact_id": manifest["parent_artifact_id"],
                 },
             )
 
@@ -101,6 +104,8 @@ class GraphMapper(Mapper):
             for keypoint, track in enumerate(ids):
                 self.track_observations[track][frame] = keypoint
         self.seed_attempts = []
+        self.point_ids = []
+        self.next_point_id = 0
 
     def match(self, first, second):
         raise RuntimeError("Graph solver must never recompute appearance matches")
@@ -157,6 +162,7 @@ class GraphMapper(Mapper):
     def initialize_graph(self):
         for first, second, data, summary in self.problem.seed_candidates:
             self.points, self.observations, self.registered = [], [], [first, second]
+            self.point_ids = []
             self.track_points[:] = -1
             for state in self.frames:
                 state.pose = None
@@ -190,6 +196,8 @@ class GraphMapper(Mapper):
             ):
                 self.track_points[track] = len(self.points)
                 self.add_point(point, first, a, second, b)
+                self.point_ids.append(self.next_point_id)
+                self.next_point_id += 1
             candidates = sorted(
                 (row for row in range(len(self.frames)) if row not in (first, second)),
                 key=lambda row: (-len(self.candidates(row)[0]), row),
@@ -268,11 +276,15 @@ class GraphMapper(Mapper):
                 self.track_points[track] = landmark
                 self.points.append(point)
                 self.observations.append(support)
+                self.point_ids.append(self.next_point_id)
+                self.next_point_id += 1
                 for row, key in support.items():
                     self.frames[row].landmark_ids[key] = landmark
 
-    def run(self, progress=True):
+    def run(self, progress=True, progress_callback=None):
         cv2.setRNGSeed(self.config.seed)
+        if progress_callback is not None:
+            progress_callback("selecting_seed", None)
         self.initialize_graph()
         for row in list(self.registered):
             self.extend_tracks(row)
@@ -290,47 +302,126 @@ class GraphMapper(Mapper):
                     break
                 remaining.remove(accepted)
                 self.extend_tracks(accepted)
+                if progress_callback is not None:
+                    progress_callback("registering_frames", accepted)
                 bar.update(1)
 
+    def final_lineage(self):
+        """Return stable point IDs and verified source-track IDs by final point row."""
+        count = int(np.count_nonzero(self.final_point_ids >= 0))
+        point_ids = np.full(count, -1, dtype=np.int64)
+        source_track_ids = np.full(count, -1, dtype=np.int64)
+        for incremental, final in enumerate(self.final_point_ids):
+            if final >= 0:
+                point_ids[final] = self.point_ids[incremental]
+        for track, incremental in enumerate(self.track_points):
+            if incremental >= 0 and self.final_point_ids[incremental] >= 0:
+                source_track_ids[self.final_point_ids[incremental]] = track
+        if (point_ids < 0).any() or (source_track_ids < 0).any():
+            raise RuntimeError("Final reconstruction lineage is incomplete")
+        return point_ids, source_track_ids
 
-def solve_geometry(path, output, *, config=None, progress=True):
+
+def solve_geometry(path, output, *, config=None, progress=True, invocation=None):
     from slam_lab.reconstruction_io import save_reconstruction
+    from slam_lab.solve_jobs import SolveJob
 
     output = Path(output).expanduser().resolve()
     if output.exists():
         raise FileExistsError(f"Output already exists: {output}")
-    problem = ReconstructionProblem.load(path)
-    mapper = GraphMapper(problem, config)
-    mapper.run(progress=progress)
-    if progress:
-        tqdm.write(
-            f"Registered {len(mapper.registered)}/{len(mapper.frames)} views; refining points"
+    artifact_id = opaque_id("reconstruction")
+    job = SolveJob(path, output, artifact_id, invocation=invocation)
+    try:
+        problem = ReconstructionProblem.load(path)
+        mapper = GraphMapper(problem, config)
+        job.configure(
+            input_artifact_id=problem.provenance["source_geometry_artifact_id"],
+            effective_options=asdict(mapper.config),
         )
-    points, observations, xy, errors, adjustment = mapper.finalize()
-    metadata = {
-        "schema_version": 1,
-        "backend": "verified-track-graph-incremental-v1",
-        **problem.provenance,
-        "camera": asdict(problem.camera),
-        "camera_assumption": "shared fixed pinhole, zero distortion; "
-        "focal length assumed unless supplied",
-        "settings": asdict(mapper.config),
-        "initialization": mapper.initialization,
-        "bundle_adjustment": adjustment,
-        "frames": len(mapper.frames),
-        "registered_frames": len(mapper.registered),
-        "points": len(points),
-        "observations": len(observations),
-        "median_reprojection_error_px": float(np.median(errors)),
-        "p95_reprojection_error_px": float(np.percentile(errors, 95)),
-        "pose_convention": "T_world_camera maps camera to world; axes right, down, forward",
-        "scale": "arbitrary; seed baseline is one unit, not meters",
-        "limitations": [
-            "prototype graph-based incremental backend; final bundle adjustment only",
-            "one connected component; disconnected or rejected images have no pose",
-            "pairwise geometry does not guarantee static-scene matches",
-            "no track splitting or alternate global solver yet",
-        ],
-    }
-    save_reconstruction(output, mapper, points, observations, xy, errors, metadata)
-    return output
+        job.update(state="running", phase="selecting_seed", total_frames=len(mapper.frames))
+
+        def report(phase, row):
+            job.update(
+                state="running",
+                phase=phase,
+                registered_frames=len(mapper.registered),
+                total_frames=len(mapper.frames),
+                points=len(mapper.points),
+                current_frame=(int(problem.frame_rows[row]) if row is not None else None),
+            )
+
+        mapper.run(progress=progress, progress_callback=report)
+        if progress:
+            tqdm.write(
+                f"Registered {len(mapper.registered)}/{len(mapper.frames)} views; refining points"
+            )
+        job.update(
+            state="running",
+            phase="bundle_adjusting" if mapper.config.bundle_evaluations else "filtering",
+            registered_frames=len(mapper.registered),
+            points=len(mapper.points),
+            current_frame=None,
+        )
+        points, observations, xy, errors, adjustment = mapper.finalize()
+        point_ids, source_track_ids = mapper.final_lineage()
+        job.update(state="running", phase="filtering", points=len(points))
+        metadata = {
+            "schema_version": 1,
+            "artifact_id": artifact_id,
+            "producer_job_id": job.job_id,
+            "backend": "verified-track-graph-incremental-v1",
+            **problem.provenance,
+            "camera": asdict(problem.camera),
+            "camera_assumption": "shared fixed pinhole, zero distortion; "
+            "focal length assumed unless supplied",
+            "settings": asdict(mapper.config),
+            "initialization": mapper.initialization,
+            "bundle_adjustment": adjustment,
+            "frames": len(mapper.frames),
+            "registered_frames": len(mapper.registered),
+            "points": len(points),
+            "observations": len(observations),
+            "median_reprojection_error_px": float(np.median(errors)),
+            "p95_reprojection_error_px": float(np.percentile(errors, 95)),
+            "pose_convention": "T_world_camera maps camera to world; axes right, down, forward",
+            "scale": "arbitrary; seed baseline is one unit, not meters",
+            "limitations": [
+                "prototype graph-based incremental backend; final bundle adjustment only",
+                "one connected component; disconnected or rejected images have no pose",
+                "pairwise geometry does not guarantee static-scene matches",
+                "no track splitting or alternate global solver yet",
+            ],
+        }
+        job.update(state="running", phase="publishing", points=len(points))
+        save_reconstruction(
+            output,
+            mapper,
+            points,
+            observations,
+            xy,
+            errors,
+            metadata,
+            frame_rows=problem.frame_rows,
+            point_ids=point_ids,
+            source_track_ids=source_track_ids,
+            artifact_id=artifact_id,
+            parent_artifact_id=problem.provenance["source_geometry_artifact_id"],
+            producer_job_id=job.job_id,
+        )
+        job.update(
+            state="complete",
+            phase="complete",
+            registered_frames=len(mapper.registered),
+            total_frames=len(mapper.frames),
+            points=len(points),
+            current_frame=None,
+            last_error=None,
+        )
+        job.finish(exit_code=0)
+        return output
+    except KeyboardInterrupt as error:
+        job.fail(error, canceled=True)
+        raise
+    except Exception as error:
+        job.fail(error)
+        raise

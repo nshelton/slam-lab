@@ -70,25 +70,20 @@ For a pre-exported recording, use the viewer installed in the environment:
 PATH. For headless work, use `--save <new-file.rrd>` on viewer commands instead of
 launching a window. Existing exports are not overwritten.
 
-## Next numerical experiment: LightGlue with the same solver selection
+## Completed LightGlue solver comparison
 
-This comparison has **not** been run at handoff. It reuses completed matches and
-selects rows 0, 10, ..., 290 across the first 30 seconds, just like the cosine test.
+The comparison reuses completed matches and selects rows 0, 10, ..., 290 across the
+first 30 seconds, just like the cosine test. The current strict result is
+`recordings/osaka-lightglue-solver-v5`.
 
 ```bash
-.venv/bin/slam-lab verify-matches recordings/osaka-allpairs-lightglue \
-  --output recordings/osaka-lightglue-geometry-step10 --frame-step 10 --max-frames 30
-
-.venv/bin/slam-lab solve recordings/osaka-lightglue-geometry-step10 \
-  --output recordings/osaka-lightglue-solver-v1 --no-rerun
-
-.venv/bin/slam-lab view-reconstruction recordings/osaka-lightglue-solver-v1
+.venv/bin/slam-lab solve-status recordings/osaka-lightglue-solver-v5
+.venv/bin/slam-lab view-reconstruction recordings/osaka-lightglue-solver-v5
 ```
 
-Verification resumes in the same geometry directory when configuration is unchanged.
-Solving needs a new output directory. Choose another experiment name if an output
-already exists. Intrinsics/geometry thresholds belong to `verify-matches`; solver
-filtering/BA settings belong to `solve`. Neither stage runs a matcher.
+To reproduce it, run `verify-matches` and `solve` with new output directories.
+Intrinsics/geometry thresholds belong to `verify-matches`; solver filtering/BA settings
+belong to `solve`. Neither stage runs a matcher.
 
 ## New input and matching
 
@@ -113,10 +108,25 @@ PyTorch runtime; it preserves the old pairs and tags new runtime provenance.
 
 ## Next backend implementation
 
-Start with P0 in [SOLVER_TODO.md](SOLVER_TODO.md): artifact identities, stable
-observation/track/point lineage and structured solve status. The proposed manifests,
-`solve-status`, live snapshots and common reader facade are not implemented yet.
-Keep completed artifacts as test fixtures; make new outputs for experiments.
+The supported backend workflow is exactly `match-all -> verify-matches -> solve`.
+Completed matching, geometry and reconstruction directories carry mandatory hashed
+`manifest.json` envelopes. Geometry validates its matching parent; reconstruction
+validates its geometry parent. Missing manifests, changed payloads and mismatched parent
+IDs are rejected instead of routed through a compatibility adapter.
+
+New reconstructions contain stable observation/track/point mappings. Solver jobs publish
+atomic structured status readable with `solve-status` or `ArtifactReader.status()`.
+
+```bash
+.venv/bin/slam-lab solve-status recordings/osaka-lightglue-solver-v5
+```
+
+Matching is the root artifact because it embeds selected frame identities, timestamps,
+pixel coordinates and feature indices consumed by every downstream stage. Source pixels
+remain in the video. Feature-cache publication is deliberately
+outside this solver interface. Full solve invocation/options/runtime provenance and the
+single manifested `ArtifactReader` are implemented. Continue with live snapshots, draft
+pagination and crash reconciliation in [SOLVER_TODO.md](SOLVER_TODO.md).
 
 After code changes, run appropriate tests and the formatting/lint checks:
 
@@ -126,5 +136,5 @@ After code changes, run appropriate tests and the formatting/lint checks:
 .venv/bin/ruff format --check src tests scripts
 ```
 
-The last solver implementation validation passed 58 tests. No test rerun is needed
+The last solver implementation validation passed 60 tests. No test rerun is needed
 merely to read the artifacts or edit prose documentation.

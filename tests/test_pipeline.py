@@ -1,11 +1,9 @@
 import subprocess
 import sys
 from dataclasses import replace
-from io import BytesIO
 
 import numpy as np
 import pytest
-from PIL import Image
 
 from slam_lab.cache import FrameCache
 from slam_lab.cli import main
@@ -46,8 +44,11 @@ def test_partial_resume_and_complete_hit(video, tmp_path, extractor):
         assert frames[0].descriptors.shape == (2, 256)
         assert frames[1].descriptors.shape == (0, 256)
         assert frames[0].keypoints.dtype == np.float32
-        with Image.open(BytesIO(frames[0].jpeg)) as image:
-            assert image.size == (frames[0].width, frames[0].height) == (64, 48)
+        assert (frames[0].width, frames[0].height) == (64, 48)
+        columns = {row[1] for row in cache.db.execute("PRAGMA table_info(frames)")}
+        assert "jpeg" not in columns
+        assert "features" not in columns
+        assert {"keypoints", "scores", "descriptors"} <= columns
 
 
 def test_interruption_retains_completed_frames(video, tmp_path, extractor):

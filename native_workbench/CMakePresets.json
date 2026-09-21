@@ -1,0 +1,65 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "core-debug",
+      "displayName": "Core library (workspace toolchain)",
+      "description": "Builds the feature store with the workspace-local C++ compiler and SQLite headers.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/core-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_COMPILER": "${sourceParentDir}/.tools/native-sysroot/usr/bin/x86_64-linux-gnu-g++-15",
+        "CMAKE_MAKE_PROGRAM": "${sourceParentDir}/.venv-cuda/bin/ninja",
+        "CMAKE_PREFIX_PATH": "${sourceParentDir}/.tools/native-sysroot/usr",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "SLAM_NATIVE_BUILD_APP": "OFF"
+      }
+    },
+    {
+      "name": "app-debug",
+      "displayName": "Full CUDA app (Debug)",
+      "description": "Requires system C++/CUDA, TensorRT C++ SDK, FFmpeg, GLFW and OpenGL development packages.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/app-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_COMPILER": "/usr/bin/g++",
+        "CMAKE_CUDA_COMPILER": "/usr/local/cuda-13.4/bin/nvcc",
+        "CUDAToolkit_ROOT": "/usr/local/cuda-13.4",
+        "CMAKE_CUDA_ARCHITECTURES": "75",
+        "CMAKE_MAKE_PROGRAM": "${sourceParentDir}/.venv-cuda/bin/ninja",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "SLAM_NATIVE_BUILD_APP": "ON"
+      }
+    },
+    {
+      "name": "app-release",
+      "displayName": "Full CUDA app (Release)",
+      "inherits": "app-debug",
+      "binaryDir": "${sourceDir}/build/app-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "core-debug",
+      "configurePreset": "core-debug"
+    },
+    {
+      "name": "app-debug",
+      "configurePreset": "app-debug"
+    },
+    {
+      "name": "app-release",
+      "configurePreset": "app-release"
+    }
+  ]
+}

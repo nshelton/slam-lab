@@ -16,12 +16,12 @@ video -> cached SuperPoint features -> exhaustive appearance matches
 
 Both exhaustive Osaka matching runs are finished, including global appearance-track
 association and Rerun export. CUDA LightGlue works on the RTX 2080 Ti. The first
-modular solver produced a 30-frame cosine-based experiment. It has not yet been
-run on the completed LightGlue store or all 300 frames.
+modular solver has produced comparable 30-frame cosine and LightGlue experiments.
 
-A separate agent is building the workbench GUI. The backend remains file-based;
-Rerun is optional presentation. The GUI integration feedback was analyzed and
-documented as planned backend work, not implemented prematurely.
+The backend remains file-based and Rerun is optional presentation. The first GUI
+integration slice—strict artifact ancestry, stable selection lineage and structured
+solver status—is implemented. Solve provenance and the published-artifact reader are
+also implemented; job snapshots and live draft pagination remain planned.
 
 ## Data and environment
 
@@ -60,6 +60,9 @@ Detailed feature/model provenance is stored in the cache and match databases.
 | `osaka-allpairs-lightglue` | Complete: 44,850 pairs, 22,111,491 match edges, 15,641 tracks of length >=2 |
 | `osaka-cosine-geometry-step10` | Complete: 30 selected images, 435 pairs, 78,714 verified edges, 103 eligible seed pairs |
 | `osaka-cosine-solver-v1` | Complete: 29 registered cameras, 1,751 points, 11,046 retained observations |
+| `osaka-lightglue-geometry-step10` | Complete: 30 selected images, 435 pairs, 139,397 verified edges |
+| `osaka-lightglue-solver-v1` | Complete: 19 registered cameras, 1,933 points, 10,483 retained observations |
+| `osaka-lightglue-solver-v5` | Strict chain, exact solve provenance and unified artifact-reader validation |
 
 Both matching status readers report `running=false`, `phase=complete`. Geometry
 also reports complete/not running. There is no unfinished matching/geometry job
@@ -108,9 +111,7 @@ Useful saved outputs:
 | `reconstruction_io.py`, `ransac_view.py` | Reconstruction artifacts and inspection adapters |
 | `match_view.py`, `geometry_view.py`, `rerun_support.py` | Pair/track viewers and environment-local Rerun discovery |
 
-The current command path is **`verify-matches -> solve`**. The older `reconstruct`
-command still rematches descriptors using a limited set of reference keyframes;
-it does not read either exhaustive matching run. Keep that distinction explicit.
+The supported command path is **`match-all -> verify-matches -> solve`**.
 
 Verification separately fits F (USAC/MAGSAC), E (calibrated RANSAC) and H (RANSAC).
 Raw masks are not overwritten by pose recovery or final filtering. OpenCV can throw
@@ -150,29 +151,19 @@ promise bit-identical CPU/GPU matches or describe CUDA inference as entirely FP3
 
 ## GUI handoff and next priorities
 
-The GUI agent should read [WORKBENCH_INTERFACE.md](WORKBENCH_INTERFACE.md) for current
-readers/formats and the **separately labeled planned contract**. No HTTP service is
-implemented. Core Python compute functions do not launch Rerun. CLI `match-all`,
-`solve` and `reconstruct` accept `--no-rerun` to skip automatic exports.
+The GUI should read [WORKBENCH_INTERFACE.md](WORKBENCH_INTERFACE.md) for the current
+artifact and status contract. No HTTP service is implemented. Core Python compute
+functions do not launch Rerun. The supported compute workflow is
+`match-all -> verify-matches -> solve`; `match-all` and `solve` accept `--no-rerun`.
 
-The ordered implementation list and acceptance criteria are in
-[SOLVER_TODO.md](SOLVER_TODO.md). First implement:
+The first P0 slice is implemented: matching, geometry and reconstruction manifests;
+strict payload/parent validation; canonical observation lineage; stable point IDs; and
+atomic `solve-status`. Unmanifested artifacts are rejected rather than adapted.
 
-1. Opaque artifact IDs and immutable parent identities, with legacy compatibility.
-2. Canonical observation lineage, `frame_rows`, `source_track_ids` and stable point IDs
-   through BA/filtering so GUI point -> track -> frame -> pixel selection is reliable.
-3. Atomic structured solve status, common lifecycle/phase fields and revisions.
-
-Then add separate job/artifact directories with effective invocation provenance,
-optional immutable live NPZ previews, strict publication/recovery rules and a
-versioned paginated reader facade. Snapshot previews are not resume checkpoints.
-The current ability to extend geometry in place conflicts with the future immutable
-artifact contract; published extensions will need new IDs. Live pair cursors must
-follow commit order so out-of-order worker results are not missed.
-
-These additions are **documentation/planning only** today: no `manifest.json`
-contract, exported source-track IDs, common lifecycle revisions, `solve-status`,
-live solver snapshots or full reader facade has been implemented.
+Next add full job invocation provenance, optional immutable live NPZ previews, crash
+reconciliation and the versioned paginated reader facade. Snapshot previews are not
+resume checkpoints. Live pair cursors must follow commit order so out-of-order worker
+results are not missed.
 
 For the next numerical experiment, compare LightGlue and cosine on the same
 30-frame selection using the commands in [WORKFLOW.md](WORKFLOW.md). After visual
@@ -186,9 +177,8 @@ optimizer is not the immediate workbench dependency.
   track splitting, global SfM backend or automatic dynamic-object exclusion yet.
 * Intrinsics are assumed; moving people, planar structures and captions can produce
   plausible inliers and low residuals with incorrect poses.
-* `solve` has no checkpoint/resume or persistent progress endpoint. Its final artifact
-  directory is published atomically, but legacy writers do not meet every proposed
-  manifest/immutability rule yet. Serialize geometry updates and solves from that run.
+* `solve` has structured persistent progress but no checkpoint/resume. Its final artifact
+  directory is published atomically and bound to its geometry parent.
 * `--resume-after` inherits the launcher's Python interpreter. Launch from `.venv-cuda`
   if the queued job needs CUDA; automatic interpreter selection is not implemented.
 * Existing solved outputs are not overwritten. Use a new directory for each solve.
@@ -198,7 +188,7 @@ optimizer is not the immediate workbench dependency.
 
 ## Validation and restart note
 
-The last implementation validation passed **58 tests** and Ruff lint checks. It
+The last implementation validation passed **60 tests** and Ruff lint checks. It
 covers synthetic known cameras and scale, outliers, pure rotation, planar and weak
 baseline rejection, raw mask preservation, runtime migration, immutable source
 matches, resume/input validation, subsampling IDs and self-contained Rerun export.
@@ -207,7 +197,5 @@ metadata and output existence; it did not rerun inference or launch another solv
 
 Suggested next-session instruction:
 
-> Read SESSION_HANDOFF.md, WORKBENCH_INTERFACE.md and SOLVER_TODO.md. Both exhaustive
-> matching runs are complete. Implement the P0 workbench backend slice: artifact
-> identities, stable observation/track/point mappings and structured solve progress.
-> Preserve existing artifacts and distinguish current APIs from planned ones.
+> Read WORKFLOW.md, WORKBENCH_INTERFACE.md and SOLVER_TODO.md. Continue after completed
+> P0 slice 1 with live snapshots, crash reconciliation and live draft pagination.

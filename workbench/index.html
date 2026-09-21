@@ -35,7 +35,22 @@
         <section class="viewer-shell">
           <div class="viewer-toolbar">
             <div class="toolbar-left">
-              <div id="run-switcher" class="segmented" aria-label="Matcher run"></div>
+              <label id="match-picker" class="artifact-picker">
+                <span>Matches</span>
+                <select id="match-selector" aria-label="Match artifact"></select>
+              </label>
+              <label id="reconstruction-picker" class="artifact-picker hidden">
+                <span>Reconstruction</span>
+                <select id="reconstruction-selector" aria-label="Reconstruction artifact"></select>
+              </label>
+              <label id="track-picker" class="artifact-picker hidden">
+                <span>Online tracks</span>
+                <select id="track-selector" aria-label="Online track artifact"></select>
+              </label>
+              <label id="detection-picker" class="artifact-picker hidden">
+                <span>Detections</span>
+                <select id="detection-selector" aria-label="Feature cache"></select>
+              </label>
               <form id="pair-form" class="pair-form">
                 <label>
                   <span>Frame row</span>
@@ -54,11 +69,63 @@
               <div class="segmented mode-switcher" aria-label="Viewer mode">
                 <button id="image-mode" class="active" type="button">Images</button>
                 <button id="matrix-mode" type="button">Matrix</button>
+                <button id="detections-mode" type="button">Detections</button>
+                <button id="tracks-mode" type="button">Tracks</button>
+                <button id="reconstruction-mode" type="button">Reconstruction</button>
+                <button id="pipeline-mode" type="button">Pipeline</button>
               </div>
               <label class="toggle">
                 <input id="show-lines" type="checkbox" checked />
                 <span>Links</span>
               </label>
+              <div id="track-controls" class="track-controls hidden">
+                <button id="track-previous" class="ghost-button" type="button" aria-label="Previous frame">←</button>
+                <button id="track-play" type="button">Play</button>
+                <button id="track-next" class="ghost-button" type="button" aria-label="Next frame">→</button>
+                <input id="track-row" type="range" min="0" max="0" step="1" value="0" aria-label="Track frame" />
+                <output id="track-row-value" for="track-row">0 / 0</output>
+                <label class="track-trail"><span>Trail</span><input id="track-trail" type="range" min="0" max="50" step="1" value="12" /><output id="track-trail-value" for="track-trail">12</output></label>
+              </div>
+              <label class="toggle">
+                <input id="show-features" type="checkbox" />
+                <span>All features</span>
+              </label>
+              <details id="viz-menu" class="viz-menu hidden">
+                <summary>Visualization</summary>
+                <div class="viz-panel">
+                  <div class="viz-heading">
+                    <span>Reconstruction display</span>
+                    <button id="viz-reset" class="text-button" type="button">Reset</button>
+                  </div>
+                  <div class="viz-toggles">
+                    <label><input id="viz-points" type="checkbox" checked /><span>Point cloud</span></label>
+                    <label><input id="viz-cameras" type="checkbox" checked /><span>Cameras</span></label>
+                    <label><input id="viz-trajectory" type="checkbox" checked /><span>Trajectory</span></label>
+                    <label><input id="viz-axes" type="checkbox" checked /><span>World axes</span></label>
+                    <label><input id="viz-grid" type="checkbox" /><span>Ground grid</span></label>
+                  </div>
+                  <label class="viz-range">
+                    <span>Point size</span>
+                    <input id="point-size" type="range" min="1" max="12" step="0.5" value="3" />
+                    <output id="point-size-value" for="point-size">3.0 px</output>
+                  </label>
+                  <label class="viz-range">
+                    <span>Point opacity</span>
+                    <input id="point-opacity" type="range" min="0.05" max="1" step="0.05" value="1" />
+                    <output id="point-opacity-value" for="point-opacity">100%</output>
+                  </label>
+                  <label class="viz-range">
+                    <span>Frustum size</span>
+                    <input id="frustum-size" type="range" min="0.1" max="5" step="0.1" value="1" />
+                    <output id="frustum-size-value" for="frustum-size">1.0×</output>
+                  </label>
+                  <label class="viz-range">
+                    <span>Camera opacity</span>
+                    <input id="camera-opacity" type="range" min="0.05" max="1" step="0.05" value="0.8" />
+                    <output id="camera-opacity-value" for="camera-opacity">80%</output>
+                  </label>
+                </div>
+              </details>
               <button id="fit-view" class="ghost-button" type="button">Fit view</button>
             </div>
           </div>
@@ -76,30 +143,101 @@
               <strong>Select an image pair</strong>
               <span>Matched features will appear on the image planes.</span>
             </div>
+            <section id="pipeline-panel" class="pipeline-panel hidden">
+              <div class="pipeline-header">
+                <div>
+                  <span class="eyebrow">End-to-end processing</span>
+                  <h1>Run a visual tracking experiment</h1>
+                  <p>Cache SuperPoint detections and build causal online landmarks. Pairwise matching and reconstruction remain available as an extended workflow.</p>
+                </div>
+                <span id="pipeline-state" class="status-pill status-idle">ready</span>
+              </div>
+              <form id="pipeline-form" class="pipeline-form">
+                <label class="pipeline-source">
+                  <span>Source video</span>
+                  <select id="pipeline-source" required></select>
+                </label>
+                <label>
+                  <span>Run name</span>
+                  <input id="pipeline-name" value="osaka-300" maxlength="48" required />
+                </label>
+                <label>
+                  <span>Maximum frames</span>
+                  <input id="pipeline-frames" type="number" min="2" value="300" required />
+                </label>
+                <label>
+                  <span>Video stride</span>
+                  <input id="pipeline-stride" type="number" min="1" max="120" value="6" required />
+                </label>
+                <label>
+                  <span>Workflow</span>
+                  <select id="pipeline-workflow">
+                    <option value="tracks">Online tracks</option>
+                    <option value="full">Full reconstruction</option>
+                  </select>
+                </label>
+                <label id="pipeline-matcher-field">
+                  <span>Matcher</span>
+                  <select id="pipeline-matcher">
+                    <option value="lightglue">LightGlue</option>
+                    <option value="cosine">Cosine mutual NN</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Compute</span>
+                  <select id="pipeline-device">
+                    <option value="cuda">CUDA</option>
+                    <option value="cpu">CPU</option>
+                  </select>
+                </label>
+                <div class="pipeline-actions">
+                  <button id="pipeline-start" type="submit">Run online tracker</button>
+                  <button id="pipeline-cancel" class="stop-button hidden" type="button">Stop</button>
+                  <button id="pipeline-open" class="ghost-button hidden" type="button">Open reconstruction</button>
+                </div>
+              </form>
+              <div id="pipeline-job" class="pipeline-job hidden">
+                <div class="pipeline-job-heading">
+                  <div><span class="eyebrow">Current job</span><h2 id="pipeline-job-name">—</h2></div>
+                  <span id="pipeline-updated" class="muted">—</span>
+                </div>
+                <div id="pipeline-stages" class="pipeline-stages"></div>
+                <details class="pipeline-log">
+                  <summary>Worker log</summary>
+                  <pre id="pipeline-log">Waiting for output…</pre>
+                </details>
+              </div>
+            </section>
           </div>
         </section>
 
         <aside class="inspector">
           <section>
-            <span class="eyebrow">Selected pair</span>
+            <span id="inspector-context" class="eyebrow">Selected pair</span>
             <h2 id="pair-title">No pair loaded</h2>
             <dl class="stats-grid">
-              <div><dt>Matches</dt><dd id="match-count">—</dd></div>
-              <div><dt>Pair runtime</dt><dd id="pair-runtime">—</dd></div>
-              <div><dt>Frame gap</dt><dd id="frame-gap">—</dd></div>
-              <div><dt>Time gap</dt><dd id="time-gap">—</dd></div>
+              <div><dt id="match-stat-label">Matches</dt><dd id="match-count">—</dd></div>
+              <div><dt id="runtime-stat-label">Pair runtime</dt><dd id="pair-runtime">—</dd></div>
+              <div><dt id="gap-stat-label">Frame gap</dt><dd id="frame-gap">—</dd></div>
+              <div><dt id="time-stat-label">Time gap</dt><dd id="time-gap">—</dd></div>
             </dl>
           </section>
 
           <section>
-            <span class="eyebrow">Matcher contract</span>
+            <span id="contract-context" class="eyebrow">Matcher contract</span>
             <h3 id="matcher-title">—</h3>
             <p id="matcher-description" class="muted">Matcher provenance will appear here.</p>
             <dl id="matcher-fields" class="detail-list"></dl>
           </section>
 
           <section>
-            <span class="eyebrow">Feature match</span>
+            <span class="eyebrow">Artifact catalog</span>
+            <h3 id="artifact-counts">Discovering files…</h3>
+            <div id="geometry-list" class="artifact-list"></div>
+          </section>
+
+          <section>
+            <span id="selection-context" class="eyebrow">Feature match</span>
             <div id="selection-empty" class="selection-empty">
               Click a colored feature point to inspect its correspondence.
             </div>

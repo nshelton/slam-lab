@@ -1,0 +1,11 @@
+{
+  "cmake.sourceDirectory": "${workspaceFolder}/native_workbench",
+  "cmake.cmakePath": "${workspaceFolder}/.venv-cuda/bin/cmake",
+  "cmake.useCMakePresets": "always",
+  "cmake.configureOnOpen": false,
+  "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+  "files.associations": {
+    "*.cu": "cuda-cpp",
+    "*.cuh": "cuda-cpp"
+  }
+}

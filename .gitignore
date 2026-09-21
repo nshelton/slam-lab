@@ -7,8 +7,10 @@
 __pycache__/
 *.egg-info/
 build/
+native_workbench/models/
 dist/
 node_modules/
 data/
 recordings/
+archive/
 *.rrd

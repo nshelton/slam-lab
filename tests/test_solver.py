@@ -1,20 +1,22 @@
 import hashlib
 import json
 from dataclasses import replace
-from io import BytesIO
+from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
-from PIL import Image
 
+from slam_lab.artifacts import validate_manifest
 from slam_lab.cache import CachedFrame
-from slam_lab.correspondence import MatchStore, pack_matches
+from slam_lab.correspondence import MatchStore, finalize_matches, pack_matches
 from slam_lab.geometry import Camera, camera_center, project
 from slam_lab.geometry_view import view_geometry
 from slam_lab.matching import PairMatches
+from slam_lab.reader import ArtifactReader
 from slam_lab.reconstruction import ReconstructionConfig
 from slam_lab.reconstruction_io import view_reconstruction
+from slam_lab.solve_jobs import solve_status
 from slam_lab.solver import GraphMapper, ReconstructionProblem, solve_geometry
 from slam_lab.verification import (
     GeometryStore,
@@ -44,8 +46,6 @@ def scene():
 def match_run(scene, tmp_path):
     camera, _, _, xy = scene
     rng = np.random.default_rng(99)
-    jpeg = BytesIO()
-    Image.new("RGB", (640, 480), (100, 150, 200)).save(jpeg, format="JPEG")
     frames = []
     for i, pixels in enumerate(xy):
         noisy = pixels + rng.normal(0, 0.1, pixels.shape)
@@ -60,7 +60,6 @@ def match_run(scene, tmp_path):
                 480,
                 640,
                 480,
-                jpeg.getvalue(),
                 noisy.astype(np.float32),
                 np.ones(len(noisy)),
                 np.empty((len(noisy), 0)),
@@ -80,7 +79,7 @@ def match_run(scene, tmp_path):
                     indices[:40, 1] = np.roll(indices[:40, 1], 5)
                     pair = PairMatches(indices, np.ones(250, np.float32), np.zeros(250, np.float32))
                 store.put_pair(first, second, pair, 0)
-        store.set(phase="complete")
+        finalize_matches(store, run)
     return run, camera
 
 
@@ -143,6 +142,25 @@ def test_resumable_verification_tracks_and_immutable_input(match_run, tmp_path):
     summary = verify_matches(run, output, camera_options={"fx": camera.fx}, progress=False)
     assert summary["pairs"] == 28 and summary["seed_candidates"] > 0
     assert summary["verified_edges"] > 3000
+    match_manifest = validate_manifest(run, artifact_type="matches")
+    geometry_manifest = validate_manifest(output, artifact_type="geometry")
+    assert geometry_manifest["parent_artifact_id"] == match_manifest["artifact_id"]
+    match_reader = ArtifactReader(run)
+    first_page = match_reader.list_frames(limit=3)
+    second_page = match_reader.list_frames(after=first_page["next_cursor"], limit=10)
+    assert [item["row"] for item in first_page["items"] + second_page["items"]] == list(range(8))
+    assert match_reader.status()["state"] == "complete"
+    assert match_reader.pair(1, 7)["indices"].shape == (250, 2)
+    with pytest.raises(ValueError, match="Invalid artifact cursor"):
+        match_reader.list_frames(after="not-a-cursor")
+    with pytest.raises(ValueError, match="canonical order"):
+        match_reader.pair(7, 1)
+    geometry_reader = ArtifactReader(output)
+    pairs = geometry_reader.list_pairs(limit=5)
+    assert len(pairs["items"]) == 5 and pairs["next_cursor"]
+    assert geometry_reader.pair(1, 7)["summary"]["seed_eligible"]
+    with pytest.raises(ValueError, match="different artifact"):
+        geometry_reader.list_pairs(after=match_reader.list_pairs(limit=1)["next_cursor"])
     status = geometry_status(output)
     assert status["phase"] == "complete" and not status["running"]
     assert status["available_pairs"] == status["completed_pairs"] == 28
@@ -163,6 +181,13 @@ def test_resumable_verification_tracks_and_immutable_input(match_run, tmp_path):
         assert len(ids) == len(np.unique(ids))
     with pytest.raises(ValueError, match="settings changed"):
         verify_matches(run, output, camera_options={"fx": camera.fx + 1}, progress=False)
+    manifest_path = run / "manifest.json"
+    changed_manifest = json.loads(manifest_path.read_text())
+    changed_manifest["artifact_id"] = "matches-different-parent"
+    manifest_path.write_text(json.dumps(changed_manifest))
+    with pytest.raises(ValueError, match="parent does not match"):
+        verify_matches(run, output, camera_options={"fx": camera.fx}, progress=False)
+    manifest_path.write_text(json.dumps(match_manifest))
     with MatchStore(run / "matches.sqlite3", create=True) as store:
         pair = store.pair(1, 7)
         pair.scores *= 0.5
@@ -170,7 +195,7 @@ def test_resumable_verification_tracks_and_immutable_input(match_run, tmp_path):
             store.db.execute(
                 "UPDATE pairs SET matches=? WHERE first=1 AND second=7", (pack_matches(pair),)
             )
-    with pytest.raises(ValueError, match="raw matches changed"):
+    with pytest.raises(ValueError, match="payload does not match manifest"):
         verify_matches(run, output, camera_options={"fx": camera.fx}, progress=False)
 
 
@@ -204,11 +229,66 @@ def test_graph_solver_ground_truth_and_self_contained_viewers(match_run, scene, 
         tmp_path / "solution",
         config=ReconstructionConfig(bundle_evaluations=0),
         progress=False,
+        invocation=["/test/python", "-m", "slam_lab", "solve", "geometry path"],
     )
-    assert json.loads((result / "metadata.json").read_text())["registered_frames"] == 7
+    metadata = json.loads((result / "metadata.json").read_text())
+    assert metadata["registered_frames"] == 7
+    manifest = validate_manifest(result)
+    assert manifest["artifact_id"] == metadata["artifact_id"]
+    assert manifest["artifact_type"] == "reconstruction"
+    geometry_manifest = validate_manifest(geometry, artifact_type="geometry")
+    assert manifest["parent_artifact_id"] == geometry_manifest["artifact_id"]
+    assert metadata["matching_artifact_id"] == geometry_manifest["parent_artifact_id"]
+    assert set(manifest["capabilities"]) == {
+        "matching_frame_rows",
+        "source_track_lineage",
+        "stable_point_ids",
+    }
+    with np.load(result / "reconstruction.npz", allow_pickle=False) as reconstruction:
+        np.testing.assert_array_equal(reconstruction["frame_rows"], problem.frame_rows)
+        point_ids = reconstruction["point_ids"]
+        source_track_ids = reconstruction["source_track_ids"]
+        observations = reconstruction["observations"]
+        assert len(point_ids) == len(np.unique(point_ids)) == len(reconstruction["points"])
+        assert len(source_track_ids) == len(reconstruction["points"])
+        for frame, point, feature in observations:
+            assert problem.observation_tracks[frame][feature] == source_track_ids[point]
+    status = solve_status(result)
+    assert status["state"] == status["phase"] == "complete"
+    assert status["output_artifact_id"] == manifest["artifact_id"]
+    assert status["registered_frames"] == 7
+    assert status["points"] == metadata["points"]
+    assert not status["worker_alive"]
+    job = json.loads((Path(status["job_directory"]) / "job.json").read_text())
+    assert job["input"]["artifact_id"] == geometry_manifest["artifact_id"]
+    assert job["output"]["artifact_id"] == manifest["artifact_id"]
+    assert job["effective_options"]["bundle_evaluations"] == 0
+    assert isinstance(job["arguments"], list) and job["exit_code"] == 0
+    assert job["arguments"][-1] == "geometry path"
+    assert job["finished_at"] is not None
+    reader = ArtifactReader(result)
+    assert reader.manifest()["artifact_id"] == manifest["artifact_id"]
+    assert reader.status()["state"] == "complete"
+    assert "source_track_ids" in reader.load_reconstruction()
+    assert len(reader.list_frames(limit=3)["items"]) == 3
+    with pytest.raises(ValueError, match="Pair reading"):
+        reader.list_pairs()
     assert view_reconstruction(result, output=tmp_path / "solution.rrd") == 8
     assert view_geometry(geometry, pair=[1, 7], output=tmp_path / "geometry.rrd") == [1, 7]
     assert (tmp_path / "geometry.rrd").stat().st_size > 1000
+
+
+def test_failed_solve_has_structured_terminal_status(tmp_path):
+    output = tmp_path / "failed-solution"
+    with pytest.raises(ValueError, match="Missing artifact manifest"):
+        solve_geometry(tmp_path / "missing-geometry", output, progress=False)
+    status = solve_status(output)
+    assert status["state"] == "failed"
+    assert status["revision"] >= 2
+    assert status["last_error"]["code"]
+    job = json.loads((Path(status["job_directory"]) / "job.json").read_text())
+    assert job["exit_code"] == 1 and job["finished_at"] is not None
+    assert not output.exists()
 
 
 def test_subsample_keeps_original_match_rows(match_run, tmp_path):

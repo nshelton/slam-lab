@@ -1,15 +1,23 @@
 # SLAM Lab
 
 Process monocular RGB videos or image sequences, cache SuperPoint features and
-pairwise matches, verify geometry, and reconstruct camera poses and sparse points.
-Rerun is the current viewer; the processing pipeline uses SQLite/NPZ/JSON files.
+causal online feature tracks or pairwise matches, verify geometry, and reconstruct
+camera poses and sparse points. The Three.js workbench and optional Rerun adapters
+read the same SQLite/NPZ/JSON artifacts.
 
-Video → features → matches → geometry/verified tracks → cameras and points
+Video → features → online tracks
+                 ↘ matches → geometry/verified tracks → cameras and points
 
 Start with [WORKFLOW.md](WORKFLOW.md) for commands and the documentation map.
 [SESSION_HANDOFF.md](SESSION_HANDOFF.md) records the verified end-of-session state,
 results and next work. Both Osaka all-pairs matching runs are complete; the initial
 modular solver has been exercised on 30 selected frames from the cosine run.
+
+The new CUDA-first desktop prototype lives in
+[native_workbench/](native_workbench/README.md). It uses NVDEC, TensorRT,
+CUDA/OpenGL interop, Dear ImGui, and an asynchronous feature database so decode,
+display, SuperPoint, and the forthcoming online landmark tracker share one live
+frame path without extracted images.
 
 **All-pairs LightGlue matching:** see [MATCHING.md](MATCHING.md) for the Osaka run,
 resuming after interruption, progress checks and viewing correspondences in Rerun.
@@ -33,9 +41,21 @@ slam-lab process /path/to/video.mp4
 slam-lab process /path/to/videos --recursive
 slam-lab list
 
+# Build descriptor-only landmarks causally from the cached detections.
+slam-lab track-online .slam-cache/<run-id>/cache.sqlite3 \
+  --output recordings/my-online-tracks --device cuda
+slam-lab track-status recordings/my-online-tracks
+
 # Use the cache directory or cache.sqlite3 path printed by process/list.
 slam-lab view .slam-cache/<run-id>
 ```
+
+`track-online` reuses the exact cached SuperPoint detections and processes them in
+timestamp order. It stores frame observations, persistent landmark IDs, spherical
+descriptor resultants, mean-resultant concentration, and assignment similarities
+in `tracks.sqlite3`. Images remain only in the compressed source video; the
+track artifact references them by source path, timestamp, and original frame index. It commits
+once per frame and resumes an interrupted output.
 
 The viewer provides a video timeline, keypoint overlays colored by confidence,
 feature-count plots, inference timing, and recording metadata. You can inspect
@@ -123,9 +143,9 @@ slam-lab view .slam-cache/<run-id> --save recordings/session.rrd
 rerun recordings/session.rrd
 ```
 
-Viewing requires only the cache, even if the original video has moved. Descriptors
-stay in the cache for future matching; the viewer logs images, points, confidence,
-and scalar statistics. Existing `.rrd` files are never overwritten by `--save`.
+The browser viewer streams the source video and overlays cached detections by timestamp.
+Descriptors stay in the cache for future matching. Existing `.rrd` files are never
+overwritten by `--save`.
 
 ## Install on another machine
 
@@ -157,12 +177,13 @@ Device selection is not part of the key; CPU/GPU results may differ slightly.
 Each frame contains:
 
 - Its original frame index, presentation timestamp, and time relative to the first frame.
-- Original dimensions and resized preview dimensions.
-- A JPEG preview, encoded **after** extraction from the uncompressed resized image.
+- Original dimensions and resized detector dimensions.
 - `float32` keypoints `(N, 2)`, confidence scores `(N,)`, and descriptors `(N, 256)`.
 - Inference duration in milliseconds, excluding decoding, model loading, and cache writes.
 
-Coordinates are `(x, y)` in the cached preview, with the origin at the top left.
+The arrays are stored as raw little-endian float32 SQLite blobs, without NPZ compression.
+No decoded frame or JPEG is stored. Coordinates are `(x, y)` in detector input pixels,
+with the origin at the top left.
 To map back to the original coded image, accounting for pixel centers:
 
 ```python
@@ -219,30 +240,11 @@ Use the modular path for the current matcher-independent solver:
 
 ```bash
 .venv/bin/slam-lab verify-matches recordings/osaka-allpairs-lightglue \
-  --output recordings/osaka-lightglue-geometry-step10 --frame-step 10 --max-frames 30
-.venv/bin/slam-lab solve recordings/osaka-lightglue-geometry-step10 \
-  --output recordings/osaka-lightglue-solver-v1 --no-rerun
+  --output recordings/my-lightglue-geometry --frame-step 10 --max-frames 30
+.venv/bin/slam-lab solve recordings/my-lightglue-geometry \
+  --output recordings/my-lightglue-solution --no-rerun
 ```
 
-This is a suggested next experiment, not an existing result. See [SOLVER.md](SOLVER.md)
-for the completed cosine experiment and solver limitations. Workbench backend changes
-such as stable artifact manifests, source-track mappings and structured solve status
-are planned in [SOLVER_TODO.md](SOLVER_TODO.md), not implemented yet.
-
-## Earlier descriptor-based reconstruction
-
-The legacy `reconstruct` command consumes cached features directly: mutual descriptor matching,
-essential-matrix RANSAC initialization, PnP RANSAC tracking, triangulation, and
-sparse robust bundle adjustment with fixed camera intrinsics.
-
-```bash
-OPENBLAS_NUM_THREADS=1 slam-lab reconstruct .slam-cache/<run-id> \
-  --output recordings/my-reconstruction --fov-deg 60 --max-frames 300
-rerun recordings/my-reconstruction/reconstruction.rrd
-```
-
-Outputs include `poses.json`, `points.ply`, observations and residuals in
-`reconstruction.npz`, and a 2D/3D Rerun recording. Intrinsics are assumed, not
-calibrated; the map has arbitrary monocular scale. Failed frames are marked rather
-than assigned fabricated poses. See [RECONSTRUCTION.md](RECONSTRUCTION.md) for
-the algorithm, camera conventions, Osaka command, tuning, and known limitations.
+See [SOLVER.md](SOLVER.md) for solver limitations. Matching, geometry and reconstruction
+artifacts use mandatory manifests and strict parent validation; reconstructions export
+stable selection mappings and structured solver status.

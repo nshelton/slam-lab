@@ -1,42 +1,21 @@
-# Initial monocular reconstruction
+# Historical monocular reconstruction
 
-This document describes the **legacy `reconstruct` command** and the earlier Osaka
-tracking investigation. It does not consume the exhaustive match stores. Use
+This document preserves the earlier Osaka tracking investigation. Its direct
+`reconstruct` CLI was removed so the project has one supported reconstruction workflow.
+The internal mapper remains only as reused solver machinery and numerical tests. Use
 [SOLVER.md](SOLVER.md) for the current `verify-matches -> solve` pipeline and
 [SESSION_HANDOFF.md](SESSION_HANDOFF.md) for current results and remaining work.
 
-The pipeline now reconstructs a sparse 3D map and camera poses directly from a
+The removed pipeline reconstructed a sparse 3D map and camera poses directly from a
 SuperPoint cache. It uses only the RGB camera. Depth, IMU, ground truth, and the
 original video are not needed. This is an incremental structure-from-motion
 baseline, with no loop closure yet.
 
-## Run and inspect
+## Archived behavior
 
-```bash
-source .venv/bin/activate
-
-# Already-installed dependencies in this workspace; on another machine:
-uv pip install -e '.[reconstruction]'
-
-# Osaka: the cached 300-frame / 30-second preview.
-# Limit BLAS threads to avoid overhead in sparse optimization on many-core CPUs.
-OPENBLAS_NUM_THREADS=1 slam-lab reconstruct \
-  .slam-cache/7065fae5d5e9bd54ae4e14d2d5f051960dfe2d14266d89d5e6771fa037786216 \
-  --output recordings/osaka-reconstruction --fov-deg 60 --max-frames 300
-
-rerun recordings/osaka-reconstruction/reconstruction.rrd
-
-# Reopen or re-export a solved run without matching/optimization.
-slam-lab view-reconstruction recordings/osaka-reconstruction
-slam-lab view-reconstruction recordings/osaka-reconstruction --save recordings/another-view.rrd
-```
-
-Choose a new `--output` directory for each experiment; existing results are never
-overwritten. `--max-frames` defaults to 300 selected cached frames. `--frame-step 3`
-uses every third cached frame. This offline implementation loads selected features
-into memory (roughly 2 MiB of descriptors per frame at 2,048 features), so use
-bounded segments initially. Interrupted reconstructions can be rerun from the
-unchanged feature cache; reconstruction itself does not yet checkpoint/resume.
+The removed path loaded selected features directly and rematched descriptors inside the
+mapper. The supported workflow instead persists matching and verification artifacts
+before solving. The remainder of this document is historical diagnostic context.
 
 Rerun shows the final colored map and trajectory, a moving camera frustum with its
 image, current tracked observations, tracking-support curves, and per-frame status.

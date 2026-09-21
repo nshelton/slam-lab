@@ -105,16 +105,6 @@ def view_matches(path, *, output=None, pair=None, max_links=None, min_track_leng
                     if side:
                         rr.log(root, rr.Transform3D(translation=[*shift, 0]), static=True)
                         rr.log(coverage, rr.Transform3D(translation=[*shift, 0]), static=True)
-                    rr.log(
-                        root + "/image",
-                        rr.EncodedImage(contents=frame["jpeg"], media_type="image/jpeg"),
-                        static=True,
-                    )
-                    rr.log(
-                        coverage + "/image",
-                        rr.EncodedImage(contents=frame["jpeg"], media_type="image/jpeg"),
-                        static=True,
-                    )
                     unmatched = np.ones(len(frame["keypoints"]), dtype=bool)
                     unmatched[matches.indices[:, side]] = False
                     if unmatched.any():
@@ -201,10 +191,6 @@ def view_matches(path, *, output=None, pair=None, max_links=None, min_track_leng
                     visible = lengths[ids] >= min_track_length
                     rr.set_time("frame", sequence=frame["index"])
                     rr.set_time("video_time", duration=np.timedelta64(frame["timestamp_ns"], "ns"))
-                    rr.log(
-                        "camera/image",
-                        rr.EncodedImage(contents=frame["jpeg"], media_type="image/jpeg"),
-                    )
                     rr.log("camera/image/tracks", rr.Clear(recursive=False))
                     if visible.any():
                         rr.log(

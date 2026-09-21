@@ -55,16 +55,13 @@ def view_cache(
             "runtime": cache.get("extractor"),
             "display_min_score": min_score,
             "point_colors": "red (score 0) to green (score >= 0.05)",
-            "coordinates": "cached preview pixels; original size stored per frame",
+            "coordinates": "resized video pixels; image remains in the source video",
         }
         rr.log("info", rr.TextDocument(json.dumps(info, indent=2)), static=True)
         try:
             for frame in cache.frames(descriptors=False):
                 rr.set_time("frame", sequence=frame.index)
                 rr.set_time("video_time", duration=np.timedelta64(frame.timestamp_ns, "ns"))
-                rr.log(
-                    "camera/image", rr.EncodedImage(contents=frame.jpeg, media_type="image/jpeg")
-                )
                 visible = frame.scores >= min_score
                 scores = frame.scores[visible]
                 if len(scores):

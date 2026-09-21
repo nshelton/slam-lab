@@ -4,7 +4,6 @@ import json
 import sqlite3
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -21,7 +20,6 @@ class CachedFrame:
     height: int
     original_width: int
     original_height: int
-    jpeg: bytes
     keypoints: np.ndarray
     scores: np.ndarray
     descriptors: np.ndarray
@@ -47,8 +45,9 @@ class FrameCache(AbstractContextManager):
                     height INTEGER NOT NULL,
                     original_width INTEGER NOT NULL,
                     original_height INTEGER NOT NULL,
-                    jpeg BLOB NOT NULL,
-                    features BLOB NOT NULL,
+                    keypoints BLOB NOT NULL,
+                    scores BLOB NOT NULL,
+                    descriptors BLOB NOT NULL,
                     extraction_ms REAL NOT NULL,
                     keypoint_count INTEGER NOT NULL
                 );
@@ -90,16 +89,14 @@ class FrameCache(AbstractContextManager):
         arrays = (frame.keypoints, frame.scores, frame.descriptors)
         if not all(np.isfinite(array).all() for array in arrays):
             raise ValueError("Non-finite feature values")
-        features = BytesIO()
-        np.savez_compressed(
-            features,
-            keypoints=np.asarray(frame.keypoints, dtype=np.float32),
-            scores=np.asarray(frame.scores, dtype=np.float32),
-            descriptors=np.asarray(frame.descriptors, dtype=np.float32),
-        )
+        keypoints = np.asarray(frame.keypoints, dtype="<f4")
+        scores = np.asarray(frame.scores, dtype="<f4")
+        descriptors = np.asarray(frame.descriptors, dtype="<f4")
         with self.db:
             self.db.execute(
-                "INSERT INTO frames VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO frames(frame_index,timestamp_ns,pts,width,height,"
+                "original_width,original_height,keypoints,scores,descriptors,"
+                "extraction_ms,keypoint_count) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     frame.index,
                     frame.timestamp_ns,
@@ -108,8 +105,9 @@ class FrameCache(AbstractContextManager):
                     frame.height,
                     frame.original_width,
                     frame.original_height,
-                    frame.jpeg,
-                    features.getvalue(),
+                    keypoints.tobytes(),
+                    scores.tobytes(),
+                    descriptors.tobytes(),
                     frame.extraction_ms,
                     size,
                 ),
@@ -117,18 +115,23 @@ class FrameCache(AbstractContextManager):
 
     def frames(self, *, descriptors: bool = True):
         cursor = self.db.execute(
-            "SELECT frame_index, timestamp_ns, pts, width, height, original_width, "
-            "original_height, jpeg, features, extraction_ms FROM frames ORDER BY frame_index"
+            "SELECT frame_index,timestamp_ns,pts,width,height,original_width,original_height,"
+            "keypoints,scores,descriptors,extraction_ms,keypoint_count "
+            "FROM frames ORDER BY frame_index"
         )
         for row in cursor:
-            with np.load(BytesIO(row[8]), allow_pickle=False) as features:
-                yield CachedFrame(
-                    *row[:8],
-                    keypoints=features["keypoints"],
-                    scores=features["scores"],
-                    descriptors=features["descriptors"] if descriptors else np.empty((0, 256)),
-                    extraction_ms=row[9],
-                )
+            count = row[11]
+            yield CachedFrame(
+                *row[:7],
+                keypoints=np.frombuffer(row[7], dtype="<f4").reshape(count, 2).copy(),
+                scores=np.frombuffer(row[8], dtype="<f4").reshape(count).copy(),
+                descriptors=(
+                    np.frombuffer(row[9], dtype="<f4").reshape(count, 256).copy()
+                    if descriptors
+                    else np.empty((0, 256), dtype=np.float32)
+                ),
+                extraction_ms=row[10],
+            )
 
 
 def resolve_cache(path: Path) -> Path:

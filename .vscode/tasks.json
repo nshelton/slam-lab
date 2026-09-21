@@ -1,0 +1,89 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Native: install system dependencies",
+      "type": "shell",
+      "command": "bash native_workbench/tools/install_ubuntu2604_system.sh",
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "dedicated" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Native: configure core",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv-cuda/bin/cmake",
+      "args": ["--preset", "core-debug"],
+      "options": { "cwd": "${workspaceFolder}/native_workbench" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Native: build core",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv-cuda/bin/cmake",
+      "args": ["--build", "--preset", "core-debug"],
+      "options": { "cwd": "${workspaceFolder}/native_workbench" },
+      "dependsOn": "Native: configure core",
+      "problemMatcher": ["$gcc"],
+      "group": { "kind": "build", "isDefault": true }
+    },
+    {
+      "label": "Native: configure app (Debug)",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv-cuda/bin/cmake",
+      "args": ["--preset", "app-debug"],
+      "options": { "cwd": "${workspaceFolder}/native_workbench" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Native: build app (Debug)",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv-cuda/bin/cmake",
+      "args": ["--build", "--preset", "app-debug"],
+      "options": { "cwd": "${workspaceFolder}/native_workbench" },
+      "dependsOn": "Native: configure app (Debug)",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Native: configure app (Release)",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv-cuda/bin/cmake",
+      "args": ["--preset", "app-release"],
+      "options": { "cwd": "${workspaceFolder}/native_workbench" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Native: build app (Release)",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv-cuda/bin/cmake",
+      "args": ["--build", "--preset", "app-release"],
+      "options": { "cwd": "${workspaceFolder}/native_workbench" },
+      "dependsOn": "Native: configure app (Release)",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Native: export SuperPoint ONNX",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv-cuda/bin/python",
+      "args": [
+        "${workspaceFolder}/native_workbench/tools/export_superpoint_onnx.py",
+        "${workspaceFolder}/native_workbench/models/superpoint-1024x576-k2048.onnx"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Native: build SuperPoint engine",
+      "type": "process",
+      "command": "trtexec",
+      "args": [
+        "--onnx=${workspaceFolder}/native_workbench/models/superpoint-1024x576-k2048.onnx",
+        "--saveEngine=${workspaceFolder}/native_workbench/models/superpoint-1024x576-k2048.engine",
+        "--skipInference"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "dependsOn": "Native: export SuperPoint ONNX",
+      "problemMatcher": []
+    }
+  ]
+}

@@ -5,7 +5,8 @@ Status: the first modular implementation is available as `verify-matches`,
 and [WORKBENCH_INTERFACE.md](WORKBENCH_INTERFACE.md) for the GUI integration contract.
 The broader architecture below still includes planned capabilities: global solvers,
 track splitting, individual association-conflict records, and periodic/local BA.
-The existing `reconstruct` command retains the original video-order mapper.
+The original video-order mapper remains internal for shared machinery and tests; it has
+no CLI. The manifested modular workflow is the only supported interface.
 
 Workbench integration priorities and acceptance criteria are tracked separately in
 [SOLVER_TODO.md](SOLVER_TODO.md): artifact/observation identity and structured solve

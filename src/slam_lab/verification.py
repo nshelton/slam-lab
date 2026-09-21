@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
+from slam_lab.artifacts import opaque_id, validate_manifest, write_manifest
 from slam_lab.config import fingerprint
 from slam_lab.correspondence import MatchStore, associate_tracks, unpack_matches
 from slam_lab.geometry import Camera, triangulate
@@ -222,7 +223,7 @@ class GeometryStore(AbstractContextManager):
                 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS frames (
                     row_id INTEGER PRIMARY KEY, frame_index INTEGER, timestamp_ns INTEGER,
-                    width INTEGER, height INTEGER, jpeg BLOB, keypoints BLOB,
+                    width INTEGER, height INTEGER, keypoints BLOB,
                     keypoint_count INTEGER);
                 CREATE TABLE IF NOT EXISTS pairs (
                     first INTEGER, second INTEGER, source_hash TEXT, arrays BLOB, summary TEXT,
@@ -307,6 +308,7 @@ def verify_matches(
     if frame_step < 1 or (max_frames is not None and max_frames < 2):
         raise ValueError("Need a positive frame step and at least two frames")
     source, output = Path(match_run).expanduser().resolve(), Path(output).expanduser().resolve()
+    source_manifest = validate_manifest(source, artifact_type="matches")
     if source == output or (output.exists() and not (output / "geometry.sqlite3").exists()):
         raise FileExistsError("Choose a new geometry output or resume an existing geometry run")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -319,6 +321,17 @@ def verify_matches(
             MatchStore(source / "matches.sqlite3") as matches,
             GeometryStore(output / "geometry.sqlite3", create=True) as store,
         ):
+            saved_artifact_id = store.get("artifact_id")
+            if saved_artifact_id is None and store.get("identity") is not None:
+                raise ValueError("Geometry run has no artifact identity; choose a new --output")
+            if saved_artifact_id is None:
+                saved_artifact_id = opaque_id("geometry")
+                store.set(
+                    artifact_id=saved_artifact_id,
+                    parent_artifact_id=source_manifest["artifact_id"],
+                )
+            if store.get("parent_artifact_id") != source_manifest["artifact_id"]:
+                raise ValueError("Geometry parent does not match the supplied matching artifact")
             rows = matches.db.execute("SELECT * FROM frames ORDER BY row_id").fetchall()
             rows = rows[::frame_step][:max_frames]
             if len(rows) < 2:
@@ -338,8 +351,13 @@ def verify_matches(
             }
             if store.get("identity") not in (None, identity):
                 raise ValueError("Geometry inputs or settings changed; choose a new --output")
+            if store.get("phase") == "complete":
+                manifest = validate_manifest(output, artifact_type="geometry")
+                if manifest["artifact_id"] != saved_artifact_id:
+                    raise ValueError("Geometry manifest does not belong to this geometry store")
+                return store.get("summary")
             with store.db:
-                store.db.executemany("INSERT OR IGNORE INTO frames VALUES (?,?,?,?,?,?,?,?)", rows)
+                store.db.executemany("INSERT OR IGNORE INTO frames VALUES (?,?,?,?,?,?,?)", rows)
             store.set(
                 identity=identity,
                 source_match_run=str(source),
@@ -398,6 +416,16 @@ def verify_matches(
                 store.set(phase="building_tracks")
                 summary = build_verified_tracks(store, output)
                 store.set(elapsed_seconds=perf_counter() - started)
+                store.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                write_manifest(
+                    output,
+                    artifact_id=saved_artifact_id,
+                    artifact_type="geometry",
+                    parent_artifact_id=source_manifest["artifact_id"],
+                    producer_job_id=None,
+                    payloads=["geometry.sqlite3", "summary.json", "tracks.npz"],
+                    capabilities=["verified_tracks", "matching_frame_rows"],
+                )
                 return summary
             except KeyboardInterrupt:
                 store.set(phase="paused")

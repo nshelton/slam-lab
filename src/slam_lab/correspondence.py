@@ -16,6 +16,7 @@ from time import perf_counter
 import numpy as np
 from tqdm import tqdm
 
+from slam_lab.artifacts import opaque_id, validate_manifest, write_manifest
 from slam_lab.cache import FrameCache, resolve_cache
 from slam_lab.config import fingerprint
 from slam_lab.matching import CosineMatcher, DescriptorMatcher, LightGlueMatcher, PairMatches
@@ -66,7 +67,7 @@ class MatchStore(AbstractContextManager):
                 CREATE TABLE IF NOT EXISTS frames (
                     row_id INTEGER PRIMARY KEY, frame_index INTEGER NOT NULL,
                     timestamp_ns INTEGER NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL,
-                    jpeg BLOB NOT NULL, keypoints BLOB NOT NULL, keypoint_count INTEGER NOT NULL);
+                    keypoints BLOB NOT NULL, keypoint_count INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS pairs (
                     first INTEGER NOT NULL, second INTEGER NOT NULL, count INTEGER NOT NULL,
                     matches BLOB NOT NULL, elapsed_ms REAL NOT NULL,
@@ -94,6 +95,8 @@ class MatchStore(AbstractContextManager):
     def initialize(self, frames, identity, source, *, allow_runtime_change=False):
         saved = self.get("identity")
         if saved is not None:
+            if self.get("artifact_id") is None:
+                raise ValueError("Matching run has no artifact identity; choose a new --output")
             compatible = allow_runtime_change and algorithm_identity(saved) == algorithm_identity(
                 identity
             )
@@ -108,7 +111,7 @@ class MatchStore(AbstractContextManager):
             raise ValueError("Unrecognized incomplete match store")
         with self.db:
             self.db.executemany(
-                "INSERT INTO frames VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO frames VALUES (?,?,?,?,?,?,?)",
                 [
                     (
                         row,
@@ -116,7 +119,6 @@ class MatchStore(AbstractContextManager):
                         f.timestamp_ns,
                         f.width,
                         f.height,
-                        f.jpeg,
                         np.asarray(f.keypoints, dtype="<f4").tobytes(),
                         len(f.keypoints),
                     )
@@ -125,6 +127,7 @@ class MatchStore(AbstractContextManager):
             )
             values = {
                 "schema_version": 1,
+                "artifact_id": opaque_id("matches"),
                 "identity": identity,
                 "source": source,
                 "frames": len(frames),
@@ -198,7 +201,7 @@ class MatchStore(AbstractContextManager):
 
     def frame(self, row):
         record = self.db.execute(
-            "SELECT frame_index,timestamp_ns,width,height,jpeg,keypoints "
+            "SELECT frame_index,timestamp_ns,width,height,keypoints "
             "FROM frames WHERE row_id=?",
             (row,),
         ).fetchone()
@@ -209,8 +212,7 @@ class MatchStore(AbstractContextManager):
             "timestamp_ns": record[1],
             "width": record[2],
             "height": record[3],
-            "jpeg": record[4],
-            "keypoints": np.frombuffer(record[5], dtype="<f4").reshape(-1, 2),
+            "keypoints": np.frombuffer(record[4], dtype="<f4").reshape(-1, 2),
         }
 
 
@@ -224,7 +226,6 @@ def selected_identity(frames, matcher, max_frames, frame_step):
         )
         digest.update(np.asarray(frame.keypoints, dtype="<f4").tobytes())
         digest.update(np.asarray(frame.descriptors, dtype="<f4").tobytes())
-        digest.update(frame.jpeg)
     return {
         "schema": 1,
         "selection_hash": digest.hexdigest(),
@@ -339,6 +340,21 @@ def finalize_matches(store, output):
     temporary.write_text(json.dumps(summary, indent=2) + "\n")
     temporary.replace(output / "summary.json")
     store.set(phase="complete", summary=summary, completed_at=datetime.now(UTC).isoformat())
+    store.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    write_manifest(
+        output,
+        artifact_id=store.get("artifact_id"),
+        artifact_type="matches",
+        parent_artifact_id=None,
+        producer_job_id=None,
+        payloads=["matches.sqlite3", "summary.json", "tracks.npz"],
+        capabilities=["video_referenced_frames", "matching_observation_namespace"],
+        origin={
+            "kind": "feature_cache_snapshot",
+            "feature_cache": store.get("feature_cache"),
+            "selection_identity": store.get("identity_hash"),
+        },
+    )
     return summary
 
 
@@ -395,6 +411,9 @@ def _match_all(
     with MatchStore(output / "matches.sqlite3", create=True) as store:
         store.initialize(frames, identity, source, allow_runtime_change=allow_runtime_change)
         if store.get("phase") == "complete":
+            manifest = validate_manifest(output, artifact_type="matches")
+            if manifest["artifact_id"] != store.get("artifact_id"):
+                raise ValueError("Matching manifest does not belong to this match store")
             return store.get("summary")
         store.set(
             phase="matching",

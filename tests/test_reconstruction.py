@@ -1,11 +1,9 @@
 import json
 from dataclasses import replace
-from io import BytesIO
 
 import cv2
 import numpy as np
 import pytest
-from PIL import Image
 
 from slam_lab.bundle import normalize_baseline
 from slam_lab.cache import CachedFrame, FrameCache
@@ -31,8 +29,6 @@ def scene():
     points = rng.uniform([-2, -1.4, 5], [2, 1.4, 10], (250, 3))
     descriptors = rng.normal(size=(len(points), 256))
     descriptors /= np.linalg.norm(descriptors, axis=1, keepdims=True)
-    jpeg = BytesIO()
-    Image.new("RGB", (640, 480), (120, 170, 200)).save(jpeg, format="JPEG")
     frames, poses = [], []
     for frame_id in range(12):
         pose = np.eye(4)
@@ -57,7 +53,6 @@ def scene():
                 480,
                 1280,
                 960,
-                jpeg.getvalue(),
                 xy[order].astype(np.float32),
                 np.ones(len(order), np.float32),
                 desc[order].astype(np.float32),

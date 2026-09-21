@@ -1,0 +1,35 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Native workbench (CUDA)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/native_workbench/build/app-debug/slam-native-workbench",
+      "args": [
+        "--video", "${input:nativeVideo}",
+        "--engine", "${input:superpointEngine}",
+        "--db", "${workspaceFolder}/recordings/native-vscode/features.sqlite3"
+      ],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "Native: build app (Debug)",
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "externalConsole": false
+    }
+  ],
+  "inputs": [
+    {
+      "id": "nativeVideo",
+      "type": "promptString",
+      "description": "Absolute path to the source video",
+      "default": "/home/nick/Downloads/osaka.mp4"
+    },
+    {
+      "id": "superpointEngine",
+      "type": "promptString",
+      "description": "Path to the TensorRT SuperPoint engine",
+      "default": "native_workbench/models/superpoint-1024x576-k2048.engine"
+    }
+  ]
+}

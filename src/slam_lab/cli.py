@@ -60,35 +60,6 @@ def parser() -> argparse.ArgumentParser:
     view.add_argument(
         "--point-radius", type=float, default=2.0, help="Point radius in image pixels"
     )
-    reconstruct = commands.add_parser(
-        "reconstruct", help="Solve monocular camera poses and sparse 3D"
-    )
-    reconstruct.add_argument("cache", type=Path)
-    reconstruct.add_argument("--output", type=Path, required=True, help="New output directory")
-    reconstruct.add_argument("--max-frames", type=positive_int, default=300)
-    reconstruct.add_argument(
-        "--frame-step", type=positive_int, default=1, help="Use every Nth cached frame"
-    )
-    reconstruct.add_argument(
-        "--fov-deg", type=float, default=60.0, help="Assumed horizontal FOV; overridden by --fx"
-    )
-    for parameter in ("fx", "fy", "cx", "cy"):
-        reconstruct.add_argument(
-            f"--{parameter}", type=float, help="Fixed intrinsic in CACHED preview pixels"
-        )
-    reconstruct.add_argument("--ratio", type=float, default=0.8)
-    reconstruct.add_argument("--ransac-px", type=float, default=1.5)
-    reconstruct.add_argument("--reprojection-px", type=float, default=3.0)
-    reconstruct.add_argument(
-        "--min-parallax", type=float, default=1.0, help="Triangulation angle in degrees"
-    )
-    reconstruct.add_argument("--min-track-length", type=positive_int, default=3)
-    reconstruct.add_argument(
-        "--bundle-evaluations", type=int, default=30, help="0 disables bundle adjustment"
-    )
-    reconstruct.add_argument("--seed", type=int, default=7)
-    reconstruct.add_argument("--quiet", action="store_true")
-    reconstruct.add_argument("--no-rerun", action="store_true", help="Skip automatic Rerun export")
     reconstruction_view = commands.add_parser(
         "view-reconstruction", help="View solved poses and points in Rerun"
     )
@@ -128,6 +99,22 @@ def parser() -> argparse.ArgumentParser:
     )
     status = commands.add_parser("match-status", help="Read saved matching progress")
     status.add_argument("run", type=Path)
+    online = commands.add_parser(
+        "track-online", help="Build causal descriptor-only landmarks from cached features"
+    )
+    online.add_argument("cache", type=Path)
+    online.add_argument("--output", type=Path, required=True)
+    online.add_argument("--max-frames", type=positive_int)
+    online.add_argument("--min-similarity", type=float, default=0.82)
+    online.add_argument("--min-margin", type=float, default=0.02)
+    online.add_argument("--max-inactive-frames", type=positive_int, default=15)
+    online.add_argument("--landmark-chunk-size", type=positive_int, default=4096)
+    online.add_argument("--device", choices=["cpu", "cuda", "auto"], default="cpu")
+    online.add_argument("--quiet", action="store_true")
+    online_status = commands.add_parser(
+        "track-status", help="Read online landmark tracking progress as JSON"
+    )
+    online_status.add_argument("run", type=Path)
     matches_view = commands.add_parser("view-matches", help="View matches/tracks in Rerun")
     matches_view.add_argument("run", type=Path)
     matches_view.add_argument(
@@ -176,6 +163,10 @@ def parser() -> argparse.ArgumentParser:
     solve.add_argument("--min-parallax", type=float, default=1.0)
     solve.add_argument("--quiet", action="store_true")
     solve.add_argument("--no-rerun", action="store_true", help="Skip automatic Rerun export")
+    solve_status_parser = commands.add_parser(
+        "solve-status", help="Read structured solver job progress as JSON"
+    )
+    solve_status_parser.add_argument("run", type=Path, help="Output path or job directory")
     return root
 
 
@@ -236,8 +227,41 @@ def list_command(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     raw_args = sys.argv[1:] if argv is None else argv
+    invocation = (
+        [str(Path(sys.argv[0]).resolve()), *raw_args]
+        if argv is None
+        else [sys.executable, "-m", "slam_lab", *raw_args]
+    )
     args = parser().parse_args(raw_args)
     try:
+        if args.command == "track-status":
+            from slam_lab.online_tracker import online_track_status
+
+            print(json.dumps(online_track_status(args.run), indent=2))
+            return 0
+        if args.command == "track-online":
+            from slam_lab.online_tracker import OnlineTrackerConfig, track_online
+
+            result = track_online(
+                args.cache,
+                args.output,
+                config=OnlineTrackerConfig(
+                    min_similarity=args.min_similarity,
+                    min_margin=args.min_margin,
+                    max_inactive_frames=args.max_inactive_frames,
+                    landmark_chunk_size=args.landmark_chunk_size,
+                    device=args.device,
+                ),
+                max_frames=args.max_frames,
+                progress=not args.quiet,
+            )
+            print(f"Saved online tracks to {result}")
+            return 0
+        if args.command == "solve-status":
+            from slam_lab.solve_jobs import solve_status
+
+            print(json.dumps(solve_status(args.run), indent=2))
+            return 0
         if args.command == "geometry-status":
             from slam_lab.verification import geometry_status
 
@@ -279,6 +303,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.geometry,
                 args.output,
                 progress=not args.quiet,
+                invocation=invocation,
                 config=ReconstructionConfig(
                     bundle_evaluations=args.bundle_evaluations,
                     min_track_length=args.min_track_length,
@@ -371,35 +396,6 @@ def main(argv: list[str] | None = None) -> int:
             return process_command(args)
         if args.command == "list":
             return list_command(args)
-        if args.command == "reconstruct":
-            from slam_lab.reconstruction import ReconstructionConfig, reconstruct
-            from slam_lab.reconstruction_io import view_reconstruction
-
-            config = ReconstructionConfig(
-                ratio=args.ratio,
-                essential_threshold=args.ransac_px,
-                reprojection_threshold=args.reprojection_px,
-                min_parallax=args.min_parallax,
-                min_track_length=args.min_track_length,
-                bundle_evaluations=args.bundle_evaluations,
-                seed=args.seed,
-            )
-            result = reconstruct(
-                args.cache,
-                args.output,
-                config=config,
-                camera_options={
-                    key: getattr(args, key) for key in ("fx", "fy", "cx", "cy", "fov_deg")
-                },
-                max_frames=args.max_frames,
-                frame_step=args.frame_step,
-                progress=not args.quiet,
-            )
-            if not args.no_rerun:
-                recording = result / "reconstruction.rrd"
-                view_reconstruction(result, output=recording)
-            print(f"Saved reconstruction to {result}")
-            return 0
         if args.command == "view-reconstruction":
             from slam_lab.reconstruction_io import view_reconstruction
 

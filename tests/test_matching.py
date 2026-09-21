@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from slam_lab.artifacts import validate_manifest
 from slam_lab.config import ExtractionConfig
 from slam_lab.correspondence import MatchStore, associate_tracks, match_all, match_status
 from slam_lab.match_view import view_matches
@@ -63,7 +64,7 @@ def test_all_pairs_resume_identity_and_self_contained_view(video, tmp_path, extr
     output = tmp_path / "matches"
     with pytest.raises(RuntimeError, match="simulated interruption"):
         match_all(
-            cached.path, output, matcher=CountingMatcher(fail_at=2), workers=1, progress=False
+            cached.path, output, matcher=CountingMatcher(fail_at=4), workers=1, progress=False
         )
     partial = match_status(output)
     assert 0 < partial["completed_pairs"] < 6
@@ -73,6 +74,12 @@ def test_all_pairs_resume_identity_and_self_contained_view(video, tmp_path, extr
     assert resumed.calls == 6 - partial["completed_pairs"]
     assert summary["unique_pairs"] == 6
     assert summary["geometry_verified"] is False
+    manifest = validate_manifest(output, artifact_type="matches")
+    assert manifest["parent_artifact_id"] is None
+    assert manifest["capabilities"] == [
+        "matching_observation_namespace",
+        "video_referenced_frames",
+    ]
     with MatchStore(output / "matches.sqlite3") as store:
         assert list(store.db.execute("SELECT first,second FROM pairs ORDER BY first,second")) == [
             (0, 1),
@@ -238,7 +245,7 @@ def test_explicit_runtime_switch_preserves_legacy_pairs_and_rejects_model_change
 
     cached = process_video(video, tmp_path / "cache", ExtractionConfig(), extractor, progress=False)
     output = tmp_path / "mixed-runtime"
-    cpu = CountingMatcher(fail_at=2)
+    cpu = CountingMatcher(fail_at=4)
     cpu.provenance = {
         "name": "lightglue-superpoint",
         "device": "cpu",
