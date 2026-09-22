@@ -9,6 +9,7 @@ extern "C" {
 }
 
 #include <cerrno>
+#include <algorithm>
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
@@ -85,9 +86,41 @@ class FfmpegCudaDecoder final : public VideoDecoder {
     }
     const AVRational rate = av_guess_frame_rate(format_, stream_, nullptr);
     nominal_fps_ = rate.den ? av_q2d(rate) : 0.0;
+    if (stream_->start_time != AV_NOPTS_VALUE) {
+      start_time_ns_ = av_rescale_q(stream_->start_time, stream_->time_base,
+                                    AVRational{1, 1000000000});
+    } else if (format_->start_time != AV_NOPTS_VALUE) {
+      start_time_ns_ = av_rescale_q(format_->start_time, AV_TIME_BASE_Q,
+                                    AVRational{1, 1000000000});
+    } else {
+      start_time_ns_ = 0;
+    }
+    if (stream_->duration != AV_NOPTS_VALUE && stream_->duration > 0) {
+      duration_ns_ = av_rescale_q(stream_->duration, stream_->time_base,
+                                  AVRational{1, 1000000000});
+    } else if (format_->duration != AV_NOPTS_VALUE && format_->duration > 0) {
+      duration_ns_ = av_rescale_q(format_->duration, AV_TIME_BASE_Q,
+                                  AVRational{1, 1000000000});
+    } else {
+      duration_ns_ = 0;
+    }
     codec_name_ = codec->name;
     frame_index_ = 0;
     draining_ = false;
+  }
+
+  void seek_ns(std::int64_t timestamp_ns) override {
+    if (!format_ || !codec_ || !stream_) throw std::runtime_error("Video is not open");
+    const auto clamped = std::max<std::int64_t>(0, timestamp_ns);
+    const std::int64_t stream_timestamp = av_rescale_q(
+        clamped, AVRational{1, 1000000000}, stream_->time_base);
+    require(av_seek_frame(format_, stream_index_, stream_timestamp, AVSEEK_FLAG_BACKWARD),
+            "seek video");
+    avcodec_flush_buffers(codec_);
+    av_packet_unref(packet_);
+    av_frame_unref(frame_);
+    draining_ = false;
+    frame_index_ = 0;  // Ordinals after a seek are not source frame indices.
   }
 
   bool next(GpuFrame& output) override {
@@ -159,6 +192,8 @@ class FfmpegCudaDecoder final : public VideoDecoder {
   }
 
   [[nodiscard]] double nominal_fps() const override { return nominal_fps_; }
+  [[nodiscard]] std::int64_t duration_ns() const override { return duration_ns_; }
+  [[nodiscard]] std::int64_t start_time_ns() const override { return start_time_ns_; }
   [[nodiscard]] std::string codec_name() const override { return codec_name_; }
 
  private:
@@ -181,6 +216,8 @@ class FfmpegCudaDecoder final : public VideoDecoder {
     }
     stream_ = nullptr;
     stream_index_ = -1;
+    duration_ns_ = 0;
+    start_time_ns_ = 0;
   }
 
   AVFormatContext* format_{};
@@ -191,6 +228,8 @@ class FfmpegCudaDecoder final : public VideoDecoder {
   AVStream* stream_{};
   int stream_index_{-1};
   std::uint64_t frame_index_{};
+  std::int64_t duration_ns_{};
+  std::int64_t start_time_ns_{};
   double nominal_fps_{};
   std::string codec_name_;
   bool draining_{};

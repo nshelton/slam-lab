@@ -12,14 +12,31 @@ There is one decoded-frame owner and no image fan-out through files:
    the TensorRT input allocation.
 4. TensorRT runs SuperPoint. Its fixed top-k output avoids dynamic allocation
    in the frame loop.
-5. The CPU receives only the small keypoint/score output plus descriptors. The
-   online landmark tracker will consume this batch immediately.
+5. The CPU receives keypoints, scores, and descriptors. cuBLAS searches the
+   active landmark means on the GPU, then a one-to-one greedy pass updates the
+   spherical resultants on the CPU.
 6. A bounded writer queue moves persistence to a separate thread. SQLite uses
    WAL, `synchronous=NORMAL`, and multi-frame transactions.
+
+The alternative optical-flow path takes the decoded luma plane directly into
+the NVIDIA Optical Flow CUDA API. The dedicated optical-flow engine emits a
+4x4 grid of S10.5 motion vectors, which advects regularly seeded track points.
+After each step, the tracker keeps the longest-lived track in each seed cell
+and respawns a point in every empty cell, preserving coverage after camera motion.
+It does not run TensorRT, compute descriptors, or perform cosine association.
+The same SQLite writer stores point coordinates and IDs with
+`descriptor_encoding=none`; method metadata keeps the databases distinct.
 
 The initial implementation is synchronous across display and inference so its
 timings are easy to trust. The next performance pass should use three frame
 slots with CUDA events: decode/display N+1, infer N, and read back/write N-1.
+
+The video scrubber lazily opens a second NVDEC decoder. It seeks backward to a
+keyframe and decodes forward to the chosen timestamp for display. The primary
+decoder and online tracker remain at their sequential processing position.
+Cached feature overlays are looked up by source timestamp and PTS through an
+indexed SQLite read-only connection. This keeps scrub previews separate from
+the causal track and database write path.
 
 ## Persistence contract
 
@@ -30,6 +47,8 @@ The source video is the only image store. A frame row contains:
 - packed little-endian float32 `(x, y)` keypoints and scores;
 - packed row-major 256-D descriptors in float16 or float32;
 - decode, preprocessing, inference, and readback timings.
+- landmark IDs and cosine scores for every feature, tracking timing, and
+  new/matched counts; a `landmarks` table stores cumulative resultants.
 
 There is no compatibility promise with the Python workbench cache. The native
 store has its own schema version and can change while this prototype is being
@@ -43,9 +62,9 @@ A C layer would add wrappers without making the hot path faster.
 
 ## Landmark tracking boundary
 
-The online tracker should own GPU-resident landmark descriptor means and run
-association on the inference stream or a dependent CUDA stream. It should emit
-only assignments and updated diagnostics to the UI/DB:
+The current tracker uploads active landmark means each frame and uses a
+dedicated CUDA stream for the cosine matrix and top-two reduction. It emits
+assignments and updated diagnostics to the UI/DB:
 
 ```text
 SuperPoint output
@@ -58,6 +77,12 @@ SuperPoint output
 
 This preserves the descriptor-only experiment. Geometry, LightGlue, and pose
 estimation can remain comparison modes outside this first tracker.
+
+The diagnostics window fits a fixed two-component PCA basis to the first
+2,048 descriptors and projects current observations onto it. It does not
+participate in association. Track-length histogram bins update in memory as
+each landmark grows; on resume, they are rebuilt from persisted landmark
+observation counts.
 
 ## Scale decisions still to measure
 

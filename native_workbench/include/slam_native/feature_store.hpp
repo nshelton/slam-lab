@@ -1,6 +1,8 @@
 #pragma once
 
 #include "slam_native/types.hpp"
+#include "slam_native/online_tracker.hpp"
+#include "slam_native/flow_tracker.hpp"
 
 #include <condition_variable>
 #include <cstddef>
@@ -15,7 +17,7 @@ struct sqlite3;
 
 namespace slam_native {
 
-enum class DescriptorEncoding { float16, float32 };
+enum class DescriptorEncoding { float16, float32, none };
 
 struct StoreConfig {
   DescriptorEncoding descriptor_encoding{DescriptorEncoding::float16};
@@ -36,11 +38,20 @@ class FeatureStore {
                    int input_width,
                    int input_height,
                    int max_keypoints,
-                   float threshold);
+                   float threshold,
+                   const TrackerConfig& tracker,
+                   bool optical_flow = false);
+  [[nodiscard]] std::vector<LandmarkState> load_active_landmarks(
+      std::uint32_t max_inactive_frames) const;
+  [[nodiscard]] std::uint64_t next_landmark_id() const;
+  [[nodiscard]] TrackLengthHistogram load_length_histogram() const;
+  [[nodiscard]] std::vector<FlowTrackPosition> load_latest_positions() const;
   void enqueue(FrameFeatures features);
   void flush();
   [[nodiscard]] std::size_t queued() const;
   [[nodiscard]] std::uint64_t persisted() const;
+  [[nodiscard]] std::uint64_t landmark_rows() const;
+  [[nodiscard]] std::uint64_t observation_count() const;
   [[nodiscard]] std::int64_t last_frame_index() const;
 
  private:
@@ -60,6 +71,8 @@ class FeatureStore {
   bool writing_{false};
   std::exception_ptr writer_error_;
   std::uint64_t persisted_{};
+  std::uint64_t landmark_rows_{};
+  std::uint64_t observation_count_{};
   std::int64_t last_frame_index_{-1};
 };
 

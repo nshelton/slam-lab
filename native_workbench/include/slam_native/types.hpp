@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <memory>
 #include <string>
 #include <vector>
@@ -31,6 +32,15 @@ struct Keypoint {
   float score{};
 };
 
+struct LandmarkState {
+  std::uint64_t id{};
+  std::array<float, 256> resultant{};
+  std::uint64_t observation_count{};
+  std::uint64_t first_frame{};
+  std::uint64_t last_frame{};
+  float concentration{};
+};
+
 // Descriptor rows are contiguous. Each row has descriptor_dimension values.
 // The inference result stays in float32 for online tracking. FeatureStore
 // chooses its on-disk encoding independently.
@@ -42,6 +52,12 @@ struct FrameFeatures {
   int height{};
   std::vector<Keypoint> keypoints;
   std::vector<float> descriptors;
+  std::vector<std::uint64_t> landmark_ids;
+  std::vector<float> landmark_similarities;
+  std::vector<LandmarkState> landmark_updates;
+  std::uint32_t new_landmarks{};
+  std::uint32_t matched_landmarks{};
+  double tracking_ms{};
   double decode_ms{};
   double preprocess_ms{};
   double inference_ms{};
@@ -60,4 +76,3 @@ struct PipelineStats {
 };
 
 }  // namespace slam_native
-
