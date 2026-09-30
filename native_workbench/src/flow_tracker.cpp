@@ -1,142 +1,44 @@
 #include "slam_native/flow_tracker.hpp"
-
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
-#include <utility>
 
 namespace slam_native {
+namespace {
+// Must match the CUDA sampler in flow_association.cu exactly.
+FlowVector bilinear(const std::vector<FlowVector>& field, int width, int height, int grid,
+                    float x, float y) {
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  if (width <= 0 || height <= 0 || grid <= 0 || !std::isfinite(x) || !std::isfinite(y) ||
+      field.size() != static_cast<std::size_t>(width) * height) return {nan, nan};
+  const float half = 0.5F * static_cast<float>(grid - 1);
+  const float gx = std::clamp((x - half) / grid, 0.0F, float(width - 1));
+  const float gy = std::clamp((y - half) / grid, 0.0F, float(height - 1));
+  const int x0 = static_cast<int>(gx), y0 = static_cast<int>(gy);
+  const int x1 = std::min(x0 + 1, width - 1), y1 = std::min(y0 + 1, height - 1);
+  const float wx = gx - x0, wy = gy - y0;
+  const auto at = [&](int c, int r) { return field[static_cast<std::size_t>(r) * width + c]; };
+  const auto a = at(x0, y0), b = at(x1, y0), c = at(x0, y1), d = at(x1, y1);
+  return {(a.dx * (1 - wx) + b.dx * wx) * (1 - wy) + (c.dx * (1 - wx) + d.dx * wx) * wy,
+          (a.dy * (1 - wx) + b.dy * wx) * (1 - wy) + (c.dy * (1 - wx) + d.dy * wx) * wy};
+}
+}  // namespace
 
 FlowVector FlowField::sample(float x, float y) const {
-  if (width <= 0 || height <= 0 || grid_size <= 0 ||
-      vectors.size() != static_cast<std::size_t>(width) * height) return {};
-  const int column = std::clamp(static_cast<int>(x / grid_size), 0, width - 1);
-  const int row = std::clamp(static_cast<int>(y / grid_size), 0, height - 1);
-  return vectors[static_cast<std::size_t>(row) * width + column];
+  return bilinear(vectors, width, height, grid_size, x, y);
+}
+FlowVector FlowField::sample_backward(float x, float y) const {
+  return bilinear(backward, width, height, grid_size, x, y);
 }
 
-FlowTracker::FlowTracker(std::vector<LandmarkState> active,
-                         std::vector<FlowTrackPosition> positions,
-                         std::uint64_t next_id, TrackLengthHistogram histogram)
-    : next_id_(next_id), histogram_(histogram) {
-  std::unordered_map<std::uint64_t, FlowTrackPosition> last_positions;
-  for (const auto& position : positions) last_positions[position.id] = position;
-  for (auto& landmark : active) {
-    if (const auto found = last_positions.find(landmark.id); found != last_positions.end()) {
-      active_.push_back({std::move(landmark), found->second.x, found->second.y});
-    }
+void FlowTrackerConfig::validate() const {
+  if (!std::isfinite(association_radius) || association_radius <= 0 || association_radius > 1000 ||
+      max_tracks == 0 || max_tracks > 100000 || !std::isfinite(min_descriptor_similarity) ||
+      !std::isfinite(descriptor_weight) || descriptor_weight < 0 || max_coast_frames < 0 ||
+      max_coast_frames > 1000 || !std::isfinite(forward_backward_threshold) ||
+      assignment_rounds < 1 || assignment_rounds > 64) {
+    throw std::invalid_argument("Invalid flow tracker settings");
   }
 }
-
-void FlowTracker::associate(FrameFeatures& frame, const std::optional<FlowField>& flow) {
-  const auto started = std::chrono::steady_clock::now();
-  constexpr std::size_t target_tracks = 1600;
-  constexpr std::size_t max_tracks = 2000;
-  if (frame.width <= 0 || frame.height <= 0) throw std::invalid_argument("Invalid flow frame size");
-  int spacing = std::max(24, static_cast<int>(std::ceil(std::sqrt(
-      static_cast<double>(frame.width) * frame.height / target_tracks))));
-  auto cell_columns = [&] { return (frame.width + spacing - 1) / spacing; };
-  auto cell_rows = [&] { return (frame.height + spacing - 1) / spacing; };
-  while (static_cast<std::size_t>(cell_columns()) * cell_rows() > max_tracks) ++spacing;
-  if (flow) {
-    for (auto& track : active_) {
-      const FlowVector vector = flow->sample(track.x, track.y);
-      track.x += vector.dx;
-      track.y += vector.dy;
-      track.landmark.last_frame = frame.frame_index;
-    }
-    active_.erase(std::remove_if(active_.begin(), active_.end(), [&](const Track& track) {
-                    return !std::isfinite(track.x) || !std::isfinite(track.y) ||
-                           track.x < 0 || track.y < 0 ||
-                           track.x >= frame.width || track.y >= frame.height;
-                  }), active_.end());
-  } else if (frame.frame_index != 0) {
-    // A resumed session starts from its last saved positions. The next decoded
-    // frame must supply flow before those positions can advance.
-    active_.clear();
-  }
-  frame.keypoints.clear();
-  frame.landmark_ids.clear();
-  frame.landmark_similarities.clear();
-  frame.landmark_updates.clear();
-  frame.descriptors.clear();
-  frame.new_landmarks = 0;
-  const int cells_x = cell_columns();
-  const int cells_y = cell_rows();
-  const auto cell_index = [&](const Track& track) {
-    const int column = std::clamp(static_cast<int>(track.x) / spacing, 0, cells_x - 1);
-    const int row = std::clamp(static_cast<int>(track.y) / spacing, 0, cells_y - 1);
-    return static_cast<std::size_t>(row) * cells_x + column;
-  };
-  // Flow can bring many tracks into the same region. Reserve one long-lived
-  // track per cell so the point budget can cover newly visible image areas.
-  std::vector<int> winner(static_cast<std::size_t>(cells_x) * cells_y, -1);
-  for (std::size_t index = 0; index < active_.size(); ++index) {
-    int& previous = winner[cell_index(active_[index])];
-    if (previous < 0 ||
-        active_[index].landmark.observation_count >
-            active_[static_cast<std::size_t>(previous)].landmark.observation_count ||
-        (active_[index].landmark.observation_count ==
-             active_[static_cast<std::size_t>(previous)].landmark.observation_count &&
-         active_[index].landmark.id <
-             active_[static_cast<std::size_t>(previous)].landmark.id)) {
-      previous = static_cast<int>(index);
-    }
-  }
-  std::vector<bool> occupied(static_cast<std::size_t>(cells_x) * cells_y);
-  std::vector<Track> kept;
-  kept.reserve(std::min(active_.size(), occupied.size()));
-  for (std::size_t index = 0; index < active_.size(); ++index) {
-    const std::size_t cell = cell_index(active_[index]);
-    if (winner[cell] != static_cast<int>(index)) continue;
-    occupied[cell] = true;
-    kept.push_back(std::move(active_[index]));
-  }
-  active_ = std::move(kept);
-  frame.matched_landmarks = static_cast<std::uint32_t>(active_.size());
-  for (int row = 0; row < cells_y; ++row) {
-    for (int column = 0; column < cells_x; ++column) {
-      if (active_.size() >= max_tracks) break;
-      if (occupied[static_cast<std::size_t>(row) * cells_x + column]) continue;
-      const float x = (column * spacing +
-                       std::min((column + 1) * spacing, frame.width)) * 0.5F;
-      const float y = (row * spacing +
-                       std::min((row + 1) * spacing, frame.height)) * 0.5F;
-      LandmarkState landmark;
-      landmark.id = next_id_++;
-      landmark.observation_count = 0;
-      landmark.first_frame = frame.frame_index;
-      landmark.last_frame = frame.frame_index;
-      active_.push_back({landmark, x, y});
-      ++frame.new_landmarks;
-    }
-  }
-  frame.keypoints.reserve(active_.size());
-  frame.landmark_ids.reserve(active_.size());
-  frame.landmark_similarities.reserve(active_.size());
-  frame.landmark_updates.reserve(active_.size());
-  for (auto& track : active_) {
-    if (track.landmark.observation_count) {
-      --histogram_[track_length_bin(track.landmark.observation_count)];
-    }
-    ++track.landmark.observation_count;
-    ++histogram_[track_length_bin(track.landmark.observation_count)];
-    frame.keypoints.push_back({track.x, track.y, 1.0F});
-    frame.landmark_ids.push_back(track.landmark.id);
-    frame.landmark_similarities.push_back(std::numeric_limits<float>::quiet_NaN());
-    frame.landmark_updates.push_back(track.landmark);
-  }
-  frame.tracking_ms = std::chrono::duration<double, std::milli>(
-      std::chrono::steady_clock::now() - started).count();
-}
-
-const LandmarkState* FlowTracker::find(std::uint64_t id) const {
-  for (const auto& track : active_) {
-    if (track.landmark.id == id) return &track.landmark;
-  }
-  return nullptr;
-}
-
 }  // namespace slam_native

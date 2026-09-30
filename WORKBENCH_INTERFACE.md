@@ -8,7 +8,7 @@ thread. The sections through "Current progress, cancellation and concurrency"
 describe the implemented solver. The final contract section marks implemented identity,
 lineage and status fields separately from the remaining job/snapshot/reader work.
 The ordered backend task list is [SOLVER_TODO.md](SOLVER_TODO.md).
-The verified result inventory is in [SESSION_HANDOFF.md](SESSION_HANDOFF.md), with
+The verified result inventory is in [archived reconstruction handoff](archive/SESSION_HANDOFF-20260920.md), with
 inspection and experiment commands in [WORKFLOW.md](WORKFLOW.md).
 
 Keep SQLite/NPZ/JSON as the interchange formats. The backend should not emit Three.js

@@ -14,3 +14,4 @@ data/
 recordings/
 archive/
 *.rrd
+/third_party/

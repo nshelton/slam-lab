@@ -1,6 +1,7 @@
 #include "slam_native/superpoint.hpp"
 
 #include <NvInfer.h>
+#include <cub/block/block_scan.cuh>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -91,6 +92,52 @@ __global__ void resize_luma_letterbox(const Pixel* luma,
   destination[y * destination_width + x] = top * (1.0F - wy) + bottom * wy;
 }
 
+constexpr int kCompactThreads = 1024;
+
+// Stable compaction of the fixed top-k output: keeps detections above the
+// threshold inside the letterbox, converts them to source pixels, preserves
+// engine order (score-descending), and records raw -> compact indices.
+__global__ void compact_detections(const float* keypoints, const float* scores, int capacity,
+                                   float threshold, float scale, int offset_x, int offset_y,
+                                   int scaled_width, int scaled_height, Keypoint* points,
+                                   int* compact_index, int* count) {
+  using Scan = cub::BlockScan<int, kCompactThreads>;
+  __shared__ typename Scan::TempStorage storage;
+  __shared__ int base;
+  if (threadIdx.x == 0) base = 0;
+  __syncthreads();
+  for (int start = 0; start < capacity; start += kCompactThreads) {
+    const int index = start + threadIdx.x;
+    int keep = 0;
+    float x = 0, y = 0, score = 0;
+    if (index < capacity) {
+      x = keypoints[index * 2];
+      y = keypoints[index * 2 + 1];
+      score = scores[index];
+      keep = !(score < threshold || x < offset_x || y < offset_y ||
+               x >= offset_x + scaled_width || y >= offset_y + scaled_height);
+    }
+    int position = 0, total = 0;
+    Scan(storage).ExclusiveSum(keep, position, total);
+    if (index < capacity) {
+      compact_index[index] = keep ? base + position : -1;
+      if (keep) points[base + position] = {(x - offset_x) / scale, (y - offset_y) / scale, score};
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) base += total;
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) *count = base;
+}
+
+__global__ void gather_descriptors(const float* source, const int* compact_index, int capacity,
+                                   float* target) {
+  const int element = blockIdx.x * blockDim.x + threadIdx.x;
+  if (element >= capacity * 256) return;
+  const int destination = compact_index[element / 256];
+  if (destination >= 0) target[destination * 256 + element % 256] = source[element];
+}
+
 class TensorRtSuperPoint final : public SuperPoint {
  public:
   TensorRtSuperPoint(const std::filesystem::path& engine_path, SuperPointConfig config)
@@ -143,16 +190,22 @@ class TensorRtSuperPoint final : public SuperPoint {
       }
     }
 
-    keypoints_.resize(static_cast<std::size_t>(config_.max_keypoints) * 2);
-    scores_.resize(config_.max_keypoints);
+    points_.resize(config_.max_keypoints);
     descriptors_.resize(static_cast<std::size_t>(config_.max_keypoints) * 256);
     cuda_check(cudaMalloc(&device_image_, image_bytes()), "allocate SuperPoint input");
-    cuda_check(cudaMalloc(&device_keypoints_, keypoints_.size() * sizeof(float)),
+    cuda_check(cudaMalloc(&device_keypoints_, config_.max_keypoints * 2 * sizeof(float)),
                "allocate keypoint output");
-    cuda_check(cudaMalloc(&device_scores_, scores_.size() * sizeof(float)),
+    cuda_check(cudaMalloc(&device_scores_, config_.max_keypoints * sizeof(float)),
                "allocate score output");
     cuda_check(cudaMalloc(&device_descriptors_, descriptors_.size() * sizeof(float)),
                "allocate descriptor output");
+    cuda_check(cudaMalloc(&device_points_, config_.max_keypoints * sizeof(Keypoint)),
+               "allocate compact keypoints");
+    cuda_check(cudaMalloc(&device_compact_descriptors_, descriptors_.size() * sizeof(float)),
+               "allocate compact descriptors");
+    cuda_check(cudaMalloc(&device_compact_index_, config_.max_keypoints * sizeof(int)),
+               "allocate compaction map");
+    cuda_check(cudaMalloc(&device_count_, sizeof(int)), "allocate detection count");
     cuda_check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "create inference stream");
     for (cudaEvent_t* event : {&preprocess_begin_, &preprocess_end_, &inference_end_, &readback_end_}) {
       cuda_check(cudaEventCreate(event), "create timing event");
@@ -174,6 +227,14 @@ class TensorRtSuperPoint final : public SuperPoint {
     cudaFree(device_keypoints_);
     cudaFree(device_scores_);
     cudaFree(device_descriptors_);
+    cudaFree(device_points_);
+    cudaFree(device_compact_descriptors_);
+    cudaFree(device_compact_index_);
+    cudaFree(device_count_);
+  }
+
+  DeviceDetections device_detections() const override {
+    return {device_points_, device_compact_descriptors_, last_count_, nullptr};
   }
 
   FrameFeatures infer(const GpuFrame& frame) override {
@@ -187,6 +248,10 @@ class TensorRtSuperPoint final : public SuperPoint {
     const dim3 grid((config_.input_width + block.x - 1) / block.x,
                     (config_.input_height + block.y - 1) / block.y);
 
+    if (frame.ready_event) {
+      cuda_check(cudaStreamWaitEvent(stream_, static_cast<cudaEvent_t>(frame.ready_event), 0),
+                 "wait for decoded frame");
+    }
     cuda_check(cudaEventRecord(preprocess_begin_, stream_), "start preprocess timer");
     if (frame.format == PixelFormat::nv12) {
       resize_luma_letterbox<<<grid, block, 0, stream_>>>(
@@ -205,12 +270,21 @@ class TensorRtSuperPoint final : public SuperPoint {
       throw std::runtime_error("TensorRT SuperPoint enqueue failed");
     }
     cuda_check(cudaEventRecord(inference_end_, stream_), "end inference timer");
-    cuda_check(cudaMemcpyAsync(keypoints_.data(), device_keypoints_,
-                               keypoints_.size() * sizeof(float), cudaMemcpyDeviceToHost, stream_),
-               "read back keypoints");
-    cuda_check(cudaMemcpyAsync(scores_.data(), device_scores_, scores_.size() * sizeof(float),
-                               cudaMemcpyDeviceToHost, stream_), "read back scores");
-    cuda_check(cudaMemcpyAsync(descriptors_.data(), device_descriptors_,
+    compact_detections<<<1, kCompactThreads, 0, stream_>>>(
+        static_cast<const float*>(device_keypoints_), static_cast<const float*>(device_scores_),
+        config_.max_keypoints, config_.detection_threshold, scale, offset_x, offset_y,
+        scaled_width, scaled_height, device_points_, device_compact_index_, device_count_);
+    gather_descriptors<<<(config_.max_keypoints * 256 + 255) / 256, 256, 0, stream_>>>(
+        static_cast<const float*>(device_descriptors_), device_compact_index_,
+        config_.max_keypoints, device_compact_descriptors_);
+    cuda_check(cudaGetLastError(), "compact SuperPoint detections");
+    // Host copies feed the feature cache and raw-detection display only; the
+    // tracker reads device_detections().
+    cuda_check(cudaMemcpyAsync(&host_count_, device_count_, sizeof(int), cudaMemcpyDeviceToHost,
+                               stream_), "read back detection count");
+    cuda_check(cudaMemcpyAsync(points_.data(), device_points_, points_.size() * sizeof(Keypoint),
+                               cudaMemcpyDeviceToHost, stream_), "read back keypoints");
+    cuda_check(cudaMemcpyAsync(descriptors_.data(), device_compact_descriptors_,
                                descriptors_.size() * sizeof(float), cudaMemcpyDeviceToHost, stream_),
                "read back descriptors");
     cuda_check(cudaEventRecord(readback_end_, stream_), "end readback timer");
@@ -225,20 +299,10 @@ class TensorRtSuperPoint final : public SuperPoint {
     result.preprocess_ms = event_ms(preprocess_begin_, preprocess_end_);
     result.inference_ms = event_ms(preprocess_end_, inference_end_);
     result.readback_ms = event_ms(inference_end_, readback_end_);
-    result.keypoints.reserve(config_.max_keypoints);
-    result.descriptors.reserve(static_cast<std::size_t>(config_.max_keypoints) * 256);
-    for (int index = 0; index < config_.max_keypoints; ++index) {
-      const float x = keypoints_[index * 2];
-      const float y = keypoints_[index * 2 + 1];
-      const float score = scores_[index];
-      if (score < config_.detection_threshold || x < offset_x || y < offset_y ||
-          x >= offset_x + scaled_width || y >= offset_y + scaled_height) {
-        continue;
-      }
-      result.keypoints.push_back({(x - offset_x) / scale, (y - offset_y) / scale, score});
-      const auto first = descriptors_.begin() + static_cast<std::ptrdiff_t>(index) * 256;
-      result.descriptors.insert(result.descriptors.end(), first, first + 256);
-    }
+    last_count_ = host_count_;
+    result.keypoints.assign(points_.begin(), points_.begin() + host_count_);
+    result.descriptors.assign(descriptors_.begin(),
+                              descriptors_.begin() + static_cast<std::ptrdiff_t>(host_count_) * 256);
     return result;
   }
 
@@ -267,8 +331,13 @@ class TensorRtSuperPoint final : public SuperPoint {
   cudaEvent_t preprocess_end_{};
   cudaEvent_t inference_end_{};
   cudaEvent_t readback_end_{};
-  std::vector<float> keypoints_;
-  std::vector<float> scores_;
+  Keypoint* device_points_{};
+  float* device_compact_descriptors_{};
+  int* device_compact_index_{};
+  int* device_count_{};
+  int host_count_{};
+  int last_count_{};
+  std::vector<Keypoint> points_;
   std::vector<float> descriptors_;
 };
 

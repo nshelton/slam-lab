@@ -1,0 +1,59 @@
+diff --git a/src/Viewer.cc b/src/Viewer.cc
+index 18f23f0..bc85980 100644
+--- a/src/Viewer.cc
++++ b/src/Viewer.cc
+@@ -18,6 +18,8 @@
+ 
+ 
+ #include "Viewer.h"
++#include <chrono>
++#include <thread>
+ #include <pangolin/pangolin.h>
+ 
+ #include <mutex>
+@@ -204,7 +206,13 @@ void Viewer::Run()
+     Twc.SetIdentity();
+     pangolin::OpenGlMatrix Ow; // Oriented with g in the z axis
+     Ow.SetIdentity();
+-    cv::namedWindow("ORB-SLAM3: Current Frame");
++    // slam-lab patch: show the current frame inside the Pangolin window instead of
++    // a cv::imshow window (the local OpenCV build has no GUI backend).
++    pangolin::View& d_img = pangolin::CreateDisplay()
++            .SetBounds(0.0, 0.4, 0.55, 1.0, 16.0f/9.0f)
++            .SetLock(pangolin::LockRight, pangolin::LockBottom);
++    pangolin::GlTexture imgTexture;
++    cv::Mat lastFrame;
+ 
+     bool bFollow = true;
+     bool bLocalizationMode = false;
+@@ -315,6 +323,17 @@ void Viewer::Run()
+         if(menuShowPoints)
+             mpMapDrawer->DrawMapPoints();
+ 
++        if(!lastFrame.empty())
++        {
++            if(imgTexture.width != lastFrame.cols || imgTexture.height != lastFrame.rows)
++                imgTexture.Reinitialise(lastFrame.cols, lastFrame.rows, GL_RGB, false, 0, GL_BGR, GL_UNSIGNED_BYTE);
++            imgTexture.Upload(lastFrame.data, GL_BGR, GL_UNSIGNED_BYTE);
++            d_img.SetAspect(static_cast<float>(lastFrame.cols) / lastFrame.rows);
++            d_img.Activate();
++            glColor3f(1.0f, 1.0f, 1.0f);
++            imgTexture.RenderToViewportFlipY();
++        }
++
+         pangolin::FinishFrame();
+ 
+         cv::Mat toShow;
+@@ -335,8 +354,10 @@ void Viewer::Run()
+             cv::resize(toShow, toShow, cv::Size(width, height));
+         }
+ 
+-        cv::imshow("ORB-SLAM3: Current Frame",toShow);
+-        cv::waitKey(mT);
++        if(toShow.type() == CV_8UC1)
++            cv::cvtColor(toShow, toShow, cv::COLOR_GRAY2BGR);
++        lastFrame = toShow.isContinuous() ? toShow : toShow.clone();
++        std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(mT));
+ 
+         if(menuReset)
+         {

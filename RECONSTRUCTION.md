@@ -4,7 +4,7 @@ This document preserves the earlier Osaka tracking investigation. Its direct
 `reconstruct` CLI was removed so the project has one supported reconstruction workflow.
 The internal mapper remains only as reused solver machinery and numerical tests. Use
 [SOLVER.md](SOLVER.md) for the current `verify-matches -> solve` pipeline and
-[SESSION_HANDOFF.md](SESSION_HANDOFF.md) for current results and remaining work.
+[archived reconstruction handoff](archive/SESSION_HANDOFF-20260920.md) for current results and remaining work.
 
 The removed pipeline reconstructed a sparse 3D map and camera poses directly from a
 SuperPoint cache. It uses only the RGB camera. Depth, IMU, ground truth, and the

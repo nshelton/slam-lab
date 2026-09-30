@@ -2,10 +2,13 @@
 #include "slam_native/app.hpp"
 
 #include "slam_native/cuda_frame_presenter.hpp"
+#include "slam_native/display_environment.hpp"
 #include "slam_native/descriptor_projection.hpp"
 #include "slam_native/flow_tracker.hpp"
 #include "slam_native/launcher.hpp"
 #include "slam_native/optical_flow.hpp"
+#include "slam_native/trajectory_view.hpp"
+#include "slam_native/visual_odometry.hpp"
 #include "slam_native/video_decoder.hpp"
 
 #include <GLFW/glfw3.h>
@@ -38,6 +41,7 @@ using Clock = std::chrono::steady_clock;
 class GlfwLifetime {
  public:
   GlfwLifetime() {
+    configure_display_environment();
     glfwSetErrorCallback([](int, const char* description) {
       std::fprintf(stderr, "GLFW: %s\n", description);
     });
@@ -89,28 +93,35 @@ struct Runtime {
   bool stopped{};
   bool stop_requested{};
   bool close_requested{};
+  bool restart_requested{};
   bool show_features{true};
+  int point_display_mode{}; // 0: tracked points, 1: all raw SuperPoint detections
+  float association_radius{6.0F};
   bool show_trails{true};
   bool show_flow_vectors{};
   bool show_diagnostics{true};
-  bool preview_mode{};
-  bool preview_has_cache{};
+  bool show_trajectory{true};
+  OdometryFrameResult odometry;
   bool scrub_active{};
   bool seek_requested{};
   double scrub_seconds{};
   double seek_seconds{};
   Clock::time_point last_seek_request{};
   std::string seek_error;
-  std::int64_t processing_timestamp_ns{};
-  std::uint64_t processing_frame_index{};
   unsigned int texture{};
   int frame_width{};
   int frame_height{};
   std::uint64_t frame_index{};
   std::int64_t timestamp_ns{};
   std::vector<Keypoint> points;
+  std::vector<bool> supported;  // false: carried by flow this frame (no detection)
+  std::vector<Keypoint> detections;
   std::vector<std::uint64_t> landmark_ids;
   std::vector<float> similarities;
+  std::vector<Keypoint> predictions;
+  std::vector<float> corrections;
+  bool cache_hit{};
+  double flow_ms{};
   std::vector<ProjectedDescriptor> projected;
   std::optional<FlowField> flow_field;
   std::uint64_t selected_landmark{std::numeric_limits<std::uint64_t>::max()};
@@ -122,86 +133,11 @@ struct Runtime {
   std::unordered_map<std::uint64_t, Trail> trails;
   std::uint32_t new_landmarks{};
   std::uint32_t matched_landmarks{};
+  std::uint32_t coasted_landmarks{};
   double tracking_ms{};
   PipelineStats stats;
   Clock::time_point started{Clock::now()};
   Clock::time_point next_frame{Clock::now()};
-};
-
-struct CachedOverlay {
-  std::uint64_t frame_index{};
-  std::vector<Keypoint> points;
-  std::vector<std::uint64_t> landmark_ids;
-  std::vector<float> similarities;
-};
-
-class FramePreviewReader {
- public:
-  explicit FramePreviewReader(const std::filesystem::path& path) {
-    if (sqlite3_open_v2(path.c_str(), &db_, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
-      const std::string error = db_ ? sqlite3_errmsg(db_) : "no SQLite connection";
-      if (db_) sqlite3_close(db_);
-      db_ = nullptr;
-      throw std::runtime_error("Open preview database: " + error);
-    }
-    sqlite3_busy_timeout(db_, 250);
-    constexpr const char* sql =
-        "SELECT frame_index,keypoint_count,keypoints_xy_f32,scores_f32,"
-        "landmark_ids_u64,landmark_similarities_f32 FROM frames "
-        "WHERE timestamp_ns=? AND pts=? LIMIT 1";
-    if (sqlite3_prepare_v2(db_, sql, -1, &statement_, nullptr) != SQLITE_OK) {
-      const std::string error = sqlite3_errmsg(db_);
-      sqlite3_close(db_);
-      db_ = nullptr;
-      throw std::runtime_error("Prepare preview lookup: " + error);
-    }
-  }
-  ~FramePreviewReader() {
-    if (statement_) sqlite3_finalize(statement_);
-    if (db_) sqlite3_close(db_);
-  }
-  FramePreviewReader(const FramePreviewReader&) = delete;
-  FramePreviewReader& operator=(const FramePreviewReader&) = delete;
-
-  [[nodiscard]] std::optional<CachedOverlay> find(const GpuFrame& frame) {
-    sqlite3_reset(statement_);
-    sqlite3_clear_bindings(statement_);
-    sqlite3_bind_int64(statement_, 1, frame.timestamp_ns);
-    sqlite3_bind_int64(statement_, 2, frame.pts);
-    const int result = sqlite3_step(statement_);
-    if (result == SQLITE_DONE) return std::nullopt;
-    if (result != SQLITE_ROW) {
-      throw std::runtime_error("Read preview features: " + std::string(sqlite3_errmsg(db_)));
-    }
-    const int count = sqlite3_column_int(statement_, 1);
-    if (count < 0 || sqlite3_column_bytes(statement_, 2) != count * 2 * static_cast<int>(sizeof(float)) ||
-        sqlite3_column_bytes(statement_, 3) != count * static_cast<int>(sizeof(float)) ||
-        sqlite3_column_bytes(statement_, 4) != count * static_cast<int>(sizeof(std::uint64_t)) ||
-        sqlite3_column_bytes(statement_, 5) != count * static_cast<int>(sizeof(float))) {
-      throw std::runtime_error("Invalid cached preview feature blobs");
-    }
-    CachedOverlay overlay;
-    overlay.frame_index = static_cast<std::uint64_t>(sqlite3_column_int64(statement_, 0));
-    overlay.points.resize(count);
-    overlay.landmark_ids.resize(count);
-    overlay.similarities.resize(count);
-    const auto* xy = static_cast<const float*>(sqlite3_column_blob(statement_, 2));
-    const auto* scores = static_cast<const float*>(sqlite3_column_blob(statement_, 3));
-    for (int index = 0; index < count; ++index) {
-      overlay.points[index] = {xy[index * 2], xy[index * 2 + 1], scores[index]};
-    }
-    if (count) {
-      std::memcpy(overlay.landmark_ids.data(), sqlite3_column_blob(statement_, 4),
-                  count * sizeof(std::uint64_t));
-      std::memcpy(overlay.similarities.data(), sqlite3_column_blob(statement_, 5),
-                  count * sizeof(float));
-    }
-    return overlay;
-  }
-
- private:
-  sqlite3* db_{};
-  sqlite3_stmt* statement_{};
 };
 
 ImU32 landmark_color(std::uint64_t id, int alpha = 220) {
@@ -226,7 +162,7 @@ std::string format_video_time(double seconds) {
   return buffer;
 }
 
-void update_trails(Runtime& runtime, std::uint32_t max_inactive_frames) {
+void update_trails(Runtime& runtime) {
   for (std::size_t index = 0; index < runtime.points.size(); ++index) {
     auto& trail = runtime.trails[runtime.landmark_ids[index]];
     trail.positions.emplace_back(runtime.points[index].x, runtime.points[index].y);
@@ -240,7 +176,7 @@ void update_trails(Runtime& runtime, std::uint32_t max_inactive_frames) {
     trail.last_frame = runtime.frame_index;
   }
   for (auto it = runtime.trails.begin(); it != runtime.trails.end();) {
-    if (runtime.frame_index - it->second.last_frame > max_inactive_frames) {
+    if (it->second.last_frame != runtime.frame_index) {
       it = runtime.trails.erase(it);
     } else {
       ++it;
@@ -260,8 +196,7 @@ void draw_sidebar(Runtime& runtime,
   ImGui::SetNextWindowSize({310, 675}, ImGuiCond_FirstUseEver);
   ImGui::Begin("Pipeline");
   ImGui::BeginDisabled(runtime.stopped || runtime.eof);
-  const char* run_label = runtime.playing ? "Pause" :
-                          runtime.preview_mode ? "Resume processing" : "Run";
+  const char* run_label = runtime.playing ? "Pause" : "Play";
   if (ImGui::Button(run_label)) runtime.playing = !runtime.playing;
   ImGui::SameLine();
   if (ImGui::Button("Step")) {
@@ -275,37 +210,42 @@ void draw_sidebar(Runtime& runtime,
     runtime.stopped = true;
     runtime.stop_requested = true;
   }
+  ImGui::SameLine();
+  if (ImGui::Button("Restart")) runtime.restart_requested = true;
   if (ImGui::Button("Choose another video")) runtime.close_requested = true;
   ImGui::Checkbox("Realtime pacing", &runtime.realtime_pacing);
-  ImGui::Checkbox(optical_flow ? "Show flow tracks" : "Show SuperPoints",
-                  &runtime.show_features);
+  ImGui::SetNextItemWidth(110);
+  ImGui::DragFloat("Association radius", &runtime.association_radius, 0.5F,
+                   0.5F, 100.0F, "%.1f px", ImGuiSliderFlags_AlwaysClamp);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Maximum distance from a flow prediction to a SuperPoint, in source-image pixels.\n"
+                      "Applies on the next frame. Larger values allow more distant matches.\n"
+                      "Each previous track still accepts only one detection.");
+  }
+  ImGui::Combo("Point view", &runtime.point_display_mode,
+               "Tracked points\0SuperPoint detections (red)\0");
+  ImGui::Checkbox("Show points", &runtime.show_features);
+  ImGui::BeginDisabled(runtime.point_display_mode == 1);
   ImGui::Checkbox("Show tracks", &runtime.show_trails);
   if (optical_flow) ImGui::Checkbox("Show flow vectors", &runtime.show_flow_vectors);
+  ImGui::EndDisabled();
   ImGui::Checkbox("Diagnostics", &runtime.show_diagnostics);
+  ImGui::SameLine();
+  ImGui::Checkbox("Trajectory", &runtime.show_trajectory);
   ImGui::Separator();
   ImGui::Text("Codec: %s", decoder.codec_name().c_str());
   ImGui::Text("Nominal FPS: %.2f", decoder.nominal_fps());
-  if (runtime.preview_mode && !runtime.preview_has_cache) {
-    ImGui::Text("Frame: uncached preview");
-  } else {
-    ImGui::Text("Frame: %llu%s", static_cast<unsigned long long>(runtime.frame_index),
-                runtime.preview_mode ? " (preview)" : "");
-  }
+  ImGui::Text("Frame: %llu", static_cast<unsigned long long>(runtime.frame_index));
   ImGui::Text("Time: %.3f s", std::max(0.0,
               static_cast<double>(runtime.timestamp_ns - decoder.start_time_ns()) / 1e9));
-  if (runtime.preview_mode) {
-    ImGui::TextWrapped("Preview paused. Run continues processing from frame %llu (%.2f s).",
-                      static_cast<unsigned long long>(runtime.processing_frame_index),
-                      static_cast<double>(runtime.processing_timestamp_ns -
-                                          decoder.start_time_ns()) / 1e9);
-  }
   if (!runtime.seek_error.empty()) {
     ImGui::TextColored({1, 0.5F, 0.4F, 1}, "%s", runtime.seek_error.c_str());
   }
-  ImGui::Text("Features: %zu", runtime.points.size());
-  ImGui::Text("Matched / new: %u / %u", runtime.matched_landmarks,
-              runtime.new_landmarks);
-  ImGui::Text("Method: %s", optical_flow ? "NVIDIA optical flow" : "SuperPoint descriptors");
+  ImGui::Text("Features: %zu", runtime.point_display_mode == 1 ?
+              runtime.detections.size() : runtime.points.size());
+  ImGui::Text("Matched / coasted / new: %u / %u / %u", runtime.matched_landmarks,
+              runtime.coasted_landmarks, runtime.new_landmarks);
+  ImGui::Text("Method: %s", optical_flow ? "SuperPoint + optical flow" : "SuperPoint descriptors");
   ImGui::Text("Active / total tracks: %zu / %llu",
               optical_flow ? flow_tracker->active_count() : tracker->active_count(),
               static_cast<unsigned long long>(optical_flow ? flow_tracker->landmark_count() :
@@ -313,10 +253,15 @@ void draw_sidebar(Runtime& runtime,
   ImGui::Separator();
   ImGui::Text("Decode: %.2f ms", runtime.stats.decode_ms);
   ImGui::Text("Preprocess: %.2f ms", runtime.stats.preprocess_ms);
-  ImGui::Text("%s: %.2f ms", optical_flow ? "Optical flow" : "SuperPoint",
-              runtime.stats.inference_ms);
-  if (!optical_flow) ImGui::Text("Readback: %.2f ms", runtime.stats.readback_ms);
+  ImGui::Text("SuperPoint: %.2f ms%s", runtime.stats.inference_ms,
+              runtime.cache_hit ? " (cached)" : "");
+  ImGui::Text("Optical flow: %.2f ms", runtime.flow_ms);
+  ImGui::Text("Readback: %.2f ms", runtime.stats.readback_ms);
   ImGui::Text("Tracking: %.2f ms", runtime.tracking_ms);
+  ImGui::Text("Camera pose: %s (%.1f ms)", to_string(runtime.odometry.state), runtime.odometry.ms);
+  if (runtime.odometry.has_pose) {
+    ImGui::Text("Pose inliers: %d / %d", runtime.odometry.inliers, runtime.odometry.correspondences);
+  }
   const double elapsed = std::chrono::duration<double>(Clock::now() - runtime.started).count();
   ImGui::Text("Throughput: %.1f frames/s", elapsed > 0 ? runtime.stats.inferred_frames / elapsed : 0);
   ImGui::Separator();
@@ -324,9 +269,8 @@ void draw_sidebar(Runtime& runtime,
   ImGui::Text("DB committed: %llu", static_cast<unsigned long long>(store.persisted()));
   ImGui::Text("DB size: %s",
               format_bytes(database_stats.main_bytes + database_stats.wal_bytes).c_str());
-  ImGui::Text("Rows: %llu frames / %llu landmarks",
-              static_cast<unsigned long long>(database_stats.frame_rows),
-              static_cast<unsigned long long>(database_stats.landmark_rows));
+  ImGui::Text("Cached frames: %llu", static_cast<unsigned long long>(database_stats.frame_rows));
+  ImGui::TextDisabled("Tracks and diagnostics live in memory.");
   ImGui::Text("Saved observations: %llu",
               static_cast<unsigned long long>(database_stats.observations));
   ImGui::TextWrapped("%s", database_path.string().c_str());
@@ -343,7 +287,7 @@ void draw_sidebar(Runtime& runtime,
     if (selected) {
       ImGui::Text("Observations: %llu",
                   static_cast<unsigned long long>(selected->observation_count));
-      if (!optical_flow) ImGui::Text("Concentration: %.3f", selected->concentration);
+
       ImGui::Text("First / last frame: %llu / %llu",
                   static_cast<unsigned long long>(selected->first_frame),
                   static_cast<unsigned long long>(selected->last_frame));
@@ -377,7 +321,8 @@ void draw_video(Runtime& runtime, bool optical_flow, std::int64_t duration_ns,
   const ImVec2 size(runtime.frame_width * scale, runtime.frame_height * scale);
   const ImVec2 origin = ImGui::GetCursorScreenPos();
   ImGui::Image(static_cast<ImTextureID>(runtime.texture), size, {0, 0}, {1, 1});
-  if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+  if (runtime.point_display_mode == 0 &&
+      ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
     const ImVec2 mouse = ImGui::GetMousePos();
     float nearest = 100.0F;
     for (std::size_t index = 0; index < runtime.points.size(); ++index) {
@@ -391,7 +336,7 @@ void draw_video(Runtime& runtime, bool optical_flow, std::int64_t duration_ns,
     }
   }
   ImDrawList* draw = ImGui::GetWindowDrawList();
-  if (runtime.show_trails) {
+  if (runtime.point_display_mode == 0 && runtime.show_trails) {
     for (const auto& [id, trail] : runtime.trails) {
       if (trail.positions.size() < 2) continue;
       if (runtime.selected_landmark != std::numeric_limits<std::uint64_t>::max() &&
@@ -405,17 +350,26 @@ void draw_video(Runtime& runtime, bool optical_flow, std::int64_t duration_ns,
       }
     }
   }
-  if (runtime.show_features) {
+  if (runtime.show_features && runtime.point_display_mode == 1) {
+    for (const auto& point : runtime.detections) {
+      draw->AddCircleFilled({origin.x + point.x * scale, origin.y + point.y * scale},
+                            2.3F, IM_COL32(255, 0, 0, 255));
+    }
+  } else if (runtime.show_features) {
     for (std::size_t index = 0; index < runtime.points.size(); ++index) {
       const auto& point = runtime.points[index];
       const ImVec2 center(origin.x + point.x * scale, origin.y + point.y * scale);
       const std::uint64_t id = runtime.landmark_ids[index];
       const bool selected = id == runtime.selected_landmark;
-      draw->AddCircleFilled(center, selected ? 5.0F : 2.3F, landmark_color(id));
+      const auto color = landmark_color(id);
+      const bool supported = index >= runtime.supported.size() || runtime.supported[index];
+      if (supported) draw->AddCircleFilled(center, selected ? 5.0F : 2.3F, color);
+      else draw->AddCircle(center, selected ? 5.0F : 3.0F, color, 0, 1.2F);  // flow-only frame
       if (selected) draw->AddCircle(center, 7.0F, IM_COL32_WHITE, 0, 2.0F);
     }
   }
-  if (optical_flow && runtime.show_flow_vectors && runtime.flow_field) {
+  if (runtime.point_display_mode == 0 &&
+      optical_flow && runtime.show_flow_vectors && runtime.flow_field) {
     constexpr int arrow_spacing = 48;
     for (int y = arrow_spacing / 2; y < runtime.frame_height; y += arrow_spacing) {
       for (int x = arrow_spacing / 2; x < runtime.frame_width; x += arrow_spacing) {
@@ -443,17 +397,6 @@ void draw_video(Runtime& runtime, bool optical_flow, std::int64_t duration_ns,
     const bool changed = ImGui::SliderScalar("##video-scrubber", ImGuiDataType_Double,
                                             &position, &minimum, &duration, "%.2f s",
                                             ImGuiSliderFlags_AlwaysClamp);
-    const ImVec2 slider_min = ImGui::GetItemRectMin();
-    const ImVec2 slider_max = ImGui::GetItemRectMax();
-    if (runtime.preview_mode) {
-      const double head_seconds = static_cast<double>(runtime.processing_timestamp_ns -
-                                                      start_time_ns) / 1e9;
-      const float fraction = static_cast<float>(std::clamp(head_seconds / duration, 0.0, 1.0));
-      const float marker_x = slider_min.x + (slider_max.x - slider_min.x) * fraction;
-      ImGui::GetWindowDrawList()->AddLine({marker_x, slider_min.y - 2.0F},
-                                           {marker_x, slider_max.y + 2.0F},
-                                           IM_COL32(74, 214, 231, 255), 2.0F);
-    }
     const bool active = ImGui::IsItemActive();
     const bool released = ImGui::IsItemDeactivatedAfterEdit();
     if (changed) {
@@ -472,8 +415,7 @@ void draw_video(Runtime& runtime, bool optical_flow, std::int64_t duration_ns,
     ImGui::Text("%s / %s", format_video_time(position).c_str(),
                 format_video_time(duration).c_str());
     ImGui::SameLine();
-    ImGui::TextDisabled("Drag to preview");
-    if (runtime.preview_mode) ImGui::TextDisabled("Cyan marker = processing position");
+    ImGui::TextDisabled("Drag to seek");
   } else {
     ImGui::TextDisabled("Video duration unavailable; seeking is disabled.");
   }
@@ -599,7 +541,15 @@ void draw_flow_diagnostics(Runtime& runtime, const FlowTracker& tracker) {
   ImGui::Text("Tracks: %llu total / %zu active",
               static_cast<unsigned long long>(tracker.landmark_count()),
               tracker.active_count());
-  ImGui::TextDisabled("Grid seeds advected by NVIDIA optical flow.");
+  ImGui::TextDisabled("SuperPoint seeds; flow prediction; SuperPoint correction.");
+  ImGui::TextDisabled("GPU association; only current SuperPoints survive.");
+  std::vector<float> corrections;
+  for (float value : runtime.corrections) if (std::isfinite(value)) corrections.push_back(value);
+  if (!corrections.empty()) {
+    ImGui::PlotHistogram("Snap distance (px)", corrections.data(),
+                         static_cast<int>(corrections.size()), 0, nullptr, 0,
+                         *std::max_element(corrections.begin(), corrections.end()) + 0.1F, {0, 65});
+  }
   ImGui::TextUnformatted("Track length histogram");
   const auto& histogram = tracker.length_histogram();
   std::array<float, kTrackLengthBins> bars{};
@@ -628,35 +578,22 @@ struct Session {
     decoder = make_ffmpeg_cuda_decoder();
     decoder->open(config.video);
     presenter = make_cuda_gl_presenter();
-    const bool use_flow = config.tracking_method == TrackingMethod::optical_flow;
-    if (use_flow) {
-      config.engine.clear();
-      config.store.descriptor_encoding = DescriptorEncoding::none;
-      optical_flow = std::make_unique<OpticalFlow>();
-    } else {
-      superpoint = make_tensorrt_superpoint(config.engine, config.superpoint);
-    }
+    optical_flow = std::make_unique<OpticalFlow>(config.optical_flow);
+    superpoint = make_tensorrt_superpoint(config.engine, config.superpoint);
     store = std::make_unique<FeatureStore>(config.database, config.store);
     store->set_session(config.video, config.engine, config.superpoint.input_width,
                        config.superpoint.input_height, config.superpoint.max_keypoints,
-                       config.superpoint.detection_threshold, config.tracker, use_flow);
-    if (use_flow) {
-      flow_tracker = std::make_unique<FlowTracker>(
-          store->load_active_landmarks(1), store->load_latest_positions(),
-          store->next_landmark_id(), store->load_length_histogram());
-    } else {
-      tracker = std::make_unique<OnlineTracker>(
-          config.tracker, store->load_active_landmarks(config.tracker.max_inactive_frames),
-          store->next_landmark_id(), store->load_length_histogram());
-    }
-    cached_through = store->last_frame_index();
+                       config.superpoint.detection_threshold);
+    flow_tracker = std::make_unique<FlowTracker>(config.flow_tracker);
+    odometry = std::make_unique<VisualOdometry>(config.odometry);
+    next_cache_index = static_cast<std::uint64_t>(store->last_frame_index() + 1);
+    runtime.association_radius = config.flow_tracker.association_radius;
   }
 
-  void preview_seek(double seconds) {
-    if (!preview_decoder) {
-      preview_decoder = make_ffmpeg_cuda_decoder();
-      preview_decoder->open(config.video);
-      preview_reader = std::make_unique<FramePreviewReader>(config.database);
+  void seek(double seconds) {
+    if (!seek_decoder) {
+      seek_decoder = make_ffmpeg_cuda_decoder();
+      seek_decoder->open(config.video);
     }
     const auto duration = decoder->duration_ns();
     const auto frame_interval = decoder->nominal_fps() > 0 ?
@@ -665,12 +602,12 @@ struct Session {
     const auto clamped = duration > 0 ?
         std::min(relative, std::max<std::int64_t>(0, duration - frame_interval)) : relative;
     const auto target = decoder->start_time_ns() + clamped;
-    preview_decoder->seek_ns(target);
+    seek_decoder->seek_ns(target);
     GpuFrame frame;
     bool found = false;
     bool had_previous = false;
     std::int64_t previous_timestamp{};
-    while (preview_decoder->next(frame)) {
+    while (seek_decoder->next(frame)) {
       if (frame.timestamp_ns >= target) {
         found = true;
         break;
@@ -679,8 +616,8 @@ struct Session {
       previous_timestamp = frame.timestamp_ns;
     }
     if (!found && had_previous) {
-      preview_decoder->seek_ns(previous_timestamp);
-      while (preview_decoder->next(frame)) {
+      seek_decoder->seek_ns(previous_timestamp);
+      while (seek_decoder->next(frame)) {
         if (frame.timestamp_ns >= previous_timestamp) {
           found = true;
           break;
@@ -688,54 +625,46 @@ struct Session {
       }
     }
     if (!found) throw std::runtime_error("No frame found near the selected time");
-    runtime.texture = presenter->present(frame);
-    runtime.frame_width = frame.width;
-    runtime.frame_height = frame.height;
-    runtime.timestamp_ns = frame.timestamp_ns;
-    runtime.frame_index = 0;
-    runtime.preview_mode = true;
-    runtime.preview_has_cache = false;
-    runtime.playing = false;
-    runtime.points.clear();
-    runtime.landmark_ids.clear();
-    runtime.similarities.clear();
-    runtime.projected.clear();
-    runtime.flow_field.reset();
+    // Finish pending feature writes before revisiting frames, avoiding duplicate cache inserts.
+    store->flush();
+    decoder.swap(seek_decoder); // The decoder now sits at the displayed frame.
+    optical_flow = std::make_unique<OpticalFlow>(config.optical_flow);
+    flow_tracker = std::make_unique<FlowTracker>(config.flow_tracker);
+    // Track IDs restart with the tracker, so the camera trajectory does too.
+    odometry = std::make_unique<VisualOdometry>(config.odometry);
+    trajectory_view.reset();
+    runtime.odometry = {};
     runtime.trails.clear();
+    runtime.projected.clear();
     runtime.selected_landmark = std::numeric_limits<std::uint64_t>::max();
-    runtime.new_landmarks = 0;
-    runtime.matched_landmarks = 0;
-    runtime.tracking_ms = 0;
-    if (const auto cached = preview_reader->find(frame)) {
-      runtime.frame_index = cached->frame_index;
-      runtime.points = cached->points;
-      runtime.landmark_ids = cached->landmark_ids;
-      runtime.similarities = cached->similarities;
-      runtime.preview_has_cache = true;
-    }
+    runtime.eof = false;
+    runtime.stopped = false;
+    runtime.stop_requested = false;
+    runtime.step_requested = false;
+    runtime.playing = false;
+    runtime.stats = {};
+    runtime.started = Clock::now();
+    process_frame(frame, 0);
+    runtime.scrub_seconds = static_cast<double>(frame.timestamp_ns - decoder->start_time_ns()) / 1e9;
     runtime.seek_error.clear();
   }
 
   void advance() {
-    if (runtime.seek_requested) {
+    if (runtime.seek_requested || runtime.restart_requested) {
+      const bool restart = runtime.restart_requested;
+      runtime.restart_requested = false;
       runtime.seek_requested = false;
       try {
-        preview_seek(runtime.seek_seconds);
+        seek(restart ? 0.0 : runtime.seek_seconds);
+        runtime.playing = restart;
       } catch (const std::exception& error) {
         runtime.seek_error = error.what();
+        runtime.playing = false;
       }
       return;
     }
-    if (runtime.preview_mode && (runtime.playing || runtime.step_requested) &&
-        !runtime.eof && !runtime.stopped) {
-      runtime.preview_mode = false;
-      runtime.preview_has_cache = false;
-    }
     const auto now = Clock::now();
-    const bool replaying_cached = cached_through >= 0 &&
-        static_cast<std::int64_t>(runtime.processing_frame_index) <= cached_through;
-    const bool pacing_ready = replaying_cached || !runtime.realtime_pacing ||
-                              now >= runtime.next_frame;
+    const bool pacing_ready = !runtime.realtime_pacing || now >= runtime.next_frame;
     if (runtime.eof || runtime.stopped ||
         !(runtime.step_requested || (runtime.playing && pacing_ready))) return;
     GpuFrame frame;
@@ -746,80 +675,84 @@ struct Session {
     } else {
       const double decode_ms =
           std::chrono::duration<double, std::milli>(Clock::now() - decode_start).count();
-      runtime.texture = presenter->present(frame);
-      runtime.frame_width = frame.width;
-      runtime.frame_height = frame.height;
-      runtime.frame_index = frame.frame_index;
-      runtime.timestamp_ns = frame.timestamp_ns;
-      runtime.seek_error.clear();
-      runtime.processing_frame_index = frame.frame_index;
-      runtime.processing_timestamp_ns = frame.timestamp_ns;
-      runtime.stats.decoded_frames++;
-      runtime.stats.decode_ms = decode_ms;
-      if (static_cast<std::int64_t>(frame.frame_index) > cached_through) {
-        FrameFeatures features;
-        if (optical_flow) {
-          features.frame_index = frame.frame_index;
-          features.timestamp_ns = frame.timestamp_ns;
-          features.pts = frame.pts;
-          features.width = frame.width;
-          features.height = frame.height;
-          std::optional<FlowField> field;
-          const auto flow_start = Clock::now();
-          if (optical_flow->has_reference()) field = optical_flow->compute(frame);
-          else optical_flow->remember(frame);
-          features.inference_ms = std::chrono::duration<double, std::milli>(
-              Clock::now() - flow_start).count();
-          flow_tracker->associate(features, field);
-          runtime.flow_field = std::move(field);
-        } else {
-          features = superpoint->infer(frame);
-          tracker->associate(features);
-          projection.observe(features);
-          runtime.projected = projection.project(features);
-        }
-        features.decode_ms = decode_ms;
-        runtime.points = features.keypoints;
-        runtime.landmark_ids = features.landmark_ids;
-        runtime.similarities = features.landmark_similarities;
-        runtime.new_landmarks = features.new_landmarks;
-        runtime.matched_landmarks = features.matched_landmarks;
-        runtime.tracking_ms = features.tracking_ms;
-        update_trails(runtime, config.tracker.max_inactive_frames);
-        runtime.stats.inferred_frames++;
-        runtime.stats.preprocess_ms = features.preprocess_ms;
-        runtime.stats.inference_ms = features.inference_ms;
-        runtime.stats.readback_ms = features.readback_ms;
-        store->enqueue(std::move(features));
-      } else {
-        if (optical_flow && static_cast<std::int64_t>(frame.frame_index) == cached_through) {
-          optical_flow->remember(frame);
-        }
-        runtime.points.clear();
-        runtime.landmark_ids.clear();
-        runtime.projected.clear();
-        runtime.flow_field.reset();
-      }
-      const double fps = decoder->nominal_fps();
-      runtime.next_frame = now + std::chrono::duration_cast<Clock::duration>(
-                                     std::chrono::duration<double>(fps > 0 ? 1.0 / fps : 0.0));
+      process_frame(frame, decode_ms);
     }
     runtime.step_requested = false;
   }
 
+  void process_frame(const GpuFrame& frame, double decode_ms) {
+    runtime.texture = presenter->present(frame);
+    runtime.frame_width = frame.width;
+    runtime.frame_height = frame.height;
+    runtime.frame_index = frame.frame_index;
+    runtime.timestamp_ns = frame.timestamp_ns;
+    runtime.seek_error.clear();
+    runtime.stats.decoded_frames++;
+    runtime.stats.decode_ms = decode_ms;
+    auto cached = store->load_frame(frame);
+    FrameFeatures features;
+    if (cached) {
+      features = std::move(*cached);
+      features.frame_index = frame.frame_index;
+    } else {
+      features = superpoint->infer(frame);
+      features.decode_ms = decode_ms;
+      auto cache_features = features;
+      // Cache row IDs must not use the decoder's seek-local frame ordinal.
+      cache_features.frame_index = next_cache_index++;
+      store->enqueue(std::move(cache_features));
+    }
+    runtime.detections = features.keypoints; // Preserve all detections before the tracking cap.
+    // GPU hot path: flow fields, detections and track state stay on the device.
+    std::optional<DeviceFlowField> field;
+    if (optical_flow->has_reference()) field = optical_flow->compute(frame);
+    else optical_flow->remember(frame);
+    const DeviceDetections device = cached ? DeviceDetections{} : superpoint->device_detections();
+    flow_tracker->set_association_radius(runtime.association_radius);
+    flow_tracker->associate(features, field ? &*field : nullptr, cached ? nullptr : &device);
+    runtime.flow_ms = field ? optical_flow->gpu_ms() : 0.0;
+    // Host flow copy only for the optional overlay.
+    runtime.flow_field.reset();
+    if (field && runtime.show_flow_vectors) runtime.flow_field = optical_flow->download();
+    // Camera pose from the observed (non-coasted) tracks; any tracker's output
+    // converted to a TrackedFrame could drive this instead.
+    runtime.odometry = odometry->process(tracked_frame_from(features));
+    trajectory_view.update(*odometry);
+    runtime.points = features.keypoints;
+    runtime.supported = features.superpoint_supported;
+    runtime.landmark_ids = features.landmark_ids;
+    runtime.similarities = features.landmark_similarities;
+    runtime.predictions = features.flow_predictions;
+    runtime.corrections = features.correction_distances;
+    runtime.cache_hit = cached.has_value();
+    runtime.new_landmarks = features.new_landmarks;
+    runtime.matched_landmarks = features.matched_landmarks;
+    runtime.coasted_landmarks = features.coasted_landmarks;
+    runtime.tracking_ms = features.tracking_ms;
+    update_trails(runtime);
+    runtime.stats.inferred_frames++;
+    runtime.stats.preprocess_ms = features.preprocess_ms;
+    runtime.stats.inference_ms = features.inference_ms;
+    runtime.stats.readback_ms = features.readback_ms;
+    const double fps = decoder->nominal_fps();
+    runtime.next_frame = Clock::now() + std::chrono::duration_cast<Clock::duration>(
+                                   std::chrono::duration<double>(fps > 0 ? 1.0 / fps : 0.0));
+  }
+
+  std::uint64_t next_cache_index{};
   AppConfig config;
   std::unique_ptr<VideoDecoder> decoder;
-  std::unique_ptr<VideoDecoder> preview_decoder;
-  std::unique_ptr<FramePreviewReader> preview_reader;
+  std::unique_ptr<VideoDecoder> seek_decoder;
   std::unique_ptr<CudaFramePresenter> presenter;
   std::unique_ptr<SuperPoint> superpoint;
   std::unique_ptr<OpticalFlow> optical_flow;
   std::unique_ptr<FeatureStore> store;
   std::unique_ptr<OnlineTracker> tracker;
   std::unique_ptr<FlowTracker> flow_tracker;
+  std::unique_ptr<VisualOdometry> odometry;
+  TrajectoryView trajectory_view;
   DescriptorProjection projection;
   Runtime runtime;
-  std::int64_t cached_through{-1};
 };
 
 }  // namespace
@@ -827,6 +760,7 @@ struct Session {
 int run_app(const AppConfig& config) {
   GlfwLifetime glfw;
   Window window;
+  validate_cuda_gl_display();
   ImGuiLifetime imgui(window.get());
   std::error_code path_error;
   const std::filesystem::path executable =
@@ -834,7 +768,7 @@ int run_app(const AppConfig& config) {
   const auto native_root = path_error ? std::filesystem::current_path() :
       executable.parent_path().parent_path().parent_path();
   AppConfig initial = config;
-  if (initial.tracking_method == TrackingMethod::superpoint && initial.engine.empty()) {
+  if (initial.engine.empty()) {
     initial.engine = native_root / "models/superpoint-1024x576-k2048.engine";
   }
   Launcher launcher(initial, native_root.parent_path());
@@ -872,6 +806,10 @@ int run_app(const AppConfig& config) {
                  session->decoder->duration_ns(),
                  session->decoder->start_time_ns());
       if (session->flow_tracker) draw_flow_diagnostics(session->runtime, *session->flow_tracker);
+      if (session->odometry) {
+        session->trajectory_view.draw(*session->odometry, &session->runtime.show_trajectory,
+                                      session->runtime.frame_width, session->runtime.frame_height);
+      }
       else draw_diagnostics(session->runtime, *session->tracker, session->projection);
     } else {
       AppConfig selected;

@@ -1,5 +1,7 @@
 #include "slam_native/video_decoder.hpp"
 
+#include <cuda.h>
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -69,6 +71,19 @@ class FfmpegCudaDecoder final : public VideoDecoder {
     require(av_hwdevice_ctx_create(&hardware_device_, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr,
                                    AV_CUDA_USE_PRIMARY_CONTEXT),
             "create FFmpeg CUDA device");
+    {
+      // FFmpeg copies NVDEC output on its own (legacy default) stream. Our
+      // consumers use non-blocking streams, which do not order against it, so
+      // each frame carries an event recorded after FFmpeg's copy.
+      const auto* device = reinterpret_cast<const AVHWDeviceContext*>(hardware_device_->data);
+      const auto* cuda = static_cast<const AVCUDADeviceContext*>(device->hwctx);
+      cuda_context_ = cuda->cuda_ctx;
+      cuda_stream_ = cuda->stream;
+      ContextScope scope(cuda_context_);
+      if (cuEventCreate(&ready_, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS) {
+        throw std::runtime_error("Create decoder completion event");
+      }
+    }
     codec_ = avcodec_alloc_context3(codec);
     if (!codec_) {
       throw std::bad_alloc();
@@ -144,6 +159,12 @@ class FfmpegCudaDecoder final : public VideoDecoder {
         const std::int64_t timestamp = frame_->best_effort_timestamp == AV_NOPTS_VALUE
                                            ? 0
                                            : frame_->best_effort_timestamp;
+        {
+          ContextScope scope(cuda_context_);
+          if (cuEventRecord(ready_, cuda_stream_) != CUDA_SUCCESS) {
+            throw std::runtime_error("Record decoder completion event");
+          }
+        }
         output = {
             .frame_index = frame_index_++,
             .timestamp_ns = av_rescale_q(timestamp, stream_->time_base, AVRational{1, 1000000000}),
@@ -155,6 +176,7 @@ class FfmpegCudaDecoder final : public VideoDecoder {
             .chroma = reinterpret_cast<std::uintptr_t>(frame_->data[1]),
             .luma_pitch = static_cast<std::size_t>(frame_->linesize[0]),
             .chroma_pitch = static_cast<std::size_t>(frame_->linesize[1]),
+            .ready_event = ready_,
         };
         return true;
       }
@@ -206,7 +228,18 @@ class FfmpegCudaDecoder final : public VideoDecoder {
     return AV_PIX_FMT_NONE;
   }
 
+  struct ContextScope {
+    explicit ContextScope(CUcontext context) { cuCtxPushCurrent(context); }
+    ~ContextScope() { CUcontext ignored{}; cuCtxPopCurrent(&ignored); }
+  };
+
   void close() {
+    if (ready_) {
+      ContextScope scope(cuda_context_);
+      cuEventSynchronize(ready_);
+      cuEventDestroy(ready_);
+      ready_ = nullptr;
+    }
     av_packet_free(&packet_);
     av_frame_free(&frame_);
     avcodec_free_context(&codec_);
@@ -225,6 +258,9 @@ class FfmpegCudaDecoder final : public VideoDecoder {
   AVBufferRef* hardware_device_{};
   AVFrame* frame_{};
   AVPacket* packet_{};
+  CUcontext cuda_context_{};
+  CUstream cuda_stream_{};
+  CUevent ready_{};
   AVStream* stream_{};
   int stream_index_{-1};
   std::uint64_t frame_index_{};

@@ -1,7 +1,29 @@
 # SLAM Lab session handoff — 2026-09-20
 
+> **Archived 2026-09-24.** Historical handoff from the first offline reconstruction session. It is out of date; see the current docs in the repository root and `native_workbench/`.
+
+## Native workbench update — 2026-09-23
+
+The native viewer now uses SuperPoint detections plus consecutive-frame NVIDIA
+optical flow, with CUDA spatial association and a default cap of 1,000 live
+tracks. Unmatched tracks die immediately: confidence decay and flow-only
+carryover were removed. Descriptors are cached but are not used for association.
+Association now considers all current detections before applying the live-track
+cap: successful continuations survive regardless of score rank, and strongest
+unmatched detections fill remaining slots.
+Only raw SuperPoint data is persisted; tracking state is rebuilt in memory.
+The red detection view shows all raw detections before the tracking cap.
+Seeking resets tracking at the selected frame, Play continues there, and
+Restart returns to the beginning with fresh tracking.
+
+See [native usage](../native_workbench/README.md) and
+[current tracking/keypoint decisions](../native_workbench/ARCHITECTURE.md) for
+the implemented rules, controls, cache contract, and measured GPU timing.
+The dated offline-pipeline report below remains historical; its artifact
+workflow is separate from the native exploratory viewer.
+
 This is the verified state at the end of the session, not a live status file.
-Start with [WORKFLOW.md](WORKFLOW.md) for commands. The project directory is
+Start with [WORKFLOW.md](../WORKFLOW.md) for commands. The project directory is
 `/home/nick/slam-lab`; all paths below are relative to it unless stated otherwise.
 
 ## Outcome
@@ -135,7 +157,7 @@ spells out their mappings and the proposed improvements.
 The original bad trajectory was not proven to be simply insufficient match count.
 The earlier RANSAC investigation found strong caption contamination in its seed
 and a large pose-direction change when that region was excluded. The bend near
-10 seconds existed before BA. See the historical [RECONSTRUCTION.md](RECONSTRUCTION.md)
+10 seconds existed before BA. See the historical [RECONSTRUCTION.md](../RECONSTRUCTION.md)
 and `recordings/osaka-ransac` diagnostics; they are not the new solver's results.
 
 The apparent missing building matches in pair 100/101 were partly a display issue:
@@ -151,7 +173,7 @@ promise bit-identical CPU/GPU matches or describe CUDA inference as entirely FP3
 
 ## GUI handoff and next priorities
 
-The GUI should read [WORKBENCH_INTERFACE.md](WORKBENCH_INTERFACE.md) for the current
+The GUI should read [WORKBENCH_INTERFACE.md](../WORKBENCH_INTERFACE.md) for the current
 artifact and status contract. No HTTP service is implemented. Core Python compute
 functions do not launch Rerun. The supported compute workflow is
 `match-all -> verify-matches -> solve`; `match-all` and `solve` accept `--no-rerun`.
@@ -166,7 +188,7 @@ resume checkpoints. Live pair cursors must follow commit order so out-of-order w
 results are not missed.
 
 For the next numerical experiment, compare LightGlue and cosine on the same
-30-frame selection using the commands in [WORKFLOW.md](WORKFLOW.md). After visual
+30-frame selection using the commands in [WORKFLOW.md](../WORKFLOW.md). After visual
 and geometric review, consider a mature solver adapter, calibration sensitivity,
 local/periodic BA, track splitting and dynamic/caption masks. A new custom global
 optimizer is not the immediate workbench dependency.

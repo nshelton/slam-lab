@@ -97,4 +97,4 @@ resume/input invalidation, row-ID mapping, and self-contained Rerun exports.
 GUI schemas and APIs are documented in [WORKBENCH_INTERFACE.md](WORKBENCH_INTERFACE.md).
 The planned backend integration tasks are in [SOLVER_TODO.md](SOLVER_TODO.md).
 For the verified session state and the next LightGlue comparison, see
-[SESSION_HANDOFF.md](SESSION_HANDOFF.md) and [WORKFLOW.md](WORKFLOW.md).
+[archived reconstruction handoff](archive/SESSION_HANDOFF-20260920.md) and [WORKFLOW.md](WORKFLOW.md).

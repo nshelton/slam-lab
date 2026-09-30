@@ -7,6 +7,10 @@
 #include <bit>
 #include <chrono>
 #include <cstring>
+#include <fstream>
+#include <limits>
+#include <sstream>
+#include <cmath>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -32,24 +36,11 @@ CREATE TABLE IF NOT EXISTS frames (
   keypoints_xy_f32 BLOB NOT NULL,
   scores_f32 BLOB NOT NULL,
   descriptors BLOB NOT NULL,
-  descriptor_encoding TEXT NOT NULL CHECK(descriptor_encoding IN ('f16', 'f32', 'none')),
+  descriptor_encoding TEXT NOT NULL CHECK(descriptor_encoding IN ('f16', 'f32')),
   decode_ms REAL NOT NULL,
   preprocess_ms REAL NOT NULL,
   inference_ms REAL NOT NULL,
-  readback_ms REAL NOT NULL,
-  landmark_ids_u64 BLOB NOT NULL,
-  landmark_similarities_f32 BLOB NOT NULL,
-  new_landmarks INTEGER NOT NULL,
-  matched_landmarks INTEGER NOT NULL,
-  tracking_ms REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS landmarks (
-  landmark_id INTEGER PRIMARY KEY,
-  observation_count INTEGER NOT NULL,
-  resultant_f32 BLOB NOT NULL,
-  concentration REAL NOT NULL,
-  first_frame INTEGER NOT NULL,
-  last_frame INTEGER NOT NULL
+  readback_ms REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS frames_timestamp ON frames(timestamp_ns);
 )sql";
@@ -139,6 +130,38 @@ void set_immutable_metadata(sqlite3* db, const char* key, const std::string& val
   set_metadata(db, key, value);
 }
 
+
+std::string file_identity(const std::filesystem::path& path, bool hash_contents) {
+  std::ostringstream result;
+  result << std::filesystem::file_size(path) << ':' <<
+      std::filesystem::last_write_time(path).time_since_epoch().count();
+  if (hash_contents) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw std::runtime_error("Cannot fingerprint engine: " + path.string());
+    std::uint64_t hash = 14695981039346656037ULL;
+    char buffer[65536];
+    while (input.read(buffer, sizeof(buffer)) || input.gcount()) {
+      for (std::streamsize i = 0; i < input.gcount(); ++i) {
+        hash ^= static_cast<unsigned char>(buffer[i]);
+        hash *= 1099511628211ULL;
+      }
+    }
+    if (!input.eof()) throw std::runtime_error("Cannot read engine fingerprint");
+    result << ':' << std::hex << hash;
+  }
+  return result.str();
+}
+
+float half_to_float(std::uint16_t bits) {
+  const int exponent = (bits >> 10) & 31;
+  const int mantissa = bits & 1023;
+  const float value = exponent == 0 ? std::ldexp(float(mantissa), -24) :
+      exponent == 31 ? (mantissa ? std::numeric_limits<float>::quiet_NaN() :
+                                  std::numeric_limits<float>::infinity()) :
+      std::ldexp(float(1024 + mantissa), exponent - 25);
+  return bits & 0x8000 ? -value : value;
+}
+
 }  // namespace
 
 FeatureStore::FeatureStore(const std::filesystem::path& path, StoreConfig config)
@@ -157,6 +180,20 @@ FeatureStore::FeatureStore(const std::filesystem::path& path, StoreConfig config
     db_ = nullptr;
     throw std::runtime_error("open feature database: " + message);
   }
+  // Reject legacy databases before any schema, metadata, or journal writes.
+  sqlite3_stmt* probe = nullptr;
+  if (sqlite3_prepare_v2(db_, "SELECT value FROM metadata WHERE key='schema_version'",
+                       -1, &probe, nullptr) == SQLITE_OK) {
+    const int result = sqlite3_step(probe);
+    const std::string version = result == SQLITE_ROW ?
+        reinterpret_cast<const char*>(sqlite3_column_text(probe, 0)) : "";
+    sqlite3_finalize(probe);
+    if (version != "3") {
+      sqlite3_close(db_);
+      db_ = nullptr;
+      throw std::runtime_error("Legacy database is unchanged; choose a new SuperPoint cache path");
+    }
+  } else if (probe) sqlite3_finalize(probe);
   sqlite3_busy_timeout(db_, 5000);
   char* error = nullptr;
   const int result = sqlite3_exec(db_, kSchema.data(), nullptr, nullptr, &error);
@@ -176,12 +213,12 @@ FeatureStore::FeatureStore(const std::filesystem::path& path, StoreConfig config
                                    : "";
   sqlite3_finalize(version);
   if (found != SQLITE_ROW && found != SQLITE_DONE) check(found, db_, "read schema version");
-  if (!existing.empty() && existing != "2") {
+  if (!existing.empty() && existing != "3") {
     sqlite3_close(db_);
     db_ = nullptr;
     throw std::runtime_error("Unsupported native feature database schema: " + existing);
   }
-  set_metadata(db_, "schema_version", "2");
+  set_metadata(db_, "schema_version", "3");
   set_metadata(db_, "image_storage", "source-video-only");
   sqlite3_stmt* last = nullptr;
   check(sqlite3_prepare_v2(db_,
@@ -198,12 +235,9 @@ FeatureStore::FeatureStore(const std::filesystem::path& path, StoreConfig config
   persisted_ = static_cast<std::uint64_t>(sqlite3_column_int64(last, 1));
   observation_count_ = static_cast<std::uint64_t>(sqlite3_column_int64(last, 2));
   sqlite3_finalize(last);
-  sqlite3_stmt* landmarks = nullptr;
-  check(sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM landmarks", -1,
-                           &landmarks, nullptr), db_, "read landmark count");
-  check(sqlite3_step(landmarks), db_, "read landmark count");
-  landmark_rows_ = static_cast<std::uint64_t>(sqlite3_column_int64(landmarks, 0));
-  sqlite3_finalize(landmarks);
+  check(sqlite3_open_v2(path.c_str(), &reader_, SQLITE_OPEN_READONLY, nullptr), db_,
+        "open cache reader");
+  sqlite3_busy_timeout(reader_, 5000);
   writer_ = std::thread(&FeatureStore::writer_loop, this);
 }
 
@@ -220,6 +254,7 @@ FeatureStore::~FeatureStore() {
   if (writer_.joinable()) {
     writer_.join();
   }
+  if (reader_) sqlite3_close(reader_);
   if (db_) {
     sqlite3_close(db_);
   }
@@ -227,158 +262,78 @@ FeatureStore::~FeatureStore() {
 
 void FeatureStore::set_session(const std::filesystem::path& source_video,
                                const std::filesystem::path& engine_path,
-                               int input_width,
-                               int input_height,
-                               int max_keypoints,
-                               float threshold,
-                               const TrackerConfig& tracker, bool optical_flow) {
-  // Call before frames are enqueued. This connection is only otherwise used by
-  // the writer thread after construction.
-  sqlite3_stmt* method = nullptr;
-  check(sqlite3_prepare_v2(db_,
-      "SELECT value FROM metadata WHERE key='tracker_algorithm'", -1, &method, nullptr),
-      db_, "read tracker algorithm");
-  const int method_result = sqlite3_step(method);
-  const std::string existing_method = method_result == SQLITE_ROW ?
-      reinterpret_cast<const char*>(sqlite3_column_text(method, 0)) : "";
-  sqlite3_finalize(method);
-  if (method_result != SQLITE_ROW && method_result != SQLITE_DONE) {
-    check(method_result, db_, "read tracker algorithm");
-  }
-  const char* algorithm = optical_flow ? "nvof-grid-tracker-v1" :
-                                         "online-spherical-mean-greedy-v1";
-  if (!existing_method.empty() && existing_method != algorithm) {
-    throw std::runtime_error("Feature database belongs to another tracking method");
-  }
-  const std::string source = std::filesystem::weakly_canonical(source_video).string();
-  set_immutable_metadata(db_, "source_video", source);
-  set_immutable_metadata(db_, "engine_path", optical_flow ? "" :
-                         std::filesystem::weakly_canonical(engine_path).string());
-  set_immutable_metadata(db_, "descriptor_dimension", optical_flow ? "0" : "256");
-  set_immutable_metadata(db_, "input_width", optical_flow ? "0" : std::to_string(input_width));
-  set_immutable_metadata(db_, "input_height", optical_flow ? "0" : std::to_string(input_height));
-  set_immutable_metadata(db_, "max_keypoints", optical_flow ? "0" : std::to_string(max_keypoints));
-  set_immutable_metadata(db_, "detection_threshold", optical_flow ? "0" : std::to_string(threshold));
+                               int input_width, int input_height, int max_keypoints,
+                               float threshold) {
+  set_immutable_metadata(db_, "source_video", std::filesystem::canonical(source_video).string());
+  set_immutable_metadata(db_, "source_identity", file_identity(source_video, false));
+  set_immutable_metadata(db_, "engine_path", std::filesystem::canonical(engine_path).string());
+  set_immutable_metadata(db_, "engine_identity", file_identity(engine_path, true));
+  set_immutable_metadata(db_, "extractor", "tensorrt-superpoint-letterbox-v1");
+  set_immutable_metadata(db_, "descriptor_dimension", "256");
+  set_immutable_metadata(db_, "input_width", std::to_string(input_width));
+  set_immutable_metadata(db_, "input_height", std::to_string(input_height));
+  set_immutable_metadata(db_, "max_keypoints", std::to_string(max_keypoints));
+  std::ostringstream precise;
+  precise << std::hexfloat << threshold;
+  set_immutable_metadata(db_, "detection_threshold", precise.str());
   set_immutable_metadata(db_, "descriptor_encoding",
-                         config_.descriptor_encoding == DescriptorEncoding::none ? "none" :
-                         config_.descriptor_encoding == DescriptorEncoding::float16 ? "f16" : "f32");
-  set_immutable_metadata(db_, "tracker_algorithm", algorithm);
-  if (!optical_flow) {
-    set_immutable_metadata(db_, "tracker_min_similarity", std::to_string(tracker.min_similarity));
-    set_immutable_metadata(db_, "tracker_min_margin", std::to_string(tracker.min_margin));
-  }
-  set_immutable_metadata(db_, "tracker_max_inactive_frames",
-                         std::to_string(tracker.max_inactive_frames));
+      config_.descriptor_encoding == DescriptorEncoding::float16 ? "f16" : "f32");
 }
 
-std::vector<LandmarkState> FeatureStore::load_active_landmarks(
-    std::uint32_t max_inactive_frames) const {
-  std::vector<LandmarkState> active;
-  if (last_frame_index_ < 0) return active;
+std::optional<FrameFeatures> FeatureStore::load_frame(const GpuFrame& frame) const {
   sqlite3_stmt* statement = nullptr;
-  check(sqlite3_prepare_v2(db_,
-      "SELECT landmark_id,observation_count,resultant_f32,concentration,"
-      "first_frame,last_frame FROM landmarks WHERE last_frame>=? ORDER BY landmark_id",
-      -1, &statement, nullptr), db_, "prepare active landmarks");
-  sqlite3_bind_int64(statement, 1,
-      std::max<std::int64_t>(0, last_frame_index_ - max_inactive_frames));
-  int result;
-  while ((result = sqlite3_step(statement)) == SQLITE_ROW) {
-    const int resultant_bytes = sqlite3_column_bytes(statement, 2);
-    const bool valid_resultant = config_.descriptor_encoding == DescriptorEncoding::none ?
-        (resultant_bytes == 0 || resultant_bytes == 256 * static_cast<int>(sizeof(float))) :
-        resultant_bytes == 256 * static_cast<int>(sizeof(float));
-    if (!valid_resultant) {
-      sqlite3_finalize(statement);
-      throw std::runtime_error("Invalid landmark resultant in feature database");
-    }
-    LandmarkState state;
-    state.id = static_cast<std::uint64_t>(sqlite3_column_int64(statement, 0));
-    state.observation_count = static_cast<std::uint64_t>(sqlite3_column_int64(statement, 1));
-    if (resultant_bytes) {
-      std::memcpy(state.resultant.data(), sqlite3_column_blob(statement, 2),
-                  state.resultant.size() * sizeof(float));
-    }
-    state.concentration = static_cast<float>(sqlite3_column_double(statement, 3));
-    state.first_frame = static_cast<std::uint64_t>(sqlite3_column_int64(statement, 4));
-    state.last_frame = static_cast<std::uint64_t>(sqlite3_column_int64(statement, 5));
-    active.push_back(state);
+  check(sqlite3_prepare_v2(reader_,
+      "SELECT frame_index,timestamp_ns,pts,width,height,keypoint_count,keypoints_xy_f32,"
+      "scores_f32,descriptors,descriptor_encoding FROM frames WHERE timestamp_ns=? AND pts=?",
+      -1, &statement, nullptr), reader_, "prepare cached frame");
+  const auto finalize = [](sqlite3_stmt* value) { sqlite3_finalize(value); };
+  std::unique_ptr<sqlite3_stmt, decltype(finalize)> guard(statement, finalize);
+  sqlite3_bind_int64(statement, 1, frame.timestamp_ns);
+  sqlite3_bind_int64(statement, 2, frame.pts);
+  const int status = sqlite3_step(statement);
+  if (status == SQLITE_DONE) return std::nullopt;
+  check(status, reader_, "read cached frame");
+  FrameFeatures result;
+  result.frame_index = static_cast<std::uint64_t>(sqlite3_column_int64(statement, 0));
+  result.timestamp_ns = sqlite3_column_int64(statement, 1);
+  result.pts = sqlite3_column_int64(statement, 2);
+  result.width = sqlite3_column_int(statement, 3);
+  result.height = sqlite3_column_int(statement, 4);
+  const int count = sqlite3_column_int(statement, 5);
+  const std::string encoding = reinterpret_cast<const char*>(sqlite3_column_text(statement, 9));
+  const std::int64_t descriptor_bytes = encoding == "f16" ? 2 : 4;
+  if (count < 0 || result.width != frame.width || result.height != frame.height ||
+      (encoding != "f16" && encoding != "f32") ||
+      sqlite3_column_bytes(statement, 6) != std::int64_t(count) * 8 ||
+      sqlite3_column_bytes(statement, 7) != std::int64_t(count) * 4 ||
+      sqlite3_column_bytes(statement, 8) != std::int64_t(count) * 256 * descriptor_bytes) {
+    throw std::runtime_error("Invalid cached SuperPoint frame");
   }
-  sqlite3_finalize(statement);
-  check(result, db_, "read active landmarks");
-  return active;
-}
-
-std::uint64_t FeatureStore::next_landmark_id() const {
-  sqlite3_stmt* statement = nullptr;
-  check(sqlite3_prepare_v2(db_, "SELECT COALESCE(MAX(landmark_id),-1)+1 FROM landmarks",
-                           -1, &statement, nullptr), db_, "prepare next landmark ID");
-  const int result = sqlite3_step(statement);
-  if (result != SQLITE_ROW) {
-    sqlite3_finalize(statement);
-    check(result, db_, "read next landmark ID");
+  const auto* xy = static_cast<const float*>(sqlite3_column_blob(statement, 6));
+  const auto* scores = static_cast<const float*>(sqlite3_column_blob(statement, 7));
+  for (int i = 0; i < count; ++i) result.keypoints.push_back({xy[2*i], xy[2*i+1], scores[i]});
+  result.descriptors.resize(static_cast<std::size_t>(count) * 256);
+  if (count && encoding == "f32") {
+    std::memcpy(result.descriptors.data(), sqlite3_column_blob(statement, 8),
+                result.descriptors.size() * sizeof(float));
+  } else if (count) {
+    const auto* values = static_cast<const std::uint16_t*>(sqlite3_column_blob(statement, 8));
+    std::transform(values, values + result.descriptors.size(), result.descriptors.begin(), half_to_float);
   }
-  const auto next = static_cast<std::uint64_t>(sqlite3_column_int64(statement, 0));
-  sqlite3_finalize(statement);
-  return next;
-}
-
-TrackLengthHistogram FeatureStore::load_length_histogram() const {
-  TrackLengthHistogram histogram{};
-  sqlite3_stmt* statement = nullptr;
-  check(sqlite3_prepare_v2(db_,
-      "SELECT observation_count,COUNT(*) FROM landmarks GROUP BY observation_count",
-      -1, &statement, nullptr), db_, "prepare track length histogram");
-  int result;
-  while ((result = sqlite3_step(statement)) == SQLITE_ROW) {
-    const auto length = static_cast<std::uint64_t>(sqlite3_column_int64(statement, 0));
-    histogram[track_length_bin(length)] +=
-        static_cast<std::uint64_t>(sqlite3_column_int64(statement, 1));
-  }
-  sqlite3_finalize(statement);
-  check(result, db_, "read track length histogram");
-  return histogram;
-}
-
-std::vector<FlowTrackPosition> FeatureStore::load_latest_positions() const {
-  std::vector<FlowTrackPosition> positions;
-  if (last_frame_index_ < 0) return positions;
-  sqlite3_stmt* statement = nullptr;
-  check(sqlite3_prepare_v2(db_,
-      "SELECT keypoint_count,keypoints_xy_f32,landmark_ids_u64 FROM frames "
-      "WHERE frame_index=?", -1, &statement, nullptr), db_, "prepare latest flow positions");
-  sqlite3_bind_int64(statement, 1, last_frame_index_);
-  const int result = sqlite3_step(statement);
-  if (result == SQLITE_ROW) {
-    const int count = sqlite3_column_int(statement, 0);
-    if (count < 0 ||
-        sqlite3_column_bytes(statement, 1) != count * 2 * static_cast<int>(sizeof(float)) ||
-        sqlite3_column_bytes(statement, 2) != count * static_cast<int>(sizeof(std::uint64_t))) {
-      sqlite3_finalize(statement);
-      throw std::runtime_error("Invalid saved flow positions");
-    }
-    const auto* xy = static_cast<const float*>(sqlite3_column_blob(statement, 1));
-    const auto* ids = static_cast<const std::uint64_t*>(sqlite3_column_blob(statement, 2));
-    positions.reserve(count);
-    for (int index = 0; index < count; ++index) {
-      positions.push_back({ids[index], xy[index * 2], xy[index * 2 + 1]});
-    }
-  }
-  sqlite3_finalize(statement);
-  if (result != SQLITE_ROW && result != SQLITE_DONE) check(result, db_, "read latest flow positions");
-  return positions;
+  return result;
 }
 
 void FeatureStore::enqueue(FrameFeatures features) {
-  if (config_.descriptor_encoding == DescriptorEncoding::none ?
-      !features.descriptors.empty() :
+  if (config_.descriptor_encoding == DescriptorEncoding::none ||
       features.descriptors.size() != features.keypoints.size() * 256) {
-    throw std::invalid_argument("Invalid descriptor array for selected tracking mode");
+    throw std::invalid_argument("Cache requires SuperPoint descriptors");
   }
-  if (features.landmark_ids.size() != features.keypoints.size() ||
-      features.landmark_similarities.size() != features.keypoints.size() ||
-      features.landmark_updates.size() != features.keypoints.size()) {
-    throw std::invalid_argument("Tracker must assign every detected feature");
+  if (!features.landmark_ids.empty() || !features.landmark_updates.empty() ||
+      !features.track_confidences.empty() || !features.landmark_similarities.empty() ||
+      !features.superpoint_supported.empty() || !features.flow_predictions.empty() ||
+      !features.correction_distances.empty() || features.new_landmarks || features.matched_landmarks ||
+      features.coasted_landmarks) {
+    throw std::invalid_argument("Only raw SuperPoint observations may be persisted");
   }
   std::unique_lock lock(mutex_);
   writable_.wait(lock, [this] {
@@ -451,7 +406,6 @@ void FeatureStore::writer_loop() {
         std::lock_guard lock(mutex_);
         persisted_ += batch.size();
         for (const auto& frame : batch) {
-          landmark_rows_ += frame.new_landmarks;
           observation_count_ += frame.keypoints.size();
         }
         writing_ = false;
@@ -471,36 +425,22 @@ void FeatureStore::writer_loop() {
 
 void FeatureStore::write_batch(std::vector<FrameFeatures>& batch) {
   std::uint64_t committed_frames;
-  std::uint64_t committed_landmarks;
   std::uint64_t committed_observations;
   {
     std::lock_guard lock(mutex_);
     committed_frames = persisted_;
-    committed_landmarks = landmark_rows_;
     committed_observations = observation_count_;
   }
   check(sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr), db_, "begin frame batch");
   sqlite3_stmt* statement = nullptr;
-  sqlite3_stmt* landmark_statement = nullptr;
   try {
     constexpr auto sql =
-        "INSERT OR REPLACE INTO frames(frame_index,timestamp_ns,pts,width,height,"
+        "INSERT INTO frames(frame_index,timestamp_ns,pts,width,height,"
         "keypoint_count,keypoints_xy_f32,scores_f32,descriptors,descriptor_encoding,"
-        "decode_ms,preprocess_ms,inference_ms,readback_ms,landmark_ids_u64,"
-        "landmark_similarities_f32,new_landmarks,matched_landmarks,tracking_ms) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+        "decode_ms,preprocess_ms,inference_ms,readback_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
     check(sqlite3_prepare_v2(db_, sql, -1, &statement, nullptr), db_, "prepare frame insert");
-    constexpr auto landmark_sql =
-        "INSERT INTO landmarks(landmark_id,observation_count,resultant_f32,"
-        "concentration,first_frame,last_frame) VALUES(?,?,?,?,?,?) "
-        "ON CONFLICT(landmark_id) DO UPDATE SET observation_count=excluded.observation_count,"
-        "resultant_f32=excluded.resultant_f32,concentration=excluded.concentration,"
-        "last_frame=excluded.last_frame";
-    check(sqlite3_prepare_v2(db_, landmark_sql, -1, &landmark_statement, nullptr),
-          db_, "prepare landmark update");
     for (const auto& frame : batch) {
       committed_frames += 1;
-      committed_landmarks += frame.new_landmarks;
       committed_observations += frame.keypoints.size();
       std::vector<float> xy;
       std::vector<float> scores;
@@ -540,46 +480,19 @@ void FeatureStore::write_batch(std::vector<FrameFeatures>& batch) {
       sqlite3_bind_double(statement, 12, frame.preprocess_ms);
       sqlite3_bind_double(statement, 13, frame.inference_ms);
       sqlite3_bind_double(statement, 14, frame.readback_ms);
-      bind_blob(statement, 15, frame.landmark_ids.data(),
-                frame.landmark_ids.size() * sizeof(std::uint64_t), db_);
-      bind_blob(statement, 16, frame.landmark_similarities.data(),
-                frame.landmark_similarities.size() * sizeof(float), db_);
-      sqlite3_bind_int(statement, 17, static_cast<int>(frame.new_landmarks));
-      sqlite3_bind_int(statement, 18, static_cast<int>(frame.matched_landmarks));
-      sqlite3_bind_double(statement, 19, frame.tracking_ms);
       check(sqlite3_step(statement), db_, "insert frame");
       check(sqlite3_reset(statement), db_, "reset frame insert");
       sqlite3_clear_bindings(statement);
-      for (const auto& landmark : frame.landmark_updates) {
-        sqlite3_bind_int64(landmark_statement, 1, static_cast<sqlite3_int64>(landmark.id));
-        sqlite3_bind_int64(landmark_statement, 2,
-                           static_cast<sqlite3_int64>(landmark.observation_count));
-        bind_blob(landmark_statement, 3, landmark.resultant.data(),
-                  config_.descriptor_encoding == DescriptorEncoding::none ? 0 :
-                  landmark.resultant.size() * sizeof(float), db_);
-        sqlite3_bind_double(landmark_statement, 4, landmark.concentration);
-        sqlite3_bind_int64(landmark_statement, 5,
-                           static_cast<sqlite3_int64>(landmark.first_frame));
-        sqlite3_bind_int64(landmark_statement, 6,
-                           static_cast<sqlite3_int64>(landmark.last_frame));
-        check(sqlite3_step(landmark_statement), db_, "update landmark");
-        check(sqlite3_reset(landmark_statement), db_, "reset landmark update");
-        sqlite3_clear_bindings(landmark_statement);
-      }
     }
     sqlite3_finalize(statement);
     statement = nullptr;
-    sqlite3_finalize(landmark_statement);
-    landmark_statement = nullptr;
     set_metadata(db_, "frame_rows", std::to_string(committed_frames));
-    set_metadata(db_, "landmark_rows", std::to_string(committed_landmarks));
     set_metadata(db_, "observation_count", std::to_string(committed_observations));
     check(sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr), db_, "commit frame batch");
   } catch (...) {
     if (statement) {
       sqlite3_finalize(statement);
     }
-    if (landmark_statement) sqlite3_finalize(landmark_statement);
     sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
     throw;
   }

@@ -9,7 +9,7 @@ Video → features → online tracks
                  ↘ matches → geometry/verified tracks → cameras and points
 
 Start with [WORKFLOW.md](WORKFLOW.md) for commands and the documentation map.
-[SESSION_HANDOFF.md](SESSION_HANDOFF.md) records the verified end-of-session state,
+[archived reconstruction handoff](archive/SESSION_HANDOFF-20260920.md) records the verified end-of-session state,
 results and next work. Both Osaka all-pairs matching runs are complete; the initial
 modular solver has been exercised on 30 selected frames from the cosine run.
 

@@ -19,7 +19,7 @@ Track counts describe appearance association, not reconstruction accuracy. Light
 retained 2,807 CPU-computed pairs and added 42,043 CUDA-computed pairs. The GPU resume
 ran from 20:30:21 to 20:45:24 UTC through track association (about 15 minutes); its
 last reported matching rate was 47.8 pairs/s. The CUDA and CPU pairs have separate
-runtime provenance. See [SESSION_HANDOFF.md](SESSION_HANDOFF.md) for the result inventory.
+runtime provenance. See [archived reconstruction handoff](archive/SESSION_HANDOFF-20260920.md) for the result inventory.
 
 ## Osaka: start or resume
 

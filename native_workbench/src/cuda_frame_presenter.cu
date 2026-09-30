@@ -154,9 +154,27 @@ class CudaGlPresenter final : public CudaFramePresenter {
 
 }  // namespace
 
+void validate_cuda_gl_display() {
+  unsigned int count = 0;
+  int devices[16]{};
+  const auto status = cudaGLGetDevices(&count, devices, 16, cudaGLDeviceListAll);
+  int device = -1;
+  const auto device_status = cudaGetDevice(&device);
+  if (status != cudaSuccess || device_status != cudaSuccess || count == 0 ||
+      std::find(devices, devices + count, device) == devices + count) {
+    const auto* renderer = glGetString(GL_RENDERER);
+    throw std::runtime_error(
+        std::string("OpenGL renderer '") +
+        (renderer ? reinterpret_cast<const char*>(renderer) : "unavailable") +
+        "' cannot share display buffers with the selected CUDA device. "
+        "Launch with __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia "
+        "and ensure OpenGL and CUDA use the same NVIDIA GPU. CUDA: " +
+        cudaGetErrorString(status != cudaSuccess ? status : device_status));
+  }
+}
+
 std::unique_ptr<CudaFramePresenter> make_cuda_gl_presenter() {
   return std::make_unique<CudaGlPresenter>();
 }
 
 }  // namespace slam_native
-

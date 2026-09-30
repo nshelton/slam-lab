@@ -56,7 +56,6 @@ class Launcher {
   [[nodiscard]] std::string& target_path();
 
   AppConfig initial_;
-  TrackingMethod tracking_method_{TrackingMethod::superpoint};
   RecentSessions recents_;
   std::filesystem::path repository_root_;
   std::string video_;

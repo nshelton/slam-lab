@@ -2,7 +2,7 @@
 
 #include "slam_native/types.hpp"
 #include "slam_native/online_tracker.hpp"
-#include "slam_native/flow_tracker.hpp"
+#include <optional>
 
 #include <condition_variable>
 #include <cstddef>
@@ -38,14 +38,8 @@ class FeatureStore {
                    int input_width,
                    int input_height,
                    int max_keypoints,
-                   float threshold,
-                   const TrackerConfig& tracker,
-                   bool optical_flow = false);
-  [[nodiscard]] std::vector<LandmarkState> load_active_landmarks(
-      std::uint32_t max_inactive_frames) const;
-  [[nodiscard]] std::uint64_t next_landmark_id() const;
-  [[nodiscard]] TrackLengthHistogram load_length_histogram() const;
-  [[nodiscard]] std::vector<FlowTrackPosition> load_latest_positions() const;
+                   float threshold);
+  [[nodiscard]] std::optional<FrameFeatures> load_frame(const GpuFrame& frame) const;
   void enqueue(FrameFeatures features);
   void flush();
   [[nodiscard]] std::size_t queued() const;
@@ -60,6 +54,7 @@ class FeatureStore {
   void throw_writer_error();
 
   sqlite3* db_{};
+  sqlite3* reader_{};
   StoreConfig config_;
   mutable std::mutex mutex_;
   std::condition_variable readable_;

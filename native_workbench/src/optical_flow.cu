@@ -38,6 +38,17 @@ __global__ void p010_to_luma8(const std::uint16_t* source, std::size_t source_pi
   target[y * target_pitch + x] = static_cast<std::uint8_t>(source_row[x] >> 8);
 }
 
+// NVOF writes S10.5 fixed point (5 fractional bits): pixels = value / 32.
+__global__ void fixed_to_pixels(const NV_OF_FLOW_VECTOR* source, std::size_t pitch,
+                                FlowVector* target, int width, int height) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= width || y >= height) return;
+  const auto vector = reinterpret_cast<const NV_OF_FLOW_VECTOR*>(
+      reinterpret_cast<const std::uint8_t*>(source) + y * pitch)[x];
+  target[y * width + x] = {vector.flowx / 32.0F, vector.flowy / 32.0F};
+}
+
 }  // namespace
 
 struct OpticalFlow::State {
@@ -45,8 +56,12 @@ struct OpticalFlow::State {
   NV_OF_CUDA_API_FUNCTION_LIST api{};
   NvOFHandle handle{};
   NvOFGPUBufferHandle input[2]{};
-  NvOFGPUBufferHandle output{};
+  NvOFGPUBufferHandle output[2]{};  // forward, backward
+  FlowVector* fields[2]{};           // forward, backward, in pixels
   cudaStream_t stream{};
+  cudaEvent_t ready{}, begin{}, end{};
+  OpticalFlowConfig config;
+  bool computed{};
   int width{};
   int height{};
   int grid_width{};
@@ -57,9 +72,11 @@ struct OpticalFlow::State {
     if (stream) cudaStreamSynchronize(stream);
     if (handle) {
       for (auto& buffer : input) if (buffer) api.nvOFDestroyGPUBufferCuda(buffer);
-      if (output) api.nvOFDestroyGPUBufferCuda(output);
+      for (auto& buffer : output) if (buffer) api.nvOFDestroyGPUBufferCuda(buffer);
       api.nvOFDestroy(handle);
     }
+    for (auto* field : fields) if (field) cudaFree(field);
+    for (auto event : {ready, begin, end}) if (event) cudaEventDestroy(event);
     if (stream) cudaStreamDestroy(stream);
     if (library) dlclose(library);
   }
@@ -97,7 +114,8 @@ struct OpticalFlow::State {
     init.height = height;
     init.outGridSize = NV_OF_OUTPUT_VECTOR_GRID_SIZE_4;
     init.mode = NV_OF_MODE_OPTICALFLOW;
-    init.perfLevel = NV_OF_PERF_LEVEL_MEDIUM;
+    init.perfLevel = config.quality <= 0 ? NV_OF_PERF_LEVEL_SLOW :
+        config.quality == 1 ? NV_OF_PERF_LEVEL_MEDIUM : NV_OF_PERF_LEVEL_FAST;
     of_check(api.nvOFInit(handle, &init), "Initialize optical-flow engine");
     NV_OF_BUFFER_DESCRIPTOR input_desc{};
     input_desc.width = width;
@@ -114,9 +132,38 @@ struct OpticalFlow::State {
     output_desc.height = grid_height;
     output_desc.bufferUsage = NV_OF_BUFFER_USAGE_OUTPUT;
     output_desc.bufferFormat = NV_OF_BUFFER_FORMAT_SHORT2;
-    of_check(api.nvOFCreateGPUBufferCuda(handle, &output_desc,
-                                        NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR, &output),
-             "Allocate optical-flow output");
+    for (int direction = 0; direction < (config.backward ? 2 : 1); ++direction) {
+      of_check(api.nvOFCreateGPUBufferCuda(handle, &output_desc,
+                                          NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR, &output[direction]),
+               "Allocate optical-flow output");
+      cuda_check(cudaMalloc(&fields[direction], sizeof(FlowVector) * grid_width * grid_height),
+                 "Allocate flow field");
+    }
+    cuda_check(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming), "Create flow event");
+    cuda_check(cudaEventCreate(&begin), "Create flow timer");
+    cuda_check(cudaEventCreate(&end), "Create flow timer");
+  }
+
+  // input(x) ~ reference(x + flow): with input = previous and reference =
+  // current this is forward flow (verified by slam-native-optical-flow-test).
+  void execute(int input_slot, int reference_slot, int direction) {
+    NV_OF_EXECUTE_INPUT_PARAMS in{};
+    in.inputFrame = input[input_slot];
+    in.referenceFrame = input[reference_slot];
+    NV_OF_EXECUTE_OUTPUT_PARAMS out{};
+    out.outputBuffer = output[direction];
+    of_check(api.nvOFExecute(handle, &in, &out), "Compute NVIDIA optical flow");
+    NV_OF_CUDA_BUFFER_STRIDE_INFO stride{};
+    of_check(api.nvOFGPUBufferGetStrideInfo(output[direction], &stride),
+             "Query optical-flow output stride");
+    const auto source = reinterpret_cast<const NV_OF_FLOW_VECTOR*>(
+        api.nvOFGPUBufferGetCUdeviceptr(output[direction]));
+    if (!source || stride.numPlanes < 1) throw std::runtime_error("Invalid optical-flow output buffer");
+    const dim3 block(32, 8);
+    const dim3 grid((grid_width + 31) / 32, (grid_height + 7) / 8);
+    fixed_to_pixels<<<grid, block, 0, stream>>>(source, stride.strideInfo[0].strideXInBytes,
+                                                fields[direction], grid_width, grid_height);
+    cuda_check(cudaGetLastError(), "Convert optical-flow vectors");
   }
 
   void copy_frame(const GpuFrame& frame, int slot) {
@@ -129,6 +176,10 @@ struct OpticalFlow::State {
       throw std::runtime_error("Invalid optical-flow input buffer");
     }
     const std::size_t pitch = stride.strideInfo[0].strideXInBytes;
+    if (frame.ready_event) {
+      cuda_check(cudaStreamWaitEvent(stream, static_cast<cudaEvent_t>(frame.ready_event), 0),
+                 "Wait for decoded frame");
+    }
     if (frame.format == PixelFormat::nv12) {
       cuda_check(cudaMemcpy2DAsync(destination, pitch,
                   reinterpret_cast<const void*>(frame.luma), frame.luma_pitch,
@@ -142,11 +193,13 @@ struct OpticalFlow::State {
           destination, pitch, width, height);
       cuda_check(cudaGetLastError(), "Convert P010 luma for optical flow");
     }
-    cuda_check(cudaStreamSynchronize(stream), "Wait for optical-flow input copy");
+    // No host wait: nvOFExecute is ordered on the same CUDA stream.
   }
 };
 
-OpticalFlow::OpticalFlow() : state_(std::make_unique<State>()) {}
+OpticalFlow::OpticalFlow(OpticalFlowConfig config) : state_(std::make_unique<State>()) {
+  state_->config = config;
+}
 OpticalFlow::~OpticalFlow() = default;
 
 void OpticalFlow::remember(const GpuFrame& frame) {
@@ -154,43 +207,55 @@ void OpticalFlow::remember(const GpuFrame& frame) {
   const int slot = state_->previous < 0 ? 0 : 1 - state_->previous;
   state_->copy_frame(frame, slot);
   state_->previous = slot;
+  state_->computed = false;
 }
 
 bool OpticalFlow::has_reference() const { return state_->previous >= 0; }
 
-FlowField OpticalFlow::compute(const GpuFrame& frame) {
+DeviceFlowField OpticalFlow::compute(const GpuFrame& frame) {
   if (!has_reference()) throw std::runtime_error("Optical flow needs a previous frame");
   state_->initialize(frame.width, frame.height);
   const int current = 1 - state_->previous;
+  cuda_check(cudaEventRecord(state_->begin, state_->stream), "Start flow timer");
   state_->copy_frame(frame, current);
-  NV_OF_EXECUTE_INPUT_PARAMS input{};
-  input.inputFrame = state_->input[state_->previous];
-  input.referenceFrame = state_->input[current];
-  NV_OF_EXECUTE_OUTPUT_PARAMS output{};
-  output.outputBuffer = state_->output;
-  of_check(state_->api.nvOFExecute(state_->handle, &input, &output),
-           "Compute NVIDIA optical flow");
-  NV_OF_CUDA_BUFFER_STRIDE_INFO stride{};
-  of_check(state_->api.nvOFGPUBufferGetStrideInfo(state_->output, &stride),
-           "Query optical-flow output stride");
-  const auto source = reinterpret_cast<const void*>(
-      state_->api.nvOFGPUBufferGetCUdeviceptr(state_->output));
-  if (!source || stride.numPlanes < 1) throw std::runtime_error("Invalid optical-flow output buffer");
-  std::vector<NV_OF_FLOW_VECTOR> raw(
-      static_cast<std::size_t>(state_->grid_width) * state_->grid_height);
-  cuda_check(cudaMemcpy2DAsync(raw.data(), state_->grid_width * sizeof(NV_OF_FLOW_VECTOR),
-              source, stride.strideInfo[0].strideXInBytes,
-              state_->grid_width * sizeof(NV_OF_FLOW_VECTOR), state_->grid_height,
-              cudaMemcpyDeviceToHost, state_->stream), "Read optical-flow vectors");
-  cuda_check(cudaStreamSynchronize(state_->stream), "Wait for optical-flow vectors");
+  state_->execute(state_->previous, current, 0);
+  if (state_->config.backward) state_->execute(current, state_->previous, 1);
+  cuda_check(cudaEventRecord(state_->end, state_->stream), "Stop flow timer");
+  cuda_check(cudaEventRecord(state_->ready, state_->stream), "Record flow completion");
+  state_->previous = current;
+  state_->computed = true;
+  DeviceFlowField field;
+  field.forward = state_->fields[0];
+  field.backward = state_->config.backward ? state_->fields[1] : nullptr;
+  field.width = state_->grid_width;
+  field.height = state_->grid_height;
+  field.ready_event = state_->ready;
+  return field;
+}
+
+double OpticalFlow::gpu_ms() const {
+  if (!state_->computed) return 0;
+  cuda_check(cudaEventSynchronize(state_->end), "Wait for flow timer");
+  float elapsed = 0;
+  cuda_check(cudaEventElapsedTime(&elapsed, state_->begin, state_->end), "Read flow timer");
+  return elapsed;
+}
+
+FlowField OpticalFlow::download() const {
+  if (!state_->computed) throw std::runtime_error("No optical-flow field has been computed");
   FlowField field;
   field.width = state_->grid_width;
   field.height = state_->grid_height;
-  field.vectors.reserve(raw.size());
-  for (const auto vector : raw) {
-    field.vectors.push_back({vector.flowx / 32.0F, vector.flowy / 32.0F});
+  const std::size_t count = static_cast<std::size_t>(field.width) * field.height;
+  field.vectors.resize(count);
+  cuda_check(cudaMemcpyAsync(field.vectors.data(), state_->fields[0], count * sizeof(FlowVector),
+                             cudaMemcpyDeviceToHost, state_->stream), "Download forward flow");
+  if (state_->config.backward) {
+    field.backward.resize(count);
+    cuda_check(cudaMemcpyAsync(field.backward.data(), state_->fields[1], count * sizeof(FlowVector),
+                               cudaMemcpyDeviceToHost, state_->stream), "Download backward flow");
   }
-  state_->previous = current;
+  cuda_check(cudaStreamSynchronize(state_->stream), "Wait for flow download");
   return field;
 }
 

@@ -30,14 +30,19 @@ void usage() {
          "  --video PATH              source video\n"
          "  --engine PATH             TensorRT SuperPoint engine\n"
          "  --db PATH                 feature database\n"
-         "  --tracker TYPE            superpoint (default) or optical-flow\n"
          "  --input-width N           TensorRT input width (default: 1024)\n"
          "  --input-height N          TensorRT input height (default: 576)\n"
          "  --max-keypoints N         fixed engine output count (default: 2048)\n"
          "  --threshold F             minimum retained score (default: 0.0005)\n"
-         "  --track-similarity F      minimum cosine similarity (default: 0.82)\n"
-         "  --track-margin F          best-versus-second margin (default: 0.02)\n"
-         "  --track-inactive N        frames before a landmark expires (default: 15)\n"
+         "  --track-radius F          SuperPoint association radius in pixels (default: 6)\n"
+         "  --max-tracks N            live-track cap; continuations first (default: 1000)\n"
+         "  --max-coast N             frames a missed track is carried by flow (default: 5; 0 = die)\n"
+         "  --min-similarity F        descriptor cosine gate for association (default: 0.7)\n"
+         "  --assignment-rounds N     propose/accept rounds; 1 = no second choice (default: 4)\n"
+         "  --flow-backward F         compute backward flow; forward-backward limit in px\n"
+         "                            for coasting (default: off; costs one more NVOF pass)\n"
+         "  --hfov DEG                camera horizontal field of view for pose (default: 60)\n"
+         "  --intrinsics FX FY CX CY  camera intrinsics in source-video pixels (overrides --hfov)\n"
          "  --descriptor-storage TYPE f16 (default) or f32\n";
 }
 
@@ -64,11 +69,6 @@ int main(int argc, char** argv) {
       } else if (option == "--db") {
         config.database = value();
         has_database = true;
-      } else if (option == "--tracker") {
-        const std::string_view method = value();
-        if (method == "superpoint") config.tracking_method = slam_native::TrackingMethod::superpoint;
-        else if (method == "optical-flow") config.tracking_method = slam_native::TrackingMethod::optical_flow;
-        else throw std::invalid_argument("--tracker must be superpoint or optical-flow");
       } else if (option == "--input-width") {
         config.superpoint.input_width = integer(value(), "--input-width");
       } else if (option == "--input-height") {
@@ -77,13 +77,32 @@ int main(int argc, char** argv) {
         config.superpoint.max_keypoints = integer(value(), "--max-keypoints");
       } else if (option == "--threshold") {
         config.superpoint.detection_threshold = std::stof(value());
-      } else if (option == "--track-similarity") {
-        config.tracker.min_similarity = std::stof(value());
-      } else if (option == "--track-margin") {
-        config.tracker.min_margin = std::stof(value());
-      } else if (option == "--track-inactive") {
-        config.tracker.max_inactive_frames =
-            static_cast<std::uint32_t>(integer(value(), "--track-inactive"));
+      } else if (option == "--track-radius") {
+        config.flow_tracker.association_radius = std::stof(value());
+      } else if (option == "--max-tracks") {
+        config.flow_tracker.max_tracks = integer(value(), "--max-tracks");
+      } else if (option == "--max-coast") {
+        const std::string text = value();
+        std::size_t used = 0;
+        const int frames = std::stoi(text, &used);
+        if (used != text.size() || frames < 0) throw std::invalid_argument("Invalid value for --max-coast");
+        config.flow_tracker.max_coast_frames = frames;
+      } else if (option == "--min-similarity") {
+        config.flow_tracker.min_descriptor_similarity = std::stof(value());
+      } else if (option == "--assignment-rounds") {
+        config.flow_tracker.assignment_rounds = integer(value(), "--assignment-rounds");
+      } else if (option == "--flow-backward") {
+        config.optical_flow.backward = true;
+        config.flow_tracker.forward_backward_threshold = std::stof(value());
+      } else if (option == "--hfov") {
+        config.odometry.horizontal_fov_degrees = std::stod(value());
+      } else if (option == "--intrinsics") {
+        slam_native::CameraIntrinsics k;
+        k.fx = std::stod(value());
+        k.fy = std::stod(value());
+        k.cx = std::stod(value());
+        k.cy = std::stod(value());
+        config.odometry.intrinsics = k;
       } else if (option == "--descriptor-storage") {
         const std::string_view encoding = value();
         if (encoding == "f16") {
@@ -100,8 +119,9 @@ int main(int argc, char** argv) {
         throw std::invalid_argument("Unknown option: " + std::string(option));
       }
     }
-    config.start_immediately = has_video && has_database &&
-        (config.tracking_method == slam_native::TrackingMethod::optical_flow || has_engine);
+    config.flow_tracker.validate();
+    config.odometry.validate();
+    config.start_immediately = has_video && has_database && has_engine;
     return slam_native::run_app(config);
   } catch (const std::exception& error) {
     std::cerr << "slam-native-workbench: " << error.what() << '\n';

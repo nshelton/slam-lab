@@ -29,7 +29,7 @@ intrinsics. SQLite/NPZ/JSON files connect the stages; Rerun is a viewer/export a
 
 | Document | Purpose |
 | --- | --- |
-| [SESSION_HANDOFF.md](SESSION_HANDOFF.md) | Session state, completed results, decisions and next tasks |
+| [archived reconstruction handoff](archive/SESSION_HANDOFF-20260920.md) | Session state, completed results, decisions and next tasks |
 | [README.md](README.md) | Installation, input processing, feature caches and overview |
 | [MATCHING.md](MATCHING.md) | Cosine/LightGlue matching, CUDA, resume and pair inspection |
 | [SOLVER.md](SOLVER.md) | Implemented geometry/track/solver pipeline and Osaka experiment |

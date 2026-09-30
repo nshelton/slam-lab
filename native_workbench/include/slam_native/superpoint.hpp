@@ -18,6 +18,8 @@ class SuperPoint {
  public:
   virtual ~SuperPoint() = default;
   virtual FrameFeatures infer(const GpuFrame& frame) = 0;
+  // GPU copy of the last infer() result (same order as its keypoints).
+  [[nodiscard]] virtual DeviceDetections device_detections() const = 0;
 };
 
 std::unique_ptr<SuperPoint> make_tensorrt_superpoint(

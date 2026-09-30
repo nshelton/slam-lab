@@ -16,15 +16,50 @@ target_include_directories(slam-native-store PUBLIC include)
 target_link_libraries(slam-native-store PUBLIC SQLite3::SQLite3)
 target_compile_options(slam-native-store PRIVATE -Wall -Wextra -Wpedantic)
 
+# Visual odometry (CPU, Eigen). Eigen is header-only and pinned like ImGui;
+# SOURCE_SUBDIR points at a missing directory so only the headers are fetched.
+include(FetchContent)
+FetchContent_Declare(eigen
+  GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
+  GIT_TAG 3.4.0
+  GIT_SHALLOW TRUE
+  SOURCE_SUBDIR headers-only
+)
+FetchContent_MakeAvailable(eigen)
+add_library(slam-native-vo STATIC
+  src/visual_odometry.cpp
+  src/vo_geometry.cpp
+  src/track_io.cpp
+)
+target_include_directories(slam-native-vo PUBLIC include PRIVATE src)
+target_include_directories(slam-native-vo SYSTEM PRIVATE ${eigen_SOURCE_DIR})
+target_compile_options(slam-native-vo PRIVATE -Wall -Wextra -Wpedantic)
+# Eigen at -O0 is ~20x slower; keep the solver usable in Debug builds.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  target_compile_options(slam-native-vo PRIVATE -O2)
+endif()
+add_executable(slam-native-vo-tracks src/vo_tracks_main.cpp)
+target_link_libraries(slam-native-vo-tracks PRIVATE slam-native-vo)
+target_compile_options(slam-native-vo-tracks PRIVATE -Wall -Wextra -Wpedantic)
+
 add_library(slam-native-recents STATIC src/recent_sessions.cpp)
 target_include_directories(slam-native-recents PUBLIC include)
 target_compile_options(slam-native-recents PRIVATE -Wall -Wextra -Wpedantic)
 
 if(BUILD_TESTING)
-  add_executable(slam-native-flow-tracker-test tests/test_flow_tracker.cpp)
-  target_link_libraries(slam-native-flow-tracker-test PRIVATE slam-native-store)
-  target_compile_options(slam-native-flow-tracker-test PRIVATE -Wall -Wextra -Wpedantic)
-  add_test(NAME native_flow_tracker COMMAND slam-native-flow-tracker-test)
+  add_executable(slam-native-feature-store-test tests/test_feature_store.cpp)
+  target_link_libraries(slam-native-feature-store-test PRIVATE slam-native-store)
+  target_compile_options(slam-native-feature-store-test PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME native_feature_store COMMAND slam-native-feature-store-test)
+  add_executable(slam-native-vo-test tests/test_visual_odometry.cpp)
+  target_link_libraries(slam-native-vo-test PRIVATE slam-native-vo)
+  target_include_directories(slam-native-vo-test PRIVATE src)
+  target_include_directories(slam-native-vo-test SYSTEM PRIVATE ${eigen_SOURCE_DIR})
+  target_compile_options(slam-native-vo-test PRIVATE -Wall -Wextra -Wpedantic)
+  if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_compile_options(slam-native-vo-test PRIVATE -O2)
+  endif()
+  add_test(NAME native_visual_odometry COMMAND slam-native-vo-test)
   add_executable(slam-native-recents-test tests/test_recent_sessions.cpp)
   target_link_libraries(slam-native-recents-test PRIVATE slam-native-recents)
   target_compile_options(slam-native-recents-test PRIVATE -Wall -Wextra -Wpedantic)
@@ -46,7 +81,6 @@ if(SLAM_NATIVE_BUILD_APP)
     set(CMAKE_CUDA_ARCHITECTURES native)
   endif()
 
-  include(FetchContent)
   find_package(CUDAToolkit REQUIRED)
   find_package(OpenGL REQUIRED)
   find_package(PkgConfig REQUIRED)
@@ -83,7 +117,9 @@ if(SLAM_NATIVE_BUILD_APP)
     src/tensorrt_superpoint.cu
     src/online_tracker.cu
     src/optical_flow.cu
+    src/flow_association.cu
     src/cuda_frame_presenter.cu
+    src/trajectory_view.cpp
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
@@ -103,6 +139,7 @@ if(SLAM_NATIVE_BUILD_APP)
 
   target_link_libraries(slam-native-workbench PRIVATE
     slam-native-store
+    slam-native-vo
     slam-native-recents
     CUDA::cudart
     CUDA::cublas
@@ -122,6 +159,58 @@ if(SLAM_NATIVE_BUILD_APP)
   )
 
   if(BUILD_TESTING)
+    # Optional desktop/GPU transport integration test, using the real Session.
+    get_target_property(transport_sources slam-native-workbench SOURCES)
+    list(REMOVE_ITEM transport_sources src/main.cpp src/app.cpp)
+    add_executable(slam-native-transport-test tests/test_transport.cpp ${transport_sources})
+    get_target_property(transport_includes slam-native-workbench INCLUDE_DIRECTORIES)
+    get_target_property(transport_libraries slam-native-workbench LINK_LIBRARIES)
+    target_include_directories(slam-native-transport-test PRIVATE ${transport_includes})
+    target_link_libraries(slam-native-transport-test PRIVATE ${transport_libraries})
+    # GPU tests (the app build already requires a CUDA device).
+    add_executable(slam-native-snapshot tests/snapshot_app.cpp ${transport_sources})
+    target_include_directories(slam-native-snapshot PRIVATE ${transport_includes})
+    target_link_libraries(slam-native-snapshot PRIVATE ${transport_libraries})
+    add_executable(slam-native-gpu-tracker-test tests/test_flow_tracker.cpp src/flow_association.cu)
+    target_link_libraries(slam-native-gpu-tracker-test PRIVATE slam-native-store CUDA::cudart)
+    add_test(NAME native_gpu_flow_tracker COMMAND slam-native-gpu-tracker-test)
+    add_executable(slam-native-display-test
+      tests/test_display.cpp
+      src/ffmpeg_cuda_decoder.cpp
+      src/cuda_frame_presenter.cu
+    )
+    target_include_directories(slam-native-display-test PRIVATE include)
+    target_link_libraries(slam-native-display-test PRIVATE PkgConfig::FFMPEG
+      CUDA::cudart CUDA::cuda_driver OpenGL::GL glfw)
+    add_executable(slam-native-hybrid-test
+      tests/test_hybrid_pipeline.cpp
+      src/ffmpeg_cuda_decoder.cpp
+      src/tensorrt_superpoint.cu
+      src/optical_flow.cu
+      src/flow_association.cu
+    )
+    target_include_directories(slam-native-hybrid-test PRIVATE include third_party/nvof ${TENSORRT_INCLUDE_DIR})
+    target_link_libraries(slam-native-hybrid-test PRIVATE slam-native-store PkgConfig::FFMPEG
+      CUDA::cudart CUDA::cuda_driver ${TENSORRT_LIBRARY} ${CMAKE_DL_LIBS})
+    add_executable(slam-native-tracking-bench
+      tests/bench_tracking.cpp
+      src/ffmpeg_cuda_decoder.cpp
+      src/tensorrt_superpoint.cu
+      src/optical_flow.cu
+      src/flow_association.cu
+    )
+    target_include_directories(slam-native-tracking-bench PRIVATE include third_party/nvof ${TENSORRT_INCLUDE_DIR})
+    target_link_libraries(slam-native-tracking-bench PRIVATE slam-native-store slam-native-vo PkgConfig::FFMPEG
+      CUDA::cudart CUDA::cuda_driver ${TENSORRT_LIBRARY} ${CMAKE_DL_LIBS})
+    add_executable(slam-native-optical-flow-test
+      tests/test_optical_flow.cpp
+      src/ffmpeg_cuda_decoder.cpp
+      src/optical_flow.cu
+    )
+    target_include_directories(slam-native-optical-flow-test PRIVATE include third_party/nvof)
+    target_link_libraries(slam-native-optical-flow-test PRIVATE slam-native-store PkgConfig::FFMPEG
+      CUDA::cudart CUDA::cuda_driver ${CMAKE_DL_LIBS})
+    add_test(NAME native_optical_flow_synthetic COMMAND slam-native-optical-flow-test)
     add_executable(slam-native-video-seek-test
       tests/test_video_seek.cpp
       src/ffmpeg_cuda_decoder.cpp

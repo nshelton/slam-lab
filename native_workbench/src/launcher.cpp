@@ -93,7 +93,7 @@ DatabaseStats inspect_database(const fs::path& path, bool inspect_rows) {
   sqlite3_busy_timeout(db, 100);
   stats.schema_version = sqlite_string(
       db, "SELECT value FROM metadata WHERE key='schema_version'");
-  if (stats.schema_version == "2") {
+  if (stats.schema_version == "3") {
     stats.source_video = sqlite_string(
         db, "SELECT value FROM metadata WHERE key='source_video'");
     stats.engine_path = sqlite_string(
@@ -124,7 +124,7 @@ std::string video_database_name(const fs::path& video) {
     if (!std::isalnum(static_cast<unsigned char>(character)) &&
         character != '-' && character != '_') character = '-';
   }
-  return "native-" + stem + "-tracks";
+  return "native-" + stem + "-superpoint-cache";
 }
 
 bool is_expected_file(const fs::path& path, int target) {
@@ -169,7 +169,7 @@ std::string format_bytes(std::uintmax_t bytes) {
 }
 
 Launcher::Launcher(AppConfig initial, fs::path repository_root)
-    : initial_(std::move(initial)), tracking_method_(initial_.tracking_method),
+    : initial_(std::move(initial)),
       recents_(RecentSessions::default_storage_path()),
       repository_root_(std::move(repository_root)),
       video_(initial_.video.string()), engine_(initial_.engine.string()),
@@ -182,7 +182,7 @@ void Launcher::set_error(std::string error) { error_ = std::move(error); }
 void Launcher::record_recent(const AppConfig& config) {
   try {
     recents_.record({config.video,
-                     config.tracking_method == TrackingMethod::optical_flow ? fs::path{} : config.engine,
+                     config.engine,
                      config.database});
   } catch (const std::exception& error) {
     error_ = std::string("Could not save recent videos: ") + error.what();
@@ -192,8 +192,7 @@ void Launcher::record_recent(const AppConfig& config) {
 void Launcher::set_video(std::string value) {
   video_ = std::move(value);
   if (!database_custom_ && !video_.empty()) {
-    const std::string name = video_database_name(expand_home(video_)) +
-        (tracking_method_ == TrackingMethod::optical_flow ? "-flow" : "");
+    const std::string name = video_database_name(expand_home(video_));
     database_ = (repository_root_ / "recordings" / name / "features.sqlite3").string();
   }
 }
@@ -334,23 +333,9 @@ bool Launcher::draw(AppConfig& selected, DatabaseSummary& database_summary) {
   ImGui::SetNextWindowPos({30, 30}, ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowSize({900, 590}, ImGuiCond_FirstUseEver);
   ImGui::Begin("Open SLAM session");
-  ImGui::TextWrapped("Choose a source video and a feature database. An existing database resumes from its last saved frame.");
+  ImGui::TextWrapped("SuperPoint detections are cached. Tracks are rebuilt in memory on each run using optical flow.");
   ImGui::Separator();
-  const char* method_label = tracking_method_ == TrackingMethod::optical_flow ?
-      "NVIDIA optical flow" : "SuperPoint descriptors";
-  ImGui::TextUnformatted("Tracking method");
-  ImGui::SetNextItemWidth(-1);
-  if (ImGui::BeginCombo("##tracking-method", method_label)) {
-    if (ImGui::Selectable("SuperPoint descriptors", tracking_method_ == TrackingMethod::superpoint)) {
-      tracking_method_ = TrackingMethod::superpoint;
-      set_video(video_);
-    }
-    if (ImGui::Selectable("NVIDIA optical flow", tracking_method_ == TrackingMethod::optical_flow)) {
-      tracking_method_ = TrackingMethod::optical_flow;
-      set_video(video_);
-    }
-    ImGui::EndCombo();
-  }
+  ImGui::TextUnformatted("Tracking: SuperPoint + NVIDIA optical flow");
   ImGui::TextUnformatted("Recent videos");
   ImGui::SetNextItemWidth(-1);
   ImGui::BeginDisabled(recents_.entries().empty());
@@ -360,11 +345,11 @@ bool Launcher::draw(AppConfig& selected, DatabaseSummary& database_summary) {
                                 recent.video.parent_path().string();
       if (ImGui::Selectable(label.c_str())) {
         video_ = recent.video.string();
-        engine_ = recent.engine.string();
-        tracking_method_ = recent.engine.empty() ? TrackingMethod::optical_flow :
-                                                   TrackingMethod::superpoint;
-        database_ = recent.database.string();
-        database_custom_ = true;
+        if (!recent.engine.empty()) engine_ = recent.engine.string();
+        const auto& recent_stats = database_summary.get(recent.database);
+        database_custom_ = recent_stats.schema_version == "3";
+        if (database_custom_) database_ = recent.database.string();
+        else set_video(video_);
         error_.clear();
       }
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", recent.video.c_str());
@@ -379,16 +364,11 @@ bool Launcher::draw(AppConfig& selected, DatabaseSummary& database_summary) {
   ImGui::SameLine();
   if (ImGui::Button("Browse##video")) open_browser(Target::video);
   ImGui::TextUnformatted("TensorRT engine");
-  ImGui::BeginDisabled(tracking_method_ == TrackingMethod::optical_flow);
   ImGui::SetNextItemWidth(-95);
   ImGui::InputText("##engine", &engine_);
   ImGui::SameLine();
   if (ImGui::Button("Browse##engine")) open_browser(Target::engine);
-  ImGui::EndDisabled();
-  if (tracking_method_ == TrackingMethod::optical_flow) {
-    ImGui::TextDisabled("Optical flow uses decoded video frames; no engine is needed.");
-  }
-  ImGui::TextUnformatted("Feature database");
+  ImGui::TextUnformatted("SuperPoint cache");
   ImGui::SetNextItemWidth(-95);
   if (ImGui::InputText("##database", &database_)) database_custom_ = true;
   ImGui::SameLine();
@@ -401,14 +381,12 @@ bool Launcher::draw(AppConfig& selected, DatabaseSummary& database_summary) {
   const auto& stats = database_summary.get(expand_home(database_));
   if (!stats.exists) {
     ImGui::Text("Database: new (0 B; created when you start)");
-    ImGui::Text("Rows: 0 frames, 0 landmarks");
+    ImGui::Text("Cached frames: 0");
   } else {
     ImGui::Text("Database: %s", format_bytes(stats.main_bytes + stats.wal_bytes).c_str());
     ImGui::Text("Main file: %s | WAL: %s", format_bytes(stats.main_bytes).c_str(),
                 format_bytes(stats.wal_bytes).c_str());
-    ImGui::Text("Rows: %llu frames, %llu landmarks",
-                static_cast<unsigned long long>(stats.frame_rows),
-                static_cast<unsigned long long>(stats.landmark_rows));
+    ImGui::Text("Cached frames: %llu", static_cast<unsigned long long>(stats.frame_rows));
     ImGui::Text("Saved feature observations: %llu",
                 static_cast<unsigned long long>(stats.observations));
     if (!stats.source_video.empty()) {
@@ -433,8 +411,7 @@ bool Launcher::draw(AppConfig& selected, DatabaseSummary& database_summary) {
                      !source_error && !selected_error;
   }
   bool engine_matches = true;
-  if (tracking_method_ == TrackingMethod::superpoint &&
-      !stats.engine_path.empty() && !engine_.empty()) {
+  if (!stats.engine_path.empty() && !engine_.empty()) {
     engine_matches = fs::weakly_canonical(stats.engine_path, stored_engine_error) ==
                      fs::weakly_canonical(expand_home(engine_), chosen_engine_error) &&
                      !stored_engine_error && !chosen_engine_error;
@@ -447,28 +424,18 @@ bool Launcher::draw(AppConfig& selected, DatabaseSummary& database_summary) {
     ImGui::TextColored({1, 0.5F, 0.4F, 1},
                        "This database was created with a different engine.");
   }
-  const bool method_matches = stats.tracker_algorithm.empty() ||
-      stats.tracker_algorithm == (tracking_method_ == TrackingMethod::optical_flow ?
-          "nvof-grid-tracker-v1" : "online-spherical-mean-greedy-v1");
-  if (!method_matches) {
-    ImGui::TextColored({1, 0.5F, 0.4F, 1},
-                       "This database belongs to a different tracking method.");
-  }
   const bool valid = fs::is_regular_file(expand_home(video_), video_error) &&
-                     (tracking_method_ == TrackingMethod::optical_flow ||
-                      fs::is_regular_file(expand_home(engine_), engine_error)) &&
+                     fs::is_regular_file(expand_home(engine_), engine_error) &&
                      !database_.empty() && stats.error.empty() &&
-                     source_matches && engine_matches && method_matches;
+                     source_matches && engine_matches;
   ImGui::BeginDisabled(!valid);
-  const bool start = ImGui::Button(stats.exists ? "Resume session" : "Start session", {160, 34});
+  const bool start = ImGui::Button(stats.exists ? "Replay with cache" : "Start session", {160, 34});
   ImGui::EndDisabled();
   if (!valid) ImGui::TextDisabled("Select an existing video and engine, and a database path.");
   if (start) {
     selected = initial_;
-    selected.tracking_method = tracking_method_;
     selected.video = fs::absolute(expand_home(video_));
-    selected.engine = tracking_method_ == TrackingMethod::optical_flow ? fs::path{} :
-        fs::absolute(expand_home(engine_));
+    selected.engine = fs::absolute(expand_home(engine_));
     selected.database = fs::absolute(expand_home(database_));
     error_.clear();
   }
