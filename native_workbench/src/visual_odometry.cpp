@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <unordered_map>
@@ -110,7 +112,8 @@ void VisualOdometryConfig::validate() const {
       keyframe_min_interval >= 1 && keyframe_max_interval >= keyframe_min_interval && keyframe_track_ratio > 0 &&
       keyframe_emergency_ratio >= 0 && min_triangulation_parallax_degrees >= 0 && window_keyframes >= 2 &&
       bundle_iterations >= 0 && local_map_keyframes >= window_keyframes && reassociation_radius_px >= 0 &&
-      min_descriptor_similarity <= 1 && (!intrinsics || (intrinsics->fx > 0 && intrinsics->fy > 0));
+      min_descriptor_similarity <= 1 && coast_max_frames >= 0 && relocalization_min_radius_px > 0 &&
+      relocalization_radius_px >= relocalization_min_radius_px && relocalization_min_inliers >= 6 && (!intrinsics || (intrinsics->fx > 0 && intrinsics->fy > 0));
   if (!ok) throw std::invalid_argument("Invalid visual odometry settings");
 }
 
@@ -118,6 +121,7 @@ const char* to_string(OdometryState state) {
   switch (state) {
     case OdometryState::initializing: return "initializing";
     case OdometryState::tracking: return "tracking";
+    case OdometryState::coasting: return "coasting";
     case OdometryState::lost: return "lost";
   }
   return "unknown";
@@ -152,6 +156,8 @@ struct VisualOdometry::Impl {
     int keyframe{};   // reference keyframe id
     SE3 relative;     // frame pose = relative * keyframe pose
     bool is_keyframe{};
+    bool predicted{};
+    double confidence{};
   };
 
   VisualOdometryConfig config;
@@ -176,6 +182,9 @@ struct VisualOdometry::Impl {
   int reference_age{};
   std::vector<FrameRecord> frames;
   SE3 last_pose, previous_pose;
+  MotionModel motion;
+  int coasted{};    // frames since the last tracked pose
+  SE3 coast_origin; // that pose
   int frames_since_keyframe{};
   int keyframe_landmarks{};
   OdometryFrameResult last;
@@ -262,6 +271,45 @@ struct VisualOdometry::Impl {
     segment_keyframes.clear();
     reference.reset();
     reference_age = 0;
+    coasted = 0;
+  }
+
+  // RMS per-axis pixel uncertainty of the projections of `points` (world)
+  // under a pose with error covariance C, and the confidence it implies.
+  double image_sigma(const SE3& pose, const Mat6& C, const std::vector<Vec3>& points) const {
+    double sum = 0;
+    int count = 0;
+    for (const auto& X : points) {
+      const Vec3 xc = pose * X;
+      if (xc.z() <= 1e-6) continue;
+      const auto J = pose_jacobian(K, xc);
+      sum += (J * C * J.transpose()).trace();
+      ++count;
+    }
+    return count ? std::sqrt(sum / (2 * count)) : std::numeric_limits<double>::infinity();
+  }
+  double confidence_of(double sigma) const {
+    const double t = config.reprojection_threshold_px;
+    return sigma > 0 ? 1 - std::exp(-t * t / (2 * sigma * sigma)) : 1;
+  }
+  void report_uncertainty(double sigma, OdometryFrameResult& result) const {
+    Eigen::Map<Eigen::Matrix<double, 6, 6, Eigen::RowMajor>>(result.pose_covariance.data()) = motion.pose;
+    result.pose_sigma_px = sigma;
+    result.confidence = confidence_of(sigma);
+  }
+  // Local landmarks, in id order, that are in front of the camera and in the image.
+  std::vector<Vec3> visible_landmarks(const SE3& pose) const {
+    std::vector<std::pair<std::uint64_t, Vec3>> found;
+    for (const auto& [id, landmark] : landmarks) {
+      const Vec3 xc = pose * landmark.X;
+      if (xc.z() <= 1e-6) continue;
+      const Vec2 p = K.project(xc);
+      if (p.x() >= 0 && p.y() >= 0 && p.x() <= width - 1 && p.y() <= height - 1) found.emplace_back(id, landmark.X);
+    }
+    std::sort(found.begin(), found.end(), [](const auto& l, const auto& r) { return l.first < r.first; });
+    std::vector<Vec3> points;
+    for (const auto& [id, X] : found) points.push_back(X);
+    return points;
   }
 
   OdometryFrameResult process(const TrackedFrame& input) {
@@ -294,8 +342,8 @@ struct VisualOdometry::Impl {
     }
     OdometryFrameResult result;
     result.frame_index = frame.frame_index;
-    if (state == OdometryState::tracking) track(frame, result);
-    else initialize(frame, result);
+    if (state == OdometryState::initializing) initialize(frame, result);
+    else track(frame, result);
     result.segment = segment;
     result.map_points = landmarks.size();
     result.keyframes = segment_keyframes.size();
@@ -438,8 +486,21 @@ struct VisualOdometry::Impl {
     }
     const SE3& pose0 = keyframes[k0].pose;
     const SE3& pose1 = keyframes[k1].pose;
-    frames.push_back({reference->frame_index, reference->timestamp_ns, segment, k0, SE3{}, true});
-    frames.push_back({frame.frame_index, frame.timestamp_ns, segment, k1, SE3{}, true});
+    std::vector<std::uint64_t> mapped;
+    for (const auto& [id, landmark] : landmarks) mapped.push_back(landmark.track);
+    std::sort(mapped.begin(), mapped.end());
+    std::vector<PoseObservation> observations;
+    std::vector<Vec3> points;
+    for (auto track : mapped) {
+      observations.push_back({landmarks.at(track_landmark.at(track)).X, current.at(track)});
+      points.push_back(observations.back().X);
+    }
+    motion.reset(pose_covariance(K, observations, pose1, std::vector<char>(observations.size(), 1)),
+                 std::max(reference_age, 1));
+    report_uncertainty(image_sigma(pose1, motion.pose, points), result);
+    // The first keyframe defines the map's frame: its pose is exact.
+    frames.push_back({reference->frame_index, reference->timestamp_ns, segment, k0, SE3{}, true, false, 1.0});
+    frames.push_back({frame.frame_index, frame.timestamp_ns, segment, k1, SE3{}, true, false, result.confidence});
     const SE3 velocity = scale_motion(pose1 * pose0.inverse(), 1.0 / std::max(reference_age, 1));
     last_pose = pose1;
     previous_pose = velocity.inverse() * pose1;
@@ -452,8 +513,7 @@ struct VisualOdometry::Impl {
     result.keyframe = true;
     result.pose = to_pose(pose1);
     result.correspondences = result.inliers = static_cast<int>(landmarks.size());
-    for (const auto& [id, landmark] : landmarks) result.pose_inliers.push_back(landmark.track);
-    std::sort(result.pose_inliers.begin(), result.pose_inliers.end());
+    result.pose_inliers = mapped;
     result.event = "initialized: " + std::to_string(landmarks.size()) + " points, " +
                    std::to_string(median_parallax).substr(0, 4) + " deg parallax";
   }
@@ -468,41 +528,49 @@ struct VisualOdometry::Impl {
     std::vector<PoseObservation> observations;
     for (auto id : ids) observations.push_back({landmarks.at(track_landmark.at(id)).X, current.at(id)});
     result.correspondences = static_cast<int>(observations.size());
-    if (result.correspondences < config.min_tracked_points) return lose(frame, result, "too few tracked landmarks");
     const SE3 velocity = last_pose * previous_pose.inverse();
-    SE3 pose = velocity * last_pose;
+    const SE3 predicted = velocity * last_pose;
+    motion.predict();
+    SE3 pose = predicted;
     std::vector<char> inliers;
-    int count = optimize_pose(K, observations, pose, config.reprojection_threshold_px, inliers);
-    if (count < std::max(config.min_tracked_points, result.correspondences / 2)) {
-      SE3 fallback = last_pose;  // constant position instead of constant velocity
-      std::vector<char> fallback_inliers;
-      const int fallback_count = optimize_pose(K, observations, fallback, config.reprojection_threshold_px,
-                                               fallback_inliers);
-      if (fallback_count > count) {
-        pose = fallback;
-        inliers = std::move(fallback_inliers);
-        count = fallback_count;
+    int count = 0;
+    if (result.correspondences >= config.min_tracked_points) {
+      count = optimize_pose(K, observations, pose, config.reprojection_threshold_px, inliers);
+      if (count < std::max(config.min_tracked_points, result.correspondences / 2)) {
+        SE3 fallback = last_pose;  // constant position instead of constant velocity
+        std::vector<char> fallback_inliers;
+        const int fallback_count = optimize_pose(K, observations, fallback, config.reprojection_threshold_px,
+                                                 fallback_inliers);
+        if (fallback_count > count) {
+          pose = fallback;
+          inliers = std::move(fallback_inliers);
+          count = fallback_count;
+        }
       }
-    }
-    if (count < std::max(config.min_tracked_points, result.correspondences / 2)) {
-      // Sudden motion: neither prediction converges. Re-estimate from scratch
-      // (P3P RANSAC on the same correspondences) before declaring loss.
-      SE3 recovered = pose;
-      std::vector<char> recovered_inliers;
-      const std::uint32_t seed = static_cast<std::uint32_t>(frame.frame_index * 3266489917U);
-      if (ransac_pnp(K, observations, config.recovery_threshold_px, config.ransac_iterations, seed, recovered,
-                     recovered_inliers) > count) {
-        const int recovered_count = optimize_pose(K, observations, recovered, config.reprojection_threshold_px,
-                                                  recovered_inliers);
-        if (recovered_count > count) {
-          pose = recovered;
-          inliers = std::move(recovered_inliers);
-          count = recovered_count;
-          result.event = "pose re-estimated (P3P RANSAC)";
+      if (count < std::max(config.min_tracked_points, result.correspondences / 2)) {
+        // Sudden motion: neither prediction converges. Re-estimate from scratch
+        // (P3P RANSAC on the same correspondences).
+        SE3 recovered = pose;
+        std::vector<char> recovered_inliers;
+        const std::uint32_t seed = static_cast<std::uint32_t>(frame.frame_index * 3266489917U);
+        if (ransac_pnp(K, observations, config.recovery_threshold_px, config.ransac_iterations, seed, recovered,
+                       recovered_inliers) > count) {
+          const int recovered_count = optimize_pose(K, observations, recovered, config.reprojection_threshold_px,
+                                                    recovered_inliers);
+          if (recovered_count > count) {
+            pose = recovered;
+            inliers = std::move(recovered_inliers);
+            count = recovered_count;
+            result.event = "pose re-estimated (P3P RANSAC)";
+          }
         }
       }
     }
-    if (count < config.min_tracked_points) return lose(frame, result, "pose optimization lost the map");
+    if (count < config.min_tracked_points) {
+      const double sigma = image_sigma(predicted, motion.pose, visible_landmarks(predicted));
+      count = relocalize(frame, current, predicted, sigma, ids, observations, pose, inliers, result);
+      if (count < config.min_tracked_points) return coast(frame, predicted, sigma, result);
+    }
     std::vector<double> errors;
     std::vector<std::uint64_t> inlier_ids, outlier_ids;
     for (std::size_t i = 0; i < observations.size(); ++i) {
@@ -516,11 +584,33 @@ struct VisualOdometry::Impl {
       update_descriptor(landmark);
       errors.push_back((K.project(pose * observations[i].X) - observations[i].u).norm());
     }
+    std::sort(inlier_ids.begin(), inlier_ids.end());
+    std::sort(outlier_ids.begin(), outlier_ids.end());
     result.inliers = count;
     result.median_reprojection_px = median(errors);
     result.pose_inliers = inlier_ids;
     result.pose_outliers = outlier_ids;
-    previous_pose = last_pose;
+    motion.correct(pose_difference(pose, predicted), pose_covariance(K, observations, pose, inliers), coasted + 1);
+    std::vector<Vec3> points;
+    for (std::size_t i = 0; i < observations.size(); ++i)
+      if (inliers[i]) points.push_back(observations[i].X);
+    report_uncertainty(image_sigma(pose, motion.pose, points), result);
+    if (coasted > 0) {
+      // Tracking resumes: the coasted frames' poses become the constant-velocity
+      // path between the tracked poses on either side of the gap.
+      const SE3 gap = pose * coast_origin.inverse();
+      for (int i = 1; i <= coasted; ++i) {
+        auto& record = frames[frames.size() - coasted + i - 1];
+        record.relative = scale_motion(gap, double(i) / (coasted + 1)) * coast_origin *
+                          keyframes[record.keyframe].pose.inverse();
+      }
+      previous_pose = scale_motion(gap, 1.0 / (coasted + 1)).inverse() * pose;
+      state = OdometryState::tracking;
+    } else {
+      previous_pose = last_pose;
+    }
+    const bool resumed = coasted > 0 || result.relocalized;
+    coasted = 0;
     last_pose = pose;
     // Before the keyframe step, so a re-found landmark is not triangulated again.
     reassociate(frame, pose, current, std::unordered_set<std::uint64_t>(inlier_ids.begin(), inlier_ids.end()), result);
@@ -529,7 +619,7 @@ struct VisualOdometry::Impl {
     const bool keyframe = (frames_since_keyframe >= config.keyframe_min_interval &&
                            (count < config.keyframe_track_ratio * keyframe_landmarks ||
                             frames_since_keyframe >= config.keyframe_max_interval)) ||
-                          emergency;
+                          emergency || resumed;  // a keyframe ties the re-found map to this frame
     if (keyframe) {
       const int id = add_keyframe(frame.frame_index, pose, current);
       for (auto track_id : inlier_ids) {
@@ -549,25 +639,30 @@ struct VisualOdometry::Impl {
       keyframe_landmarks = 0;
       for (const auto& [landmark_id, landmark] : landmarks)
         for (const auto& o : landmark.observations) keyframe_landmarks += o.keyframe == id;
-      frames.push_back({frame.frame_index, frame.timestamp_ns, segment, id, SE3{}, true});
+      frames.push_back({frame.frame_index, frame.timestamp_ns, segment, id, SE3{}, true, false, result.confidence});
       result.keyframe = true;
     } else {
       const int reference_keyframe = segment_keyframes.back();
       frames.push_back({frame.frame_index, frame.timestamp_ns, segment, reference_keyframe,
-                        pose * keyframes[reference_keyframe].pose.inverse(), false});
+                        pose * keyframes[reference_keyframe].pose.inverse(), false, false, result.confidence});
     }
     result.state = state;
     result.has_pose = true;
     result.pose = to_pose(last_pose);
   }
 
-  // Local landmarks that no track observes in this frame are projected and
-  // matched by descriptor to the frame's tracks that either have no landmark
-  // or whose landmark is a pose inlier (see local_map_keyframes).
-  void reassociate(const TrackedFrame& frame, const SE3& pose, const std::unordered_map<std::uint64_t, Vec2>& current,
-                   const std::unordered_set<std::uint64_t>& inlier_tracks, OdometryFrameResult& result) {
-    const double radius = config.reassociation_radius_px;
-    if (descriptor_dimension == 0 || radius <= 0) return;
+  // Local landmarks that no track observes in this frame, projected with
+  // `pose` and matched by descriptor to the `eligible` tracks within `radius`
+  // of the projection (mutual best, cosine >= min_descriptor_similarity).
+  // Projections up to `margin` outside the image count. Returns (landmark id,
+  // observation index), by landmark id.
+  template <typename Eligible>
+  std::vector<std::pair<std::uint64_t, int>> match_local(const TrackedFrame& frame, const SE3& pose, double radius,
+                                                          double margin,
+                                                          const std::unordered_map<std::uint64_t, Vec2>& current,
+                                                          Eligible eligible) const {
+    std::vector<std::pair<std::uint64_t, int>> matches;
+    if (descriptor_dimension == 0 || radius <= 0) return matches;
     struct Candidate {
       std::uint64_t id;
       Vec2 p;
@@ -578,7 +673,7 @@ struct VisualOdometry::Impl {
       const Vec3 xc = pose * landmark.X;
       if (xc.z() <= 1e-6) continue;
       const Vec2 p = K.project(xc);
-      if (p.x() < 0 || p.y() < 0 || p.x() > width - 1 || p.y() > height - 1) continue;
+      if (p.x() < -margin || p.y() < -margin || p.x() > width - 1 + margin || p.y() > height - 1 + margin) continue;
       candidates.push_back({id, p});
     }
     std::sort(candidates.begin(), candidates.end(), [](const auto& l, const auto& r) { return l.id < r.id; });
@@ -588,7 +683,7 @@ struct VisualOdometry::Impl {
     std::vector<std::vector<int>> grid(static_cast<std::size_t>(cols) * rows);
     for (int i = 0; i < static_cast<int>(frame.observations.size()); ++i) {
       const auto track = frame.observations[i].track_id;
-      if (!descriptors.count(track) || (track_landmark.count(track) && !inlier_tracks.count(track))) continue;
+      if (!descriptors.count(track) || !eligible(track)) continue;
       grid[static_cast<std::size_t>(cell(frame.observations[i].y, rows)) * cols + cell(frame.observations[i].x, cols)]
           .push_back(i);
     }
@@ -615,7 +710,96 @@ struct VisualOdometry::Impl {
       if (best > slot.first) slot = {best, k};
     }
     for (const auto& [k, i] : best_of_candidate)
-      if (best_of_observation[i].second == k) associate(candidates[k].id, frame.observations[i].track_id, frame, result);
+      if (best_of_observation[i].second == k) matches.emplace_back(candidates[k].id, i);
+    return matches;
+  }
+
+  // Re-association at a tracked pose: within reassociation_radius_px, to
+  // tracks that either have no landmark or whose landmark is a pose inlier
+  // (see local_map_keyframes).
+  void reassociate(const TrackedFrame& frame, const SE3& pose, const std::unordered_map<std::uint64_t, Vec2>& current,
+                   const std::unordered_set<std::uint64_t>& inlier_tracks, OdometryFrameResult& result) {
+    const auto matches = match_local(frame, pose, config.reassociation_radius_px, 0, current, [&](std::uint64_t track) {
+      return !track_landmark.count(track) || inlier_tracks.count(track);
+    });
+    for (const auto& [id, i] : matches) associate(id, frame.observations[i].track_id, frame, result);
+  }
+
+  // The live tracks do not give a pose. Search the local map around the
+  // predicted pose, as wide as its uncertainty (`sigma`, pixels), among the
+  // tracks without a landmark; P3P RANSAC over those matches and the live
+  // correspondences. On success the matched tracks take over their landmarks,
+  // the correspondences and `pose` describe the fit, and the inlier count is
+  // returned; otherwise 0, with nothing changed.
+  int relocalize(const TrackedFrame& frame, const std::unordered_map<std::uint64_t, Vec2>& current,
+                 const SE3& predicted, double sigma, std::vector<std::uint64_t>& ids,
+                 std::vector<PoseObservation>& observations, SE3& pose, std::vector<char>& inliers,
+                 OdometryFrameResult& result) {
+    const double radius = std::clamp(3 * sigma, config.relocalization_min_radius_px, config.relocalization_radius_px);
+    // A landmark in view may be predicted outside the image, by as much as the search is wide.
+    const auto matches = match_local(frame, predicted, radius, radius, current,
+                                     [&](std::uint64_t track) { return !track_landmark.count(track); });
+    std::vector<PoseObservation> all = observations;
+    for (const auto& [id, i] : matches)
+      all.push_back({landmarks.at(id).X, Vec2(frame.observations[i].x, frame.observations[i].y)});
+    const int needed = config.relocalization_min_inliers;
+    if (static_cast<int>(all.size()) < needed) return 0;
+    SE3 found = predicted;
+    std::vector<char> fit;
+    const std::uint32_t seed = static_cast<std::uint32_t>(frame.frame_index * 2246822519U);
+    if (ransac_pnp(K, all, config.recovery_threshold_px, config.ransac_iterations, seed, found, fit) < needed) return 0;
+    const int count = optimize_pose(K, all, found, config.reprojection_threshold_px, fit);
+    if (count < needed) return 0;
+    std::vector<double> offsets;  // how far the prediction was, in the image
+    const std::size_t live = observations.size();
+    for (std::size_t m = 0; m < matches.size(); ++m) {
+      if (!fit[live + m]) continue;
+      const auto& [id, i] = matches[m];
+      const Vec3& X = landmarks.at(id).X;
+      offsets.push_back((K.project(predicted * X) - K.project(found * X)).norm());
+      associate(id, frame.observations[i].track_id, frame, result);
+      ids.push_back(frame.observations[i].track_id);
+      observations.push_back(all[live + m]);
+    }
+    inliers.assign(fit.begin(), fit.begin() + static_cast<std::ptrdiff_t>(live));
+    inliers.resize(observations.size(), 1);
+    pose = found;
+    result.correspondences = static_cast<int>(all.size());
+    result.relocalized = true;
+    char text[200];
+    std::snprintf(text, sizeof text,
+                  "relocalized after %d coasted frames: %d inliers of %zu matches within %.0f px; prediction was off by "
+                  "%.1f px (median), sigma %.1f px",
+                  coasted, count, all.size(), radius, median(offsets), sigma);
+    result.event = text;
+    return count;
+  }
+
+  // No pose from the map this frame: report the motion model's prediction
+  // with its uncertainty and keep the local map for relocalize(). The segment
+  // ends once the prediction no longer constrains that search.
+  void coast(const TrackedFrame& frame, const SE3& predicted, double sigma, OdometryFrameResult& result) {
+    if (coasted >= config.coast_max_frames || !(sigma <= config.relocalization_radius_px)) {
+      const std::string why = coasted == 0 ? "tracking lost" :
+          "tracking lost: not relocalized in " + std::to_string(coasted) + " coasted frames";
+      frames.resize(frames.size() - coasted);  // predictions that were never confirmed
+      return lose(frame, result, why);
+    }
+    if (coasted == 0) coast_origin = last_pose;
+    ++coasted;
+    previous_pose = last_pose;
+    last_pose = predicted;
+    state = OdometryState::coasting;
+    report_uncertainty(sigma, result);
+    const int reference_keyframe = segment_keyframes.back();
+    frames.push_back({frame.frame_index, frame.timestamp_ns, segment, reference_keyframe,
+                      predicted * keyframes[reference_keyframe].pose.inverse(), false, true, result.confidence});
+    result.state = state;
+    result.has_pose = true;
+    result.predicted = true;
+    result.pose = to_pose(predicted);
+    result.inliers = 0;
+    result.event = "coasting (" + std::to_string(coasted) + " frames): pose predicted by constant velocity";
   }
 
   // `track` observes landmark `id`. A track that already has a landmark
@@ -655,7 +839,7 @@ struct VisualOdometry::Impl {
 
   // The segment ends: its landmarks are retired and a new segment initializes
   // from this frame.
-  void lose(const TrackedFrame& frame, OdometryFrameResult& result, const char* why) {
+  void lose(const TrackedFrame& frame, OdometryFrameResult& result, const std::string& why) {
     state = OdometryState::initializing;
     result.state = OdometryState::lost;
     result.event = why;
@@ -794,14 +978,14 @@ std::vector<TrajectorySample> VisualOdometry::trajectory(std::size_t first) cons
     const auto& record = frames[i];
     const SE3 pose = record.relative * impl_->keyframes[record.keyframe].pose;
     samples.push_back({record.frame_index, record.timestamp_ns, record.segment, record.is_keyframe,
-                       to_pose(pose)});
+                       to_pose(pose), record.predicted, record.confidence});
   }
   return samples;
 }
 
 std::size_t VisualOdometry::stable_prefix() const {
   const auto& frames = impl_->frames;
-  if (impl_->state != OdometryState::tracking) return frames.size();
+  if (impl_->state == OdometryState::initializing) return frames.size();
   const auto window = impl_->window();
   if (window.empty()) return frames.size();
   // Reference keyframe ids are non-decreasing along the frame records.

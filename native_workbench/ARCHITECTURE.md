@@ -28,9 +28,10 @@ NVDEC frame (native orientation, source px, lens-distorted)
   VisualOdometry (CPU, UI thread; src/visual_odometry.cpp)
     undistort (k1) → init (E/H RANSAC) → per-frame pose (Huber LM from constant velocity
     / constant position; P3P RANSAC recovery) → keyframes (incl. emergency): triangulate,
-    sliding-window BA (8 KF), cull → retire landmarks; loss → new segment
+    sliding-window BA (8 KF), cull → retire landmarks; no pose → coast on the motion
+    model + relocalize in the local map; coasting runs out → new segment
             ▼
-  OdometryFrameResult (pose, inlier/outlier track IDs), trajectory, active + retired map
+  OdometryFrameResult (pose, covariance, confidence, inlier/outlier track IDs), trajectory, active + retired map
             ▼
   TrajectoryView (ImGui 3D + instanced GL map points), video overlay (pose-inlier view), CSV exports
 ```
@@ -88,8 +89,9 @@ Per frame, in `FlowTracker::associate` → kernels in `src/flow_association.cu`:
    `copy_descriptors`: matched/new tracks take the current detection's
    descriptor (half precision); coasting tracks keep the old one.
 
-Death is currently final. A point that reappears after occlusion gets a
-new ID, and in the VO a new landmark, so walls get duplicated in the map.
+Death is final in the tracker: a point that reappears after occlusion gets
+a new ID. The VO re-keys the old landmark to the new track (re-association
+within the local map; relocalization after an occlusion).
 
 ### How a landmark lives and dies (VO)
 
@@ -104,50 +106,84 @@ In `VisualOdometry::Impl` (`src/visual_odometry.cpp`):
   inliers" point view draws them green/red). The pose starts from a
   constant-velocity prediction, then constant position; if neither keeps
   half the correspondences, P3P RANSAC (`vo::p3p`, Grunert;
-  `vo::ransac_pnp`, 4 px) re-estimates it from the same correspondences
-  before the frame is declared lost.
+  `vo::ransac_pnp`, 4 px) re-estimates it from the same correspondences.
+  Without a pose (fewer than 20 inliers) the frame is coasted, see the
+  motion model below.
 - At a keyframe, outlier landmarks are **deleted** (`landmarks.erase`,
   they're usually short-baseline depths and get re-triangulated).
 - `cull()`: observations that fail 2× the reprojection threshold are
   dropped; a landmark with < 2 observations is **deleted**; a landmark whose
   track is gone and which no window keyframe observes is **retired**
   (appended to `retired`, final, never refined again).
-- On loss, and on resolution change, `clear_segment()` retires the
-  segment's landmarks. The next segment starts from the current frame with
-  a new frame and scale.
+- When coasting runs out (`lose()`), and on resolution change,
+  `clear_segment()` retires the segment's landmarks. The next segment starts
+  from the current frame with a new frame and scale.
 - `MapPoint` (public) carries: track ID, position, mean RGB of keyframe
   observations, segment, keyframe count, first/last frame.
   `active_map()`, `retired_map(first)`, `retired_count()`;
   `write_map_csv()` exports both.
 
-### Where to add a camera motion model
+### Camera motion model, pose uncertainty, coasting and relocalization
 
-- **Current model.** `track()` predicts the pose with constant velocity
-  (`velocity * last_pose`, velocity = last × previous⁻¹), falls back to
-  constant position if that yields too few inliers, then runs
-  `optimize_pose()` (Huber LM, 10 iterations × 2 stages); P3P RANSAC is the
-  last resort. There is no covariance, no IMU, and no feedback to the
-  tracker.
-- **Pose covariance.** `optimize_pose()` builds the 6×6 Gauss-Newton
-  Hessian `H = Σ w JᵀJ` internally (`src/vo_geometry.cpp`); its inverse
-  at convergence is the pose covariance (up to the noise scale). Return it
-  to feed a filter.
-- **A filter on SE(3)** (constant-velocity EKF / error-state on the left
-  perturbation used everywhere: `perturb(T, δ) = exp(δ) · T`, δ = (ω, v))
-  would replace the ad-hoc velocity and give an uncertainty for gating.
+Added 2026-10-01 (`track()`, `relocalize()`, `coast()` in
+`src/visual_odometry.cpp`; `pose_covariance()` and `MotionModel` in
+`src/vo_geometry.*`).
+
+- **Pose error convention.** δ = (ω, v) with `T_true = exp(δ) · T`
+  (`perturb`): ω rotates about the camera centre, v moves the camera, both in
+  camera axes; rotation in radians, translation in the segment's map units.
+- **Tracked pose.** Covariance = s² (Σ JᵀJ)⁻¹ over the inliers, s² their
+  residual variance (Σ|e|² / (2n − 6)). Landmarks are taken as exact, so it is
+  optimistic. On synthetic data the normalized squared error averages 5.97
+  (6 when consistent; `pose_covariance_is_consistent`).
+- **Motion model.** Constant velocity with white-noise acceleration, per
+  frame: `T[k+1] = exp(a) V T[k]`, `V[k+1] = exp(a) V`, a ~ N(0, Q). The
+  prediction is `velocity * last_pose` as before; `MotionModel` carries its
+  covariance (pose, velocity and their cross term). n frames without a
+  measurement give P + n(C + Cᵀ) + n²Pv + Q·n(n+1)(2n+1)/6, so the pixel
+  uncertainty grows like n^1.5 once Q dominates.
+- **Q is estimated per segment** from the one-step prediction errors e of
+  tracked frames. Pose jitter S makes consecutive errors negatively
+  correlated (E[e eᵀ] = Q + 6S, E[e_k e_{k−1}ᵀ] = −4S), so
+  Q = E[e eᵀ] + 1.5·E[e_k e_{k−1}ᵀ], exponentially weighted over about 60
+  frames and projected to positive semidefinite. Without the correction the
+  jitter is extrapolated as acceleration.
+- **Confidence.** `OdometryFrameResult::pose_covariance` (6×6),
+  `pose_sigma_px` (RMS per-axis standard deviation of the landmarks'
+  projections under that covariance) and `confidence` =
+  1 − exp(−τ²/(2σ²)) with τ = `reprojection_threshold_px`: the probability
+  that a landmark projects within the inlier threshold of where it is.
+  `TrajectorySample` and the trajectory CSV carry `predicted` and
+  `confidence`.
+- **Coasting.** A frame without a pose reports the prediction
+  (`state == coasting`, `predicted`), keeps the local map and makes no
+  keyframe. `relocalize()` projects the local landmarks that have no live
+  track with the predicted pose and matches them by descriptor (mutual best,
+  cosine ≥ 0.7) to tracks without a landmark, within 3σ of the predicted
+  uncertainty (clamped to 16–256 px), then runs P3P RANSAC over those matches
+  plus the live correspondences. With ≥ 30 inliers the matched tracks take
+  over their landmarks (`associate()`), a keyframe ties the frame in, and the
+  coasted frames' poses are replaced by the constant-velocity path between
+  the tracked poses on either side. The segment ends when σ exceeds 256 px or
+  after 90 frames; the unconfirmed coasted frames are then removed from the
+  trajectory.
+- **Calibration on real clips.** See `baselines/README.md` (v4). The model
+  is conservative on handheld video and too tight for a sustained smooth
+  acceleration (the synthetic occlusion test: 14.8 px off at σ = 4.3 px after
+  20 frames; the 16 px floor covers it).
+
+Not done:
+
 - **Feeding the pose back to the tracker.** For tracks with landmarks, the
   predicted pose gives a predicted pixel (`K.project(T_pred * X)`, then
-  *distort* with k1, since the tracker works in distorted pixels). This
-  helps where flow fails (occlusion, blur, fast motion) and is the natural
-  way to search for re-appearing retired landmarks. The tracker's `predict`
-  kernel takes only flow today; add an optional per-track prediction array
-  (uploaded from the host, indexed like the tracks) and blend or use it as
-  a second gate. Frame-to-frame, flow is usually better than a pose
-  prediction (it includes per-pixel depth effects), so treat the pose as a
-  fallback or a prior, not a replacement.
+  *distort* with k1, since the tracker works in distorted pixels). The
+  tracker's `predict` kernel takes only flow today; add an optional per-track
+  prediction array and use it as a second gate. Frame-to-frame, flow is
+  usually better than a pose prediction, so treat the pose as a fallback.
 - **Outlier feedback.** The tracker never learns that the VO rejected a
-  track (`pose_outliers`). Down-weighting or killing persistently rejected
-  tracks is a cheap robustness win.
+  track (`pose_outliers`).
+- **A search without a pose prior** (place recognition) for when coasting
+  runs out, and loop closure.
 - Threading: the VO and keyframe BA (≈10–12 ms) run synchronously on the UI
   thread; the lens estimator shows the worker pattern
   (`BackgroundFocalEstimator`).
@@ -488,8 +524,9 @@ Seeking or restarting resets the trajectory, because track IDs restart.
 headlessly for inspection.
 
 **Weaknesses and next steps.**
-- No relocalization or loop closure. After a loss, a new segment starts
-  with a new frame and scale.
+- No loop closure, and relocalization only around the motion model's
+  prediction (see "Camera motion model" above). When coasting runs out, a
+  new segment starts with a new frame and scale.
 - Frames before initialization have no pose.
 - Scale drift (above) grows over long runs.
 - Intrinsics come from the self-calibration estimate (or a guess). Refining
@@ -497,12 +534,9 @@ headlessly for inspection.
 - Rolling shutter and moving people are only handled by the robust losses.
 - Keyframe mapping runs on the UI thread. It could move to a worker thread,
   and PnP/RANSAC could use the GPU-resident tracks.
-- Descriptors (cached per SuperPoint observation; the tracker also fills
-  `FrameFeatures::track_descriptors` per track) are the route to
-  relocalization, loop closure and re-association. `TrackedFrame` carries
-  none today.
-- No re-association after occlusion: a returning point is a new track and a
-  duplicate landmark.
+- Descriptors (`TrackedFrame::descriptors`, from
+  `FrameFeatures::track_descriptors`) drive re-association and
+  relocalization; loop closure would use them too.
 
 ## Cache boundary
 

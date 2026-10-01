@@ -84,7 +84,7 @@ std::vector<TrackedFrame> read_tracks_csv(const std::filesystem::path& path, int
 }
 
 void write_trajectory_csv(std::ostream& out, const std::vector<TrajectorySample>& trajectory) {
-  out << "frame_index,timestamp_ns,segment,keyframe,cx,cy,cz,qw,qx,qy,qz\n" << std::setprecision(10);
+  out << "frame_index,timestamp_ns,segment,keyframe,cx,cy,cz,qw,qx,qy,qz,predicted,confidence\n" << std::setprecision(10);
   for (const auto& sample : trajectory) {
     Eigen::Matrix3d R;
     for (int r = 0; r < 3; ++r)
@@ -93,7 +93,8 @@ void write_trajectory_csv(std::ostream& out, const std::vector<TrajectorySample>
     const auto center = sample.pose.center();
     out << sample.frame_index << ',' << sample.timestamp_ns << ',' << sample.segment << ','
         << (sample.keyframe ? 1 : 0) << ',' << center[0] << ',' << center[1] << ',' << center[2] << ','
-        << q.w() << ',' << q.x() << ',' << q.y() << ',' << q.z() << '\n';
+        << q.w() << ',' << q.x() << ',' << q.y() << ',' << q.z() << ','
+        << (sample.predicted ? 1 : 0) << ',' << sample.confidence << '\n';
   }
 }
 

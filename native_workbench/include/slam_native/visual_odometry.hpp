@@ -120,10 +120,26 @@ struct VisualOdometryConfig {
   double reassociation_radius_px{2.0};
   double min_descriptor_similarity{0.7};
 
+  // Coasting and relocalization. When the live tracks do not give a pose
+  // (occlusion, sudden motion), the frame's pose is the constant-velocity
+  // prediction, reported with the motion model's uncertainty
+  // (OdometryFrameResult::predicted, confidence), and the local map is kept.
+  // Its landmarks are searched by descriptor around their predicted
+  // projections, within 3 sigma of that uncertainty (at least
+  // relocalization_min_radius_px, at most relocalization_radius_px); P3P RANSAC
+  // (recovery_threshold_px) needs relocalization_min_inliers to resume the
+  // segment, and the matched tracks take over their landmarks. The segment
+  // ends when the uncertainty exceeds relocalization_radius_px (the prediction
+  // no longer constrains the search) or after coast_max_frames.
+  int coast_max_frames{90};
+  double relocalization_min_radius_px{16.0};
+  double relocalization_radius_px{256.0};
+  int relocalization_min_inliers{30};
+
   void validate() const;
 };
 
-enum class OdometryState { initializing, tracking, lost };
+enum class OdometryState { initializing, tracking, coasting, lost };
 const char* to_string(OdometryState state);
 
 struct OdometryFrameResult {
@@ -142,6 +158,22 @@ struct OdometryFrameResult {
   std::string event;         // human-readable note (why waiting, lost, ...)
   int reassociated{};        // landmarks taken over by a new track this frame
   int merged{};              // of those, duplicates folded into the older landmark
+  bool predicted{};          // coasting: the pose is the motion model's prediction
+  bool relocalized{};        // the local map was found again by descriptor search
+  // Pose uncertainty, when has_pose. The error is the perturbation delta =
+  // (omega, v) with T_true = exp(delta) * T: omega (radians) rotates about the
+  // camera centre, v (map units) moves the camera, both in camera axes.
+  // Row-major 6x6. A tracked pose's comes from its inliers (residual variance
+  // x inverse Gauss-Newton Hessian, landmarks taken as exact); a predicted
+  // pose's is that propagated by the constant-velocity model, whose
+  // acceleration noise is estimated from the segment's own prediction errors.
+  std::array<double, 36> pose_covariance{};
+  // The same in the image: RMS per-axis standard deviation of the landmarks'
+  // projections under pose_covariance, in pixels.
+  double pose_sigma_px{};
+  // Probability that a landmark projects within reprojection_threshold_px of
+  // where it is: 1 - exp(-threshold^2 / (2 pose_sigma_px^2)).
+  double confidence{};
   // Track IDs with a landmark this frame, split by the pose fit (sorted; for
   // display). Inliers reproject within reprojection_threshold_px.
   std::vector<std::uint64_t> pose_inliers, pose_outliers;
@@ -167,6 +199,11 @@ struct TrajectorySample {
   int segment{};
   bool keyframe{};
   Pose pose;  // latest estimate: follows keyframe bundle-adjustment updates
+  // Coasted frame (see OdometryFrameResult::predicted). Once the segment is
+  // found again, its pose is interpolated between the tracked poses on either
+  // side; if it never is, coasted frames are removed.
+  bool predicted{};
+  double confidence{};  // OdometryFrameResult::confidence when the frame was processed
 };
 
 class VisualOdometry {

@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -68,6 +69,10 @@ int main(int argc, char** argv) {
       else if (key == "window") vo_config.window_keyframes = static_cast<int>(value);
       else if (key == "local-map") vo_config.local_map_keyframes = static_cast<int>(value);
       else if (key == "reassoc-radius") vo_config.reassociation_radius_px = value;
+      else if (key == "vo-coast") vo_config.coast_max_frames = static_cast<int>(value);
+      else if (key == "reloc-radius") vo_config.relocalization_radius_px = value;
+      else if (key == "reloc-min-radius") vo_config.relocalization_min_radius_px = value;
+      else if (key == "reloc-inliers") vo_config.relocalization_min_inliers = static_cast<int>(value);
       else if (key == "radius") config.association_radius = value;
       else if (key == "min-sim") config.min_descriptor_similarity = value;
       else if (key == "weight") config.descriptor_weight = value;
@@ -97,7 +102,9 @@ int main(int argc, char** argv) {
     if (!export_tracks.empty()) tracks_out.open(export_tracks);
     bool tracks_header = false;
 
-    int vo_posed = 0, vo_keyframes = 0, vo_losses = 0, vo_reassociated = 0, vo_merged = 0;
+    int vo_posed = 0, vo_keyframes = 0, vo_losses = 0, vo_reassociated = 0, vo_merged = 0, vo_coasted = 0,
+        vo_relocalized = 0;
+    std::vector<float> vo_confidence, vo_sigma;
     double vo_ms = 0, vo_max_ms = 0;
     std::vector<float> vo_inlier_ratio, vo_reprojection;
     std::unordered_map<std::uint64_t, std::uint64_t> length;  // live track -> supported observations
@@ -137,7 +144,16 @@ int main(int argc, char** argv) {
       vo_losses += pose.state == OdometryState::lost;
       vo_reassociated += pose.reassociated;
       vo_merged += pose.merged;
-      if (pose.state == OdometryState::lost || pose.event == "pose re-estimated (P3P RANSAC)")
+      vo_coasted += pose.predicted;
+      vo_relocalized += pose.relocalized;
+      if (pose.has_pose && !pose.predicted) {
+        vo_confidence.push_back(float(pose.confidence));
+        vo_sigma.push_back(float(pose.pose_sigma_px));
+      }
+      if (std::getenv("SLAM_VO_COAST_LOG") && pose.predicted)
+        std::printf("  vo frame %llu: coasting, sigma %.1f px, confidence %.3f\n",
+                    static_cast<unsigned long long>(pose.frame_index), pose.pose_sigma_px, pose.confidence);
+      if (pose.state == OdometryState::lost || pose.relocalized || pose.event == "pose re-estimated (P3P RANSAC)")
         std::cout << "  vo frame " << pose.frame_index << ": " << pose.event << '\n';
       vo_ms += pose.ms;
       vo_max_ms = std::max(vo_max_ms, pose.ms);
@@ -203,6 +219,10 @@ int main(int argc, char** argv) {
                 "inlier ratio median %.3f, median reprojection %.2f px, %.2f ms/frame (max %.1f)\n",
                 vo_posed, processed + 1, vo_keyframes, vo_losses, segment_poses.size(), largest,
                 percentile(vo_inlier_ratio, 0.5), percentile(vo_reprojection, 0.5), vo_ms / (processed + 1), vo_max_ms);
+    std::printf("coasting: %d frames predicted (kept in the trajectory when relocalized), %d relocalizations; tracked "
+                "pose sigma median %.2f px (p90 %.2f), confidence p10 %.3f\n",
+                vo_coasted, vo_relocalized, percentile(vo_sigma, 0.5), percentile(vo_sigma, 0.9),
+                percentile(vo_confidence, 0.1));
     std::printf("landmarks: %zu (%zu retired), re-associated %d (%d merged)\n",
                 odometry.retired_count() + odometry.active_map().size(), odometry.retired_count(), vo_reassociated,
                 vo_merged);

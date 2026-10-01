@@ -177,6 +177,12 @@ SE3 perturb(const SE3& T, const Vec6& delta) {
   const Mat3 dR = exp_so3(delta.head<3>());
   return {orthonormalize(dR * T.R), dR * T.t + delta.tail<3>()};
 }
+Vec6 pose_difference(const SE3& a, const SE3& b) {
+  const Mat3 dR = a.R * b.R.transpose();
+  Vec6 delta;
+  delta << log_so3(dR), a.t - dR * b.t;
+  return delta;
+}
 SE3 scale_motion(const SE3& T, double fraction) {
   return {exp_so3(log_so3(T.R) * fraction), T.t * fraction};
 }
@@ -383,6 +389,71 @@ int optimize_pose(const Intrinsics& K, const std::vector<PoseObservation>& obser
     }
   }
   return static_cast<int>(std::count(inliers.begin(), inliers.end(), 1));
+}
+
+Eigen::Matrix<double, 2, 6> pose_jacobian(const Intrinsics& K, const Vec3& xc) {
+  return projection_jacobian(K, xc) * perturbation_jacobian(xc);
+}
+
+Mat6 pose_covariance(const Intrinsics& K, const std::vector<PoseObservation>& observations, const SE3& pose,
+                     const std::vector<char>& inliers) {
+  Mat6 H = Mat6::Zero();
+  double squared = 0;
+  int count = 0;
+  for (std::size_t i = 0; i < observations.size(); ++i) {
+    if (!inliers[i]) continue;
+    const Vec3 xc = pose * observations[i].X;
+    if (xc.z() < kMinDepth) continue;
+    const Eigen::Matrix<double, 2, 6> J = pose_jacobian(K, xc);
+    H += J.transpose() * J;
+    squared += (K.project(xc) - observations[i].u).squaredNorm();
+    ++count;
+  }
+  // A direction the points do not constrain gets a huge variance, not zero.
+  H.diagonal().array() += 1e-12 * H.trace() + 1e-300;
+  return squared / std::max(2 * count - 6, 1) * H.inverse();
+}
+
+void MotionModel::reset(const Mat6& measured, int steps) {
+  *this = {};
+  measured_ = pose = measured;
+  cross = measured / steps;
+  velocity = 2 * measured / (double(steps) * steps);
+}
+
+Mat6 MotionModel::acceleration() const {
+  if (weight0_ <= 0) return Mat6::Zero();
+  Mat6 Q = lag0_ / weight0_;
+  if (weight1_ > 0) Q += 0.75 / weight1_ * (lag1_ + lag1_.transpose());
+  const Eigen::SelfAdjointEigenSolver<Mat6> eigen(Q);
+  return eigen.eigenvectors() * eigen.eigenvalues().cwiseMax(0).asDiagonal() * eigen.eigenvectors().transpose();
+}
+
+void MotionModel::predict() {
+  // pose' = pose + velocity + a, velocity' = velocity + a.
+  const Mat6 Q = acceleration();
+  pose = (pose + cross + cross.transpose() + velocity + Q).eval();
+  cross = (cross + velocity + Q).eval();
+  velocity += Q;
+}
+
+void MotionModel::correct(const Vec6& error, const Mat6& measured, int steps) {
+  constexpr double kRate = 1.0 / 60;
+  if (steps == 1) {
+    lag0_ = (1 - kRate) * lag0_ + kRate * error * error.transpose();
+    weight0_ = (1 - kRate) * weight0_ + kRate;
+    if (has_previous_error_) {
+      lag1_ = (1 - kRate) * lag1_ + kRate * error * previous_error_.transpose();
+      weight1_ = (1 - kRate) * weight1_ + kRate;
+    }
+    previous_error_ = error;
+  }
+  has_previous_error_ = steps == 1;
+  // The pose is the measurement (the prediction is far weaker); the velocity
+  // is the difference of two measured poses with independent errors.
+  velocity = (measured + measured_) / (double(steps) * steps);
+  cross = measured / steps;
+  measured_ = pose = measured;
 }
 
 BundleReport bundle_adjust(const Intrinsics& K, BundleProblem& problem, int iterations, double huber_px) {

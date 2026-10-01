@@ -8,7 +8,7 @@
 //               The optional r,g,b columns (0-255) are the image colour at
 //               the observation. The reader finds them by name in the header
 //               row and ignores other extra columns.
-// Trajectory CSV: frame_index,timestamp_ns,segment,keyframe,cx,cy,cz,qw,qx,qy,qz
+// Trajectory CSV: frame_index,timestamp_ns,segment,keyframe,cx,cy,cz,qw,qx,qy,qz,predicted,confidence
 //               camera centre and camera->world rotation quaternion
 //               (Hamilton, w first); arbitrary monocular scale per segment.
 // Map CSV:      track_id,segment,x,y,z,r,g,b,has_color,keyframe_observations,

@@ -53,8 +53,15 @@ adjustment. The **Camera trajectory** window shows:
 - orbit, top, side and front views.
 
 Mouse controls: wheel zooms, left-drag orbits, right-drag pans, and
-double-click fits the view. Scale is arbitrary. After tracking is lost a new
-segment starts with its own scale. Seeking resets the trajectory.
+double-click fits the view. Scale is arbitrary. Seeking resets the trajectory.
+
+When the tracks do not give a pose (an occluder, sudden motion), the pose is
+predicted by a constant-velocity motion model for up to 90 frames
+(**coasting**; drawn dim) while the map is searched for by descriptor around
+the prediction. Every pose carries a covariance and a **confidence**: the
+probability that a landmark projects within the inlier threshold of where it
+is. A tracked pose's is close to 1; a coasted pose's falls as the prediction
+ages. If the map is not found again, a new segment starts with its own scale.
 
 - `--hfov 60`: assumed horizontal field of view (the default guess).
 - `--intrinsics FX FY CX CY`: known intrinsics in source-video pixels.
@@ -76,16 +83,18 @@ export-tracks tracks.csv export-trajectory trajectory.csv
 [export-map map.csv] [hfov DEG] [k1 K1]` runs the whole pipeline and writes
 the tracks, poses and map. The trajectory CSV has one row per posed frame:
 `frame_index`, `timestamp_ns`, `segment`, `keyframe`, the camera centre
-(`cx,cy,cz`) and the camera-to-world quaternion (`qw,qx,qy,qz`). VO options
+(`cx,cy,cz`), the camera-to-world quaternion (`qw,qx,qy,qz`), `predicted`
+(1 for a coasted frame) and `confidence`. VO options
 on the bench: `hfov`, `k1`, `fx fy cx cy` (all four), `kf-min`, `kf-max`,
-`kf-emergency-ratio` and `window`. See
+`kf-emergency-ratio`, `window`, `local-map`, `reassoc-radius`, `vo-coast`,
+`reloc-radius`, `reloc-min-radius` and `reloc-inliers`. See
 [ARCHITECTURE.md](ARCHITECTURE.md#camera-pose-live-monocular-visual-odometry--2026-09-24)
 for the algorithm, measurements and limitations.
 
 The map keeps every landmark. When a landmark's track ends and it leaves the
 bundle-adjustment window, it is **retired**: its position is final and it
 stays in the map, instead of being deleted as before. A segment's landmarks
-are retired when tracking is lost. Each landmark stores the mean image colour
+are retired when the segment ends. Each landmark stores the mean image colour
 of its keyframe observations (sampled on the GPU with a 3×3 mean), its track
 ID, and its first and last frames. The trajectory view draws retired points
 dimmer than active ones, optionally in their image colour.

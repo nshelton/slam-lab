@@ -72,6 +72,7 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
   }
   const auto& last = odometry.last();
   const ImVec4 state_color = last.state == OdometryState::tracking ? ImVec4(0.4F, 0.9F, 0.4F, 1) :
+      last.state == OdometryState::coasting ? ImVec4(1, 0.6F, 0.2F, 1) :
       last.state == OdometryState::lost ? ImVec4(1, 0.4F, 0.3F, 1) : ImVec4(1, 0.8F, 0.3F, 1);
   ImGui::TextColored(state_color, "%s", to_string(last.state));
   ImGui::SameLine();
@@ -80,7 +81,8 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
   // Active: the odometry's live landmarks (still refined); retired: final
   // positions kept for display. Their sum is what the view can draw.
   ImGui::Text("Map: %zu active, %zu retired", active_.size(), retired_.size());
-  if (last.has_pose) ImGui::Text("Median reprojection %.2f px", last.median_reprojection_px);
+  if (last.has_pose && !last.predicted) ImGui::Text("Median reprojection %.2f px", last.median_reprojection_px);
+  if (last.has_pose) ImGui::Text("Pose confidence %.2f  (sigma %.1f px)", last.confidence, last.pose_sigma_px);
   ImGui::PushTextWrapPos(0);
   if (!last.event.empty()) ImGui::TextDisabled("%s", last.event.c_str());
   else ImGui::TextDisabled("Monocular: scale is arbitrary and differs between segments.");
@@ -296,7 +298,7 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
     if (!visible(s)) { previous = nullptr; continue; }
     const V3 p = display(s.pose.center());
     if (previous && previous->segment == s.segment)
-      line(display(previous->pose.center()), p, segment_color(s.segment), 2.0F);
+      line(display(previous->pose.center()), p, segment_color(s.segment, s.predicted ? 110 : 255), 2.0F);  // coasted: dim
     if (s.keyframe)
       if (const auto q = project(p))
         draw->AddRect({q->x - 2.5F, q->y - 2.5F}, {q->x + 2.5F, q->y + 2.5F}, segment_color(s.segment, 220));

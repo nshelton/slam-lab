@@ -166,11 +166,8 @@ void distortion_round_trip() {
       }
 }
 
-// Broken tracks re-find their landmark (and duplicates merge) through
-// per-point descriptors, and only their own: a wrong association would mix
-// two points' colour-encoded indices and break the exact map.
-void reassociates_broken_tracks() {
-  auto scene = make_scene(true, 240, 5, {0, 0, 0.02, 0, 0});
+// One random unit descriptor per scene point, attached to its observations.
+void add_descriptors(Scene& scene) {
   constexpr int kDimension = 32;
   std::mt19937 rng(9);
   std::normal_distribution<float> gauss;
@@ -183,6 +180,145 @@ void reassociates_broken_tracks() {
       frame.descriptors.insert(frame.descriptors.end(), d.data(), d.data() + kDimension);
     }
   }
+}
+
+// The covariance of an optimized pose must match the scatter of its errors:
+// the normalized squared error (NEES) of a 6-d estimate averages 6.
+void pose_covariance_is_consistent() {
+  std::mt19937 rng(11);
+  std::uniform_real_distribution<double> u(-1, 1);
+  std::normal_distribution<double> noise(0, 0.7);
+  const vo::Intrinsics K{1662.8, 1662.8, 959.5, 539.5};
+  const vo::SE3 truth{vo::exp_so3(vo::Vec3(0.02, -0.1, 0.03)), vo::Vec3(0.3, -0.1, 0.5)};
+  double nees = 0;
+  const int trials = 400;
+  for (int trial = 0; trial < trials; ++trial) {
+    std::vector<vo::PoseObservation> observations;
+    for (int i = 0; i < 60; ++i) {
+      const vo::Vec3 X(4 * u(rng), 2 * u(rng), 8 + 4 * u(rng));
+      observations.push_back({X, K.project(truth * X) + vo::Vec2(noise(rng), noise(rng))});
+    }
+    vo::SE3 pose = truth;
+    std::vector<char> inliers;
+    vo::optimize_pose(K, observations, pose, 5.0, inliers);
+    const vo::Vec6 error = vo::pose_difference(truth, pose);
+    nees += error.dot(vo::pose_covariance(K, observations, pose, inliers).ldlt().solve(error));
+  }
+  std::cout << "pose covariance: mean NEES " << nees / trials << " (6 when consistent)\n";
+  require(nees / trials > 5 && nees / trials < 7.5, "Pose covariance does not match the pose errors");
+}
+
+// The motion model recovers the acceleration noise from one-step prediction
+// errors despite measurement jitter, and its n-step covariance matches a
+// simulation of the model.
+void motion_model_is_consistent() {
+  std::mt19937 rng(13);
+  std::normal_distribution<double> gauss;
+  // Acceleration and measurement sigma per axis. Q = 4 S, as on real clips
+  // (lag-1 correlation of the errors about -0.4); with far more jitter than
+  // acceleration the estimate is a small difference of large terms and errs high.
+  const double q = 2e-3, r = 1e-3;
+  const vo::Mat6 R = r * r * vo::Mat6::Identity();
+  vo::MotionModel model;
+  model.reset(R, 1);
+  const auto draw = [&](double sigma) {
+    vo::Vec6 v;
+    for (int k = 0; k < 6; ++k) v(k) = sigma * gauss(rng);
+    return v;
+  };
+  // Scalar-per-axis simulation: true pose x, velocity v; measured m = x + noise.
+  vo::Vec6 x = vo::Vec6::Zero(), v = vo::Vec6::Zero();
+  vo::Vec6 m1 = x + draw(r), m0 = m1;
+  vo::Mat6 mean = vo::Mat6::Zero();
+  int samples = 0;
+  for (int k = 0; k < 4000; ++k) {
+    v += draw(q);
+    x += v;
+    const vo::Vec6 m = x + draw(r);
+    model.predict();
+    model.correct(m - (2 * m1 - m0), R, 1);
+    m0 = m1;
+    m1 = m;
+    if (k > 500) { mean += model.acceleration(); ++samples; }
+  }
+  const double estimated = std::sqrt((mean / samples).trace() / 6);
+  std::cout << "motion model: acceleration sigma " << estimated << " (true " << q << ", measurement " << r << ")\n";
+  require(estimated > 0.8 * q && estimated < 1.3 * q, "Acceleration noise estimate is off");
+  // n frames without a measurement: P + n (C + C^T) + n^2 Pv + Q n(n+1)(2n+1)/6.
+  const vo::Mat6 Q = model.acceleration(), P = model.pose, Pv = model.velocity, C = model.cross;
+  const int n = 20;
+  for (int i = 0; i < n; ++i) model.predict();
+  const vo::Mat6 expected = P + n * (C + C.transpose()) + double(n) * n * Pv + Q * (n * (n + 1) * (2 * n + 1) / 6.0);
+  require((model.pose - expected).norm() < 1e-9 * expected.norm(), "n-step covariance does not match the closed form");
+}
+
+// An occluder hides the scene for `gap` frames and every track restarts
+// behind it. The odometry must coast on the motion model, with a pose whose
+// confidence falls, find the local map again by descriptor, and keep one
+// segment.
+void coasts_through_occlusion() {
+  auto scene = make_scene(true, 240, 5, {0, 0, 0, 0, 0});
+  add_descriptors(scene);
+  const std::size_t first = 120, gap = 20;
+  for (std::size_t f = first; f < scene.frames.size(); ++f) {
+    auto& frame = scene.frames[f];
+    if (f < first + gap) {
+      frame.observations.resize(10);  // too few to track
+      frame.descriptors.resize(10 * static_cast<std::size_t>(frame.descriptor_dimension));
+    }
+    for (auto& o : frame.observations) o.track_id += f < first + gap ? 2'000'000 : 1'000'000;
+  }
+  VisualOdometry odometry;
+  int coasted = 0, relocalized = 0;
+  double last_confidence = 1, last_sigma = 0, tracked_confidence = 1;
+  for (const auto& frame : scene.frames) {
+    const auto r = odometry.process(frame);
+    if (r.predicted) {
+      require(r.state == OdometryState::coasting && r.has_pose, "coasted frame without a pose");
+      if (std::getenv("SLAM_VO_VERBOSE"))
+        std::cout << "  coasting frame " << r.frame_index << ": sigma " << r.pose_sigma_px << " px, confidence "
+                  << r.confidence << '\n';
+      require(r.pose_sigma_px > last_sigma && r.confidence <= last_confidence, "uncertainty must grow while coasting");
+      last_sigma = r.pose_sigma_px;
+      last_confidence = r.confidence;
+      ++coasted;
+    } else if (r.has_pose) {
+      tracked_confidence = std::min(tracked_confidence, r.confidence);
+    }
+    if (r.relocalized) std::cout << "occlusion: frame " << r.frame_index << ' ' << r.event << '\n';
+    relocalized += r.relocalized;
+  }
+  const auto trajectory = odometry.trajectory();
+  const auto result = evaluate(scene, trajectory);
+  int predicted = 0;
+  for (const auto& sample : trajectory) predicted += sample.predicted;
+  std::cout << "occlusion: " << coasted << " coasted frames (confidence down to " << last_confidence
+            << "), tracked confidence >= " << tracked_confidence << ", " << result.segments << " segment(s), ATE "
+            << 100 * result.ate_fraction << "% of path\n";
+  require(coasted == static_cast<int>(gap) && predicted == coasted, "occluded frames were not coasted");
+  require(last_confidence < 0.5, "a pose predicted for many frames must not be confident");
+  require(relocalized == 1 && result.segments == 1, "the map was not found again after the occlusion");
+  require(tracked_confidence > 0.99, "tracked poses on exact data must be confident");
+  require(result.ate_fraction < 2e-3, "trajectory error through the occlusion (coasted frames included)");
+
+  // Never relocalized (the scene does not come back): the segment ends and
+  // the unconfirmed coasted frames leave the trajectory.
+  VisualOdometryConfig config;
+  config.coast_max_frames = 15;
+  VisualOdometry bounded(config);
+  std::uint64_t lost_at = 0;
+  for (std::size_t f = 0; f < first + gap; ++f)
+    if (bounded.process(scene.frames[f]).state == OdometryState::lost) lost_at = f;
+  require(lost_at == first + 15, "coasting did not end after coast_max_frames");
+  for (const auto& sample : bounded.trajectory()) require(!sample.predicted, "unconfirmed coasted frames were kept");
+}
+
+// Broken tracks re-find their landmark (and duplicates merge) through
+// per-point descriptors, and only their own: a wrong association would mix
+// two points' colour-encoded indices and break the exact map.
+void reassociates_broken_tracks() {
+  auto scene = make_scene(true, 240, 5, {0, 0, 0.02, 0, 0});
+  add_descriptors(scene);
   VisualOdometry odometry;
   int reassociated = 0, merged = 0;
   for (const auto& frame : scene.frames) {
@@ -280,7 +416,10 @@ int main() {
     pose_optimizer_converges();
     p3p_recovers_pose();
     distortion_round_trip();
+    pose_covariance_is_consistent();
+    motion_model_is_consistent();
     reassociates_broken_tracks();
+    coasts_through_occlusion();
     // Noise-free data must be reproduced essentially exactly (regression for
     // rotation drift off SO(3), which made poses diverge geometrically).
     const auto clean = make_scene(true, 240, 5, {0, 0, 0, 0, 0});
