@@ -12,9 +12,9 @@
 //               camera centre and camera->world rotation quaternion
 //               (Hamilton, w first); arbitrary monocular scale per segment.
 // Map CSV:      track_id,segment,x,y,z,r,g,b,has_color,keyframe_observations,
-//               first_frame,last_frame,retired,landmark_id
+//               first_frame,last_frame,local,landmark_id
 //               (world coordinates, as the trajectory; r,g,b are 0 when
-//               has_color is 0)
+//               has_color is 0; local: in the local map when written)
 #include "slam_native/visual_odometry.hpp"
 
 #include <filesystem>
@@ -28,6 +28,6 @@ void write_tracks(std::ostream& out, const TrackedFrame& frame, bool colors = fa
 // width/height override (or supply) the "# size" line when positive.
 std::vector<TrackedFrame> read_tracks_csv(const std::filesystem::path& path, int width = 0, int height = 0);
 void write_trajectory_csv(std::ostream& out, const std::vector<TrajectorySample>& trajectory);
-// Retired points first, then the active map.
+// Every landmark, by landmark id.
 void write_map_csv(std::ostream& out, const VisualOdometry& odometry);
 }  // namespace slam_native

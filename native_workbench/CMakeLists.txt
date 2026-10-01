@@ -29,6 +29,7 @@ FetchContent_MakeAvailable(eigen)
 add_library(slam-native-vo STATIC
   src/visual_odometry.cpp
   src/vo_geometry.cpp
+  src/place_index.cpp
   src/track_io.cpp
   src/focal_estimation.cpp
 )

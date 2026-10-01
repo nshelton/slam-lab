@@ -69,6 +69,9 @@ int main(int argc, char** argv) {
       else if (key == "window") vo_config.window_keyframes = static_cast<int>(value);
       else if (key == "local-map") vo_config.local_map_keyframes = static_cast<int>(value);
       else if (key == "reassoc-radius") vo_config.reassociation_radius_px = value;
+      else if (key == "place-interval") vo_config.place_search_interval = static_cast<int>(value);
+      else if (key == "place-ratio") vo_config.place_ratio = value;
+      else if (key == "place-inliers") vo_config.place_min_inliers = static_cast<int>(value);
       else if (key == "vo-coast") vo_config.coast_max_frames = static_cast<int>(value);
       else if (key == "reloc-radius") vo_config.relocalization_radius_px = value;
       else if (key == "reloc-min-radius") vo_config.relocalization_min_radius_px = value;
@@ -103,7 +106,8 @@ int main(int argc, char** argv) {
     bool tracks_header = false;
 
     int vo_posed = 0, vo_keyframes = 0, vo_losses = 0, vo_reassociated = 0, vo_merged = 0, vo_coasted = 0,
-        vo_relocalized = 0;
+        vo_relocalized = 0, vo_place_reassociated = 0, vo_revisits = 0;
+    std::vector<float> vo_revisit_offset;
     std::vector<float> vo_confidence, vo_sigma;
     double vo_ms = 0, vo_max_ms = 0;
     std::vector<float> vo_inlier_ratio, vo_reprojection;
@@ -146,6 +150,15 @@ int main(int argc, char** argv) {
       vo_merged += pose.merged;
       vo_coasted += pose.predicted;
       vo_relocalized += pose.relocalized;
+      vo_place_reassociated += pose.place_reassociated;
+      if (pose.place_inliers > 0 && !pose.relocalized) {  // a mapped place seen again while tracking
+        ++vo_revisits;
+        vo_revisit_offset.push_back(float(pose.place_offset_px));
+        if (std::getenv("SLAM_VO_PLACE_LOG"))
+          std::printf("  vo frame %llu: place in segment %d (tracking %d): %d inliers, %.1f px from the tracked pose\n",
+                      static_cast<unsigned long long>(pose.frame_index), pose.place_segment, pose.segment,
+                      pose.place_inliers, pose.place_offset_px);
+      }
       if (pose.has_pose && !pose.predicted) {
         vo_confidence.push_back(float(pose.confidence));
         vo_sigma.push_back(float(pose.pose_sigma_px));
@@ -223,9 +236,12 @@ int main(int argc, char** argv) {
                 "pose sigma median %.2f px (p90 %.2f), confidence p10 %.3f\n",
                 vo_coasted, vo_relocalized, percentile(vo_sigma, 0.5), percentile(vo_sigma, 0.9),
                 percentile(vo_confidence, 0.1));
-    std::printf("landmarks: %zu (%zu retired), re-associated %d (%d merged)\n",
-                odometry.retired_count() + odometry.active_map().size(), odometry.retired_count(), vo_reassociated,
-                vo_merged);
+    std::size_t local_landmarks = 0;
+    for (const auto& point : odometry.map()) local_landmarks += point.local;
+    std::printf("landmarks: %zu (%zu in the local map), re-associated %d (%d merged; %d from outside the local map)\n",
+                odometry.map_size(), local_landmarks, vo_reassociated, vo_merged, vo_place_reassociated);
+    std::printf("places: %d revisits found without a pose prior while tracking (not corrected), median %.1f px from "
+                "the tracked pose\n", vo_revisits, percentile(vo_revisit_offset, 0.5));
     if (!export_map.empty()) {
       std::ofstream out(export_map);
       write_map_csv(out, odometry);

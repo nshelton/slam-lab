@@ -213,7 +213,7 @@ void composite_premultiplied(const ImDrawList*, const ImDrawCmd*) {
 
 PointCloudRenderer::~PointCloudRenderer() {
   if (!gl_ready_) return;
-  for (auto* set : {&retired_, &active_}) {
+  for (auto* set : {&outside_, &local_}) {
     glDeleteVertexArrays(1, &set->vao);
     glDeleteBuffers(1, &set->buffer);
   }
@@ -285,7 +285,7 @@ bool PointCloudRenderer::ensure_gl() {
   glGenBuffers(1, &mesh_);
   glBindBuffer(GL_ARRAY_BUFFER, mesh_);
   glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(mesh.size() * sizeof(float)), mesh.data(), GL_STATIC_DRAW);
-  for (auto* set : {&retired_, &active_}) {
+  for (auto* set : {&outside_, &local_}) {
     glGenVertexArrays(1, &set->vao);
     glGenBuffers(1, &set->buffer);
     glBindVertexArray(set->vao);
@@ -462,27 +462,22 @@ void PointCloudRenderer::ensure_target(int width, int height) {
   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture_, 0);
 }
 
-void PointCloudRenderer::upload(InstanceSet& set, const std::vector<MapPoint>& points, bool incremental) {
-  if (!incremental || points.size() < set.uploaded) set.uploaded = 0;
+void PointCloudRenderer::upload(InstanceSet& set, const std::vector<MapPoint>& points) {
+  set.uploaded = points.size();
+  if (points.empty()) return;
   glBindBuffer(GL_ARRAY_BUFFER, set.buffer);
   if (points.size() > set.capacity) {
     set.capacity = std::max({points.size(), 2 * set.capacity, std::size_t{1024}});
     glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(set.capacity * sizeof(Instance)), nullptr,
                  GL_DYNAMIC_DRAW);
-    set.uploaded = 0;
   }
-  if (points.size() == set.uploaded) return;
   std::vector<Instance> staging;
-  staging.reserve(points.size() - set.uploaded);
-  for (std::size_t i = set.uploaded; i < points.size(); ++i) {
-    const auto& p = points[i];
+  staging.reserve(points.size());
+  for (const auto& p : points)
     staging.push_back({{p.position[0], p.position[1], p.position[2]},
                        {p.color[0], p.color[1], p.color[2], static_cast<std::uint8_t>(p.has_color ? 255 : 0)},
                        p.segment, static_cast<float>(p.first_frame)});
-  }
-  glBufferSubData(GL_ARRAY_BUFFER, static_cast<GLintptr>(set.uploaded * sizeof(Instance)),
-                  static_cast<GLsizeiptr>(staging.size() * sizeof(Instance)), staging.data());
-  set.uploaded = points.size();
+  glBufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(staging.size() * sizeof(Instance)), staging.data());
 }
 
 void PointCloudRenderer::draw_set(const InstanceSet& set, const PointCloudStyle& style) {
@@ -499,11 +494,11 @@ void PointCloudRenderer::draw_set(const InstanceSet& set, const PointCloudStyle&
 
 void PointCloudRenderer::render(ImDrawList* draw, std::array<float, 2> min, std::array<float, 2> max,
                                 float pixel_scale, const PointCloudCamera& camera,
-                                const std::vector<MapPoint>* retired, const PointCloudStyle& retired_style,
-                                const std::vector<MapPoint>* active, const PointCloudStyle& active_style,
+                                const std::vector<MapPoint>* outside, const PointCloudStyle& outside_style,
+                                const std::vector<MapPoint>* local, const PointCloudStyle& local_style,
                                 const std::vector<DenseCloudDraw>* clouds, float cloud_point_pixels,
                                 std::uint64_t cloud_generation) {
-  if (!retired && !active && !(clouds && !clouds->empty())) return;
+  if (!outside && !local && !(clouds && !clouds->empty())) return;
   const float logical_width = max[0] - min[0], logical_height = max[1] - min[1];
   const int width = std::max(1, static_cast<int>(std::lround(logical_width * pixel_scale)));
   const int height = std::max(1, static_cast<int>(std::lround(logical_height * pixel_scale)));
@@ -521,8 +516,8 @@ void PointCloudRenderer::render(ImDrawList* draw, std::array<float, 2> min, std:
                   scissor = glIsEnabled(GL_SCISSOR_TEST), cull = glIsEnabled(GL_CULL_FACE),
                   depth_clamp = glIsEnabled(GL_DEPTH_CLAMP);
 
-  if (retired) upload(retired_, *retired, true);
-  if (active) upload(active_, *active, false);
+  if (outside) upload(outside_, *outside);
+  if (local) upload(local_, *local);
   ensure_target(width, height);
 
   glBindFramebuffer(GL_FRAMEBUFFER, msaa_fbo_);
@@ -551,8 +546,8 @@ void PointCloudRenderer::render(ImDrawList* draw, std::array<float, 2> min, std:
   glUniform1f(u_far_, 1000.0F * camera.eye_distance);
   glUniform2f(u_viewport_, logical_width, logical_height);
   glUniform1i(u_rotation_, camera.rotation);
-  if (retired) draw_set(retired_, retired_style);
-  if (active) draw_set(active_, active_style);
+  if (outside) draw_set(outside_, outside_style);
+  if (local) draw_set(local_, local_style);
   if (clouds && !clouds->empty())
     draw_clouds(*clouds, camera, logical_width, logical_height, cloud_point_pixels * pixel_scale, cloud_generation);
 

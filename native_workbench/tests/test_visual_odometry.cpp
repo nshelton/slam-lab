@@ -182,6 +182,21 @@ void add_descriptors(Scene& scene) {
   }
 }
 
+// Largest distance between a map point and the scene point its colour
+// encodes, after aligning the map to the scene by a similarity.
+double worst_point_error(const Scene& scene, const std::vector<MapPoint>& map) {
+  Eigen::Matrix3Xd estimated(3, map.size()), truth(3, map.size());
+  for (std::size_t i = 0; i < map.size(); ++i) {
+    estimated.col(i) = Eigen::Vector3d(map[i].position[0], map[i].position[1], map[i].position[2]);
+    truth.col(i) = scene.points[map[i].color[0] + 256U * map[i].color[1]];
+  }
+  const Eigen::Matrix4d S = Eigen::umeyama(estimated, truth, true);
+  double worst = 0;
+  for (std::size_t i = 0; i < map.size(); ++i)
+    worst = std::max(worst, (S.topLeftCorner<3, 3>() * estimated.col(i) + S.topRightCorner<3, 1>() - truth.col(i)).norm());
+  return worst;
+}
+
 // The covariance of an optimized pose must match the scatter of its errors:
 // the normalized squared error (NEES) of a 6-d estimate averages 6.
 void pose_covariance_is_consistent() {
@@ -313,6 +328,101 @@ void coasts_through_occlusion() {
   for (const auto& sample : bounded.trajectory()) require(!sample.predicted, "unconfirmed coasted frames were kept");
 }
 
+// The scene is hidden for longer than the odometry coasts, so the segment
+// ends, and every track restarts. Nothing is dropped from the map, and the
+// search without a pose prior finds it again: tracking resumes in the same
+// segment. Without that search a second segment starts and the first one's
+// landmarks stay in the map, outside the local map.
+void resumes_segment_without_prior() {
+  auto scene = make_scene(true, 240, 5, {0, 0, 0, 0, 0});
+  add_descriptors(scene);
+  const std::size_t first = 120, gap = 40;
+  for (std::size_t f = first; f < scene.frames.size(); ++f) {
+    auto& frame = scene.frames[f];
+    if (f < first + gap) {
+      frame.observations.resize(10);  // too few to track
+      frame.descriptors.resize(10 * static_cast<std::size_t>(frame.descriptor_dimension));
+    }
+    for (auto& o : frame.observations) o.track_id += f < first + gap ? 2'000'000 : 1'000'000;
+  }
+  VisualOdometryConfig config;
+  config.coast_max_frames = 5;
+  {
+    VisualOdometry odometry(config);
+    int lost = 0, resumed = 0;
+    std::size_t before = 0;
+    for (const auto& frame : scene.frames) {
+      const auto r = odometry.process(frame);
+      lost += r.state == OdometryState::lost;
+      if (r.state == OdometryState::lost) before = odometry.map_size();
+      if (r.relocalized) {
+        std::cout << "long occlusion: frame " << r.frame_index << ' ' << r.event << '\n';
+        require(r.frame_index == first + gap && r.segment == 0 && r.place_segment == 0 && r.keyframe,
+                "the first frame after the occlusion did not resume segment 0");
+        ++resumed;
+      }
+    }
+    const auto trajectory = odometry.trajectory();
+    const auto result = evaluate(scene, trajectory);
+    const auto map = odometry.map();
+    int old = 0;  // landmarks from before the occlusion, observed again after it
+    for (const auto& point : map) old += point.first_frame < first && point.last_frame >= first + gap;
+    std::cout << "long occlusion: " << lost << " loss, " << resumed << " resume, " << result.segments
+              << " segment(s), ATE " << 100 * result.ate_fraction << "% of path, " << old << " of " << map.size()
+              << " landmarks span the occlusion, worst point error " << worst_point_error(scene, map) << '\n';
+    require(lost == 1 && resumed == 1 && result.segments == 1, "the segment was not resumed after the occlusion");
+    require(map.size() >= before && old > 100, "landmarks from before the occlusion were not kept and re-observed");
+    require(result.ate_fraction < 2e-3, "trajectory error across the resumed segment");
+    require(worst_point_error(scene, map) < 1e-3, "the resumed map does not match the true points");
+    for (const auto& sample : trajectory)
+      require(sample.frame_index < first || sample.frame_index >= first + gap, "a frame without a pose was kept");
+    for (const auto& tracked : odometry.tracked_landmarks())
+      require(odometry.has_landmark(tracked.track_id) && tracked.first_frame <= scene.frames.back().frame_index,
+              "tracked_landmarks() lists a track without a landmark");
+    require(odometry.tracked_landmarks().size() > 100, "too few tracked landmarks at the end of the walk");
+    std::map<std::uint64_t, int> observers;
+    for (const auto& o : odometry.landmark_observations()) ++observers[o.landmark_id];
+    for (const auto& point : map)
+      require(observers[point.landmark_id] == point.keyframe_observations, "landmark_observations() does not match the map");
+  }
+  config.place_search_interval = -1;  // no search without a prior: a new segment
+  VisualOdometry odometry(config);
+  for (const auto& frame : scene.frames) odometry.process(frame);
+  int kept = 0, local = 0, second = 0;
+  for (const auto& point : odometry.map()) {
+    kept += point.segment == 0;
+    local += point.segment == 0 && point.local;
+    second += point.segment != 0;
+  }
+  std::cout << "long occlusion, no place search: " << kept << " landmarks of the ended segment kept (" << local
+            << " local), " << second << " in the new one\n";
+  require(evaluate(scene, odometry.trajectory()).segments == 2, "expected a second segment without the place search");
+  require(kept > 300 && local == 0 && second > 100, "the ended segment's landmarks must stay, outside the local map");
+}
+
+// A landmark that left the local map is found again by descriptor when the
+// camera looks back at it, and re-associated only when it still projects where
+// it is seen: the colour-encoded map stays exact.
+void reassociates_outside_local_map() {
+  auto scene = make_scene(true, 600, 5, {0, 0, 0, 0, 0});
+  add_descriptors(scene);
+  VisualOdometryConfig config;
+  config.local_map_keyframes = config.window_keyframes;  // landmarks leave the local map quickly
+  VisualOdometry odometry(config);
+  int reassociated = 0, from_outside = 0;
+  for (const auto& frame : scene.frames) {
+    const auto r = odometry.process(frame);
+    reassociated += r.reassociated;
+    from_outside += r.place_reassociated;
+  }
+  const auto map = odometry.map();
+  const double worst = worst_point_error(scene, map);
+  std::cout << "outside the local map: " << from_outside << " of " << reassociated << " re-associations, "
+            << map.size() << " map points, worst point error " << worst << '\n';
+  require(from_outside > 20, "too few landmarks found again outside the local map");
+  require(worst < 1e-3, "a re-association joined different points");
+}
+
 // Broken tracks re-find their landmark (and duplicates merge) through
 // per-point descriptors, and only their own: a wrong association would mix
 // two points' colour-encoded indices and break the exact map.
@@ -326,18 +436,8 @@ void reassociates_broken_tracks() {
     reassociated += r.reassociated;
     merged += r.merged;
   }
-  auto map = odometry.retired_map();
-  const auto active = odometry.active_map();
-  map.insert(map.end(), active.begin(), active.end());
-  Eigen::Matrix3Xd estimated(3, map.size()), truth(3, map.size());
-  for (std::size_t i = 0; i < map.size(); ++i) {
-    estimated.col(i) = Eigen::Vector3d(map[i].position[0], map[i].position[1], map[i].position[2]);
-    truth.col(i) = scene.points[map[i].color[0] + 256U * map[i].color[1]];
-  }
-  const Eigen::Matrix4d S = Eigen::umeyama(estimated, truth, true);
-  double worst = 0;
-  for (std::size_t i = 0; i < map.size(); ++i)
-    worst = std::max(worst, (S.topLeftCorner<3, 3>() * estimated.col(i) + S.topRightCorner<3, 1>() - truth.col(i)).norm());
+  const auto map = odometry.map();
+  const double worst = worst_point_error(scene, map);
   std::cout << "broken tracks: " << reassociated << " re-associated (" << merged << " merged), " << map.size()
             << " map points, worst point error " << worst << '\n';
   require(reassociated > 500, "too few re-associations");
@@ -420,6 +520,8 @@ int main() {
     motion_model_is_consistent();
     reassociates_broken_tracks();
     coasts_through_occlusion();
+    resumes_segment_without_prior();
+    reassociates_outside_local_map();
     // Noise-free data must be reproduced essentially exactly (regression for
     // rotation drift off SO(3), which made poses diverge geometrically).
     const auto clean = make_scene(true, 240, 5, {0, 0, 0, 0, 0});
@@ -429,18 +531,18 @@ int main() {
     require(exact.segments == 1 && exact.ate_fraction < 1e-5 && exact.rotation_deg < 1e-4,
             "Noise-free trajectory is not exact");
     {
-      // Retired landmarks are kept, carry their observations' colour, and
-      // match the true points up to a similarity. (A local map as short as
-      // the BA window, so the short walk retires landmarks.)
+      // Landmarks that left the local map are kept, carry their observations'
+      // colour, and match the true points up to a similarity. (A local map
+      // as short as the BA window, so the short walk leaves landmarks behind.)
       VisualOdometryConfig config;
       config.local_map_keyframes = config.window_keyframes;
       VisualOdometry odometry(config);
       for (const auto& frame : clean.frames) odometry.process(frame);
-      auto map = odometry.retired_map();
-      const std::size_t retired = map.size();
-      const auto active = odometry.active_map();
-      map.insert(map.end(), active.begin(), active.end());
-      require(retired > 200, "too few retired landmarks");
+      const auto map = odometry.map();
+      std::size_t local = 0;
+      for (const auto& point : map) local += point.local;
+      const std::size_t left = map.size() - local;
+      require(left > 200, "too few landmarks outside the local map");
       Eigen::Matrix3Xd estimated(3, map.size()), truth(3, map.size());
       for (std::size_t i = 0; i < map.size(); ++i) {
         const auto& point = map[i];
@@ -455,9 +557,9 @@ int main() {
       for (std::size_t i = 0; i < map.size(); ++i)
         squared += (S.topLeftCorner<3, 3>() * estimated.col(i) + S.topRightCorner<3, 1>() - truth.col(i)).squaredNorm();
       const double rms = std::sqrt(squared / map.size());
-      std::cout << "noise-free map: " << retired << " retired + " << active.size() << " active points, RMS error "
+      std::cout << "noise-free map: " << left << " points outside the local map + " << local << " local, RMS error "
                 << rms << " (scene units)\n";
-      require(rms < 1e-3, "retired map does not match the true points");
+      require(rms < 1e-3, "map does not match the true points");
     }
     const auto scene = make_scene(true);
     double ms = 0;

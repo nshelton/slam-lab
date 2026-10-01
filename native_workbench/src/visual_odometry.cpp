@@ -1,5 +1,6 @@
 #include "slam_native/visual_odometry.hpp"
 
+#include "place_index.hpp"
 #include "vo_geometry.hpp"
 
 #include <algorithm>
@@ -7,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <stdexcept>
 #include <unordered_map>
@@ -113,7 +115,8 @@ void VisualOdometryConfig::validate() const {
       keyframe_emergency_ratio >= 0 && min_triangulation_parallax_degrees >= 0 && window_keyframes >= 2 &&
       bundle_iterations >= 0 && local_map_keyframes >= window_keyframes && reassociation_radius_px >= 0 &&
       min_descriptor_similarity <= 1 && coast_max_frames >= 0 && relocalization_min_radius_px > 0 &&
-      relocalization_radius_px >= relocalization_min_radius_px && relocalization_min_inliers >= 6 && (!intrinsics || (intrinsics->fx > 0 && intrinsics->fy > 0));
+      relocalization_radius_px >= relocalization_min_radius_px && relocalization_min_inliers >= 6 &&
+      place_ratio > 0 && place_ransac_iterations > 0 && place_min_inliers >= 6 && (!intrinsics || (intrinsics->fx > 0 && intrinsics->fy > 0));
   if (!ok) throw std::invalid_argument("Invalid visual odometry settings");
 }
 
@@ -168,13 +171,24 @@ struct VisualOdometry::Impl {
   int segment{};
   int next_segment{1};                   // segment ids are never reused
   std::vector<KeyFrame> keyframes;       // all segments; id == index
-  std::vector<int> segment_keyframes;    // ids in the current segment
-  std::unordered_map<std::uint64_t, Landmark> landmarks;  // the local map, by landmark id
+  std::vector<int> segment_keyframes;    // ids in the current segment, in time order
+  // The keyframes the local map and the bundle-adjustment window are taken
+  // from (their tail): the segment's own, or after resume() the old keyframes
+  // that saw the landmarks found, followed by the new ones.
+  std::vector<int> local_keyframes;
+  // Every landmark of the run, by id: all segments, never retired.
+  std::unordered_map<std::uint64_t, Landmark> landmarks;
+  // The local map: the current segment's landmarks that a live track observes
+  // or that one of the last local_map_keyframes local keyframes saw. Only
+  // these are projected into frames, re-associated at a pose and
+  // bundle-adjusted; the others are found again by descriptor (`places`).
+  std::unordered_set<std::uint64_t> local;
+  PlaceIndex places;  // every landmark's latest descriptor
+  int frames_since_place_search{};
   // Track -> the landmark it observes (one track per landmark). Kept while
-  // the landmark lives: a track missing from a frame may resume.
+  // the landmark is local: a track missing from a frame may resume.
   std::unordered_map<std::uint64_t, std::uint64_t> track_landmark;
   std::uint64_t next_landmark_id{};
-  std::vector<MapPoint> retired;
   std::unordered_map<std::uint64_t, std::array<std::uint8_t, 3>> colors;  // this frame's, by track
   std::unordered_map<std::uint64_t, const float*> descriptors;            // this frame's, by track
   int descriptor_dimension{};
@@ -209,24 +223,39 @@ struct VisualOdometry::Impl {
     landmark.last_frame = last_frame;
     landmark.segment = segment;
     landmark.track = track;
-    update_descriptor(landmark);
+    if (auto it = descriptors.find(track); it != descriptors.end())
+      landmark.descriptor.assign(it->second, it->second + descriptor_dimension);
     return landmark;
   }
   // The landmark's track's descriptor in this frame, when it has one.
-  void update_descriptor(Landmark& landmark) const {
-    if (auto it = descriptors.find(landmark.track); it != descriptors.end())
-      landmark.descriptor.assign(it->second, it->second + descriptor_dimension);
+  void update_descriptor(std::uint64_t id, Landmark& landmark) {
+    auto it = descriptors.find(landmark.track);
+    if (it == descriptors.end()) return;
+    landmark.descriptor.assign(it->second, it->second + descriptor_dimension);
+    places.set(id, it->second, descriptor_dimension);
   }
-  void add_active(Landmark landmark) {
+  // A new landmark, in the local map.
+  void add_landmark(Landmark landmark) {
     const std::uint64_t id = next_landmark_id++;
     track_landmark[landmark.track] = id;
+    if (!landmark.descriptor.empty())
+      places.set(id, landmark.descriptor.data(), static_cast<int>(landmark.descriptor.size()));
+    local.insert(id);
     landmarks.emplace(id, std::move(landmark));
   }
-  std::unordered_map<std::uint64_t, Landmark>::iterator erase_active(
-      std::unordered_map<std::uint64_t, Landmark>::iterator it) {
-    if (auto t = track_landmark.find(it->second.track); t != track_landmark.end() && t->second == it->first)
+  // Remove a landmark from the map altogether (a point that did not hold up).
+  void erase_landmark(std::uint64_t id) {
+    auto it = landmarks.find(id);
+    if (auto t = track_landmark.find(it->second.track); t != track_landmark.end() && t->second == id)
       track_landmark.erase(t);
-    return landmarks.erase(it);
+    local.erase(id);
+    places.erase(id);
+    landmarks.erase(it);
+  }
+  std::vector<std::uint64_t> sorted_local() const {  // deterministic order (the set's is not)
+    std::vector<std::uint64_t> ids(local.begin(), local.end());
+    std::sort(ids.begin(), ids.end());
+    return ids;
   }
   Sighting sighting(int kf, std::uint64_t track_id) const { return {kf, keyframes[kf].observations.at(track_id)}; }
   Vec2 normalized(const Vec2& u) const { return K.unproject(u).head<2>(); }
@@ -253,22 +282,20 @@ struct VisualOdometry::Impl {
     point.keyframe_observations = static_cast<int>(landmark.observations.size());
     point.first_frame = landmark.first_frame;
     point.last_frame = landmark.last_frame;
+    point.local = local.count(id) > 0;
     return point;
   }
 
-  // `keep`: retire the segment's landmarks (they stay in the map) rather than
-  // discarding them (a rejected initialization).
-  void clear_segment(bool keep = true) {
-    if (keep) {
-      std::vector<std::uint64_t> ids;
-      for (const auto& [id, landmark] : landmarks)
-        if (landmark.observations.size() >= 2) ids.push_back(id);
-      std::sort(ids.begin(), ids.end());
-      for (auto id : ids) retired.push_back(map_point(id, landmarks.at(id)));
-    }
-    landmarks.clear();
+  // The segment ends. Its landmarks stay in the map, outside the local map,
+  // where resume() can find them again; with !keep they are discarded (a
+  // rejected initialization).
+  void end_segment(bool keep = true) {
+    for (auto id : sorted_local())
+      if (!keep || landmarks.at(id).observations.size() < 2) erase_landmark(id);
+    local.clear();
     track_landmark.clear();
     segment_keyframes.clear();
+    local_keyframes.clear();
     reference.reset();
     reference_age = 0;
     coasted = 0;
@@ -300,7 +327,8 @@ struct VisualOdometry::Impl {
   // Local landmarks, in id order, that are in front of the camera and in the image.
   std::vector<Vec3> visible_landmarks(const SE3& pose) const {
     std::vector<std::pair<std::uint64_t, Vec3>> found;
-    for (const auto& [id, landmark] : landmarks) {
+    for (auto id : local) {
+      const Landmark& landmark = landmarks.at(id);
       const Vec3 xc = pose * landmark.X;
       if (xc.z() <= 1e-6) continue;
       const Vec2 p = K.project(xc);
@@ -329,7 +357,7 @@ struct VisualOdometry::Impl {
     if (frame.width <= 0 || frame.height <= 0) throw std::invalid_argument("Invalid tracked frame size");
     if (!calibrated || frame.width != width || frame.height != height) {
       if (calibrated) {  // resolution change: start over
-        clear_segment();
+        end_segment();
         state = OdometryState::initializing;
         segment = next_segment++;
       }
@@ -355,6 +383,11 @@ struct VisualOdometry::Impl {
   void initialize(const TrackedFrame& frame, OdometryFrameResult& result) {
     state = OdometryState::initializing;
     result.state = state;
+    // A place the map already has: tracking resumes there instead.
+    if (config.place_search_interval >= 0 && !landmarks.empty() &&
+        resume(frame, observation_map(frame), place_matches(frame, [](std::uint64_t) { return true; },
+                                                            [](std::uint64_t) { return true; }), result))
+      return;
     if (!reference) {
       reference = frame;
       reference_age = 0;
@@ -474,20 +507,20 @@ struct VisualOdometry::Impl {
       landmark.observations = {sighting(k0, ids[i]), sighting(k1, ids[i])};
       add_color(landmark, ids[i], reference_colors);
       add_color(landmark, ids[i], colors);
-      add_active(std::move(landmark));
+      add_landmark(std::move(landmark));
     }
     local_bundle_adjustment();
     cull(current);
-    if (static_cast<int>(landmarks.size()) < config.min_init_points) {
+    if (static_cast<int>(local.size()) < config.min_init_points) {
       keyframes.resize(keyframes.size() - 2);
-      clear_segment(false);
+      end_segment(false);
       restart("initial map too small after refinement; new reference");
       return;
     }
     const SE3& pose0 = keyframes[k0].pose;
     const SE3& pose1 = keyframes[k1].pose;
     std::vector<std::uint64_t> mapped;
-    for (const auto& [id, landmark] : landmarks) mapped.push_back(landmark.track);
+    for (auto id : local) mapped.push_back(landmarks.at(id).track);
     std::sort(mapped.begin(), mapped.end());
     std::vector<PoseObservation> observations;
     std::vector<Vec3> points;
@@ -505,16 +538,17 @@ struct VisualOdometry::Impl {
     last_pose = pose1;
     previous_pose = velocity.inverse() * pose1;
     frames_since_keyframe = 0;
-    keyframe_landmarks = static_cast<int>(landmarks.size());
+    frames_since_place_search = 0;
+    keyframe_landmarks = static_cast<int>(local.size());
     reference.reset();
     state = OdometryState::tracking;
     result.state = state;
     result.has_pose = true;
     result.keyframe = true;
     result.pose = to_pose(pose1);
-    result.correspondences = result.inliers = static_cast<int>(landmarks.size());
+    result.correspondences = result.inliers = static_cast<int>(local.size());
     result.pose_inliers = mapped;
-    result.event = "initialized: " + std::to_string(landmarks.size()) + " points, " +
+    result.event = "initialized: " + std::to_string(local.size()) + " points, " +
                    std::to_string(median_parallax).substr(0, 4) + " deg parallax";
   }
 
@@ -568,8 +602,12 @@ struct VisualOdometry::Impl {
     }
     if (count < config.min_tracked_points) {
       const double sigma = image_sigma(predicted, motion.pose, visible_landmarks(predicted));
-      count = relocalize(frame, current, predicted, sigma, ids, observations, pose, inliers, result);
-      if (count < config.min_tracked_points) return coast(frame, predicted, sigma, result);
+      Matches elsewhere;  // descriptor matches in other segments
+      count = relocalize(frame, current, predicted, sigma, ids, observations, pose, inliers, elsewhere, result);
+      if (count < config.min_tracked_points) {
+        if (resume(frame, current, elsewhere, result)) return;
+        return coast(frame, predicted, sigma, result);
+      }
     }
     std::vector<double> errors;
     std::vector<std::uint64_t> inlier_ids, outlier_ids;
@@ -579,9 +617,10 @@ struct VisualOdometry::Impl {
         continue;
       }
       inlier_ids.push_back(ids[i]);
-      auto& landmark = landmarks.at(track_landmark.at(ids[i]));
+      const std::uint64_t landmark_id = track_landmark.at(ids[i]);
+      auto& landmark = landmarks.at(landmark_id);
       landmark.last_frame = frame.frame_index;
-      update_descriptor(landmark);
+      update_descriptor(landmark_id, landmark);
       errors.push_back((K.project(pose * observations[i].X) - observations[i].u).norm());
     }
     std::sort(inlier_ids.begin(), inlier_ids.end());
@@ -613,7 +652,12 @@ struct VisualOdometry::Impl {
     coasted = 0;
     last_pose = pose;
     // Before the keyframe step, so a re-found landmark is not triangulated again.
-    reassociate(frame, pose, current, std::unordered_set<std::uint64_t>(inlier_ids.begin(), inlier_ids.end()), result);
+    const std::unordered_set<std::uint64_t> inlier_tracks(inlier_ids.begin(), inlier_ids.end());
+    reassociate(frame, pose, current, inlier_tracks, result);
+    if (config.place_search_interval > 0 && ++frames_since_place_search >= config.place_search_interval) {
+      frames_since_place_search = 0;
+      search_places(frame, pose, inlier_tracks, result);
+    }
     ++frames_since_keyframe;
     const bool emergency = count < config.keyframe_emergency_ratio * keyframe_landmarks;
     const bool keyframe = (frames_since_keyframe >= config.keyframe_min_interval &&
@@ -630,15 +674,13 @@ struct VisualOdometry::Impl {
       // A live track whose landmark no longer fits usually has a poorly
       // conditioned depth from a short baseline. Drop the point and let it be
       // re-triangulated from the widest keyframe pair that saw the track.
-      for (auto track_id : outlier_ids) erase_active(landmarks.find(track_landmark.at(track_id)));
+      for (auto track_id : outlier_ids) erase_landmark(track_landmark.at(track_id));
       triangulate_new(id);
       local_bundle_adjustment();
       cull(current);
       last_pose = keyframes[id].pose;
       frames_since_keyframe = 0;
-      keyframe_landmarks = 0;
-      for (const auto& [landmark_id, landmark] : landmarks)
-        for (const auto& o : landmark.observations) keyframe_landmarks += o.keyframe == id;
+      keyframe_landmarks = sightings_in(id);
       frames.push_back({frame.frame_index, frame.timestamp_ns, segment, id, SE3{}, true, false, result.confidence});
       result.keyframe = true;
     } else {
@@ -668,7 +710,8 @@ struct VisualOdometry::Impl {
       Vec2 p;
     };
     std::vector<Candidate> candidates;
-    for (const auto& [id, landmark] : landmarks) {
+    for (auto id : local) {
+      const Landmark& landmark = landmarks.at(id);
       if (current.count(landmark.track) || static_cast<int>(landmark.descriptor.size()) != descriptor_dimension) continue;
       const Vec3 xc = pose * landmark.X;
       if (xc.z() <= 1e-6) continue;
@@ -725,38 +768,104 @@ struct VisualOdometry::Impl {
     for (const auto& [id, i] : matches) associate(id, frame.observations[i].track_id, frame, result);
   }
 
+  // Search without a pose prior: this frame's `eligible` tracks against every
+  // landmark `accept` allows, by descriptor alone (PlaceIndex::match). Returns
+  // (landmark id, observation index), by landmark id.
+  using Matches = std::vector<std::pair<std::uint64_t, int>>;
+  template <typename Accept, typename Eligible>
+  Matches place_matches(const TrackedFrame& frame, Accept accept, Eligible eligible) const {
+    Matches matches;
+    if (descriptor_dimension == 0 || descriptor_dimension != places.dimension()) return matches;
+    std::vector<float> queries;
+    std::vector<int> rows;
+    for (int i = 0; i < static_cast<int>(frame.observations.size()); ++i) {
+      if (!eligible(frame.observations[i].track_id)) continue;
+      const float* d = frame.descriptors.data() + static_cast<std::size_t>(i) * descriptor_dimension;
+      queries.insert(queries.end(), d, d + descriptor_dimension);
+      rows.push_back(i);
+    }
+    for (const auto& m : places.match(queries.data(), static_cast<int>(rows.size()), config.min_descriptor_similarity,
+                                      config.place_ratio, accept))
+      matches.emplace_back(m.id, rows[m.query]);
+    return matches;
+  }
+
+  // P3P RANSAC and refinement over 2D-3D matches without a starting pose.
+  // Returns the inlier count (0 below `needed`).
+  int fit_pose(const std::vector<PoseObservation>& all, std::uint32_t seed, int iterations, int needed, SE3& found,
+               std::vector<char>& fit) const {
+    if (static_cast<int>(all.size()) < needed) return 0;
+    if (ransac_pnp(K, all, config.recovery_threshold_px, iterations, seed, found, fit) < needed) return 0;
+    // Refine on the inliers only, twice: most descriptor matches without a
+    // prior are wrong, and a robust fit over all of them is pulled off the pose.
+    int count = 0;
+    for (int round = 0; round < 2; ++round) {
+      std::vector<PoseObservation> kept;
+      for (std::size_t i = 0; i < all.size(); ++i)
+        if (fit[i]) kept.push_back(all[i]);
+      std::vector<char> unused;
+      optimize_pose(K, kept, found, config.reprojection_threshold_px, unused);
+      count = 0;
+      for (std::size_t i = 0; i < all.size(); ++i)
+        count += fit[i] = reprojects(found, all[i].X, all[i].u, config.reprojection_threshold_px);
+      if (count < needed) return 0;
+    }
+    return count;
+  }
+
   // The live tracks do not give a pose. Search the local map around the
   // predicted pose, as wide as its uncertainty (`sigma`, pixels), among the
   // tracks without a landmark; P3P RANSAC over those matches and the live
-  // correspondences. On success the matched tracks take over their landmarks,
-  // the correspondences and `pose` describe the fit, and the inlier count is
-  // returned; otherwise 0, with nothing changed.
+  // correspondences. When that fails, the same over the descriptor matches
+  // without a pose prior to the segment's landmarks, local or not. On success
+  // the matched tracks take over their landmarks, the correspondences and
+  // `pose` describe the fit, and the inlier count is returned; otherwise 0,
+  // with nothing changed and `elsewhere` holding the prior-free matches to
+  // other segments.
   int relocalize(const TrackedFrame& frame, const std::unordered_map<std::uint64_t, Vec2>& current,
                  const SE3& predicted, double sigma, std::vector<std::uint64_t>& ids,
                  std::vector<PoseObservation>& observations, SE3& pose, std::vector<char>& inliers,
-                 OdometryFrameResult& result) {
+                 Matches& elsewhere, OdometryFrameResult& result) {
     const double radius = std::clamp(3 * sigma, config.relocalization_min_radius_px, config.relocalization_radius_px);
+    const auto unmapped = [&](std::uint64_t track) { return !track_landmark.count(track); };
     // A landmark in view may be predicted outside the image, by as much as the search is wide.
-    const auto matches = match_local(frame, predicted, radius, radius, current,
-                                     [&](std::uint64_t track) { return !track_landmark.count(track); });
-    std::vector<PoseObservation> all = observations;
-    for (const auto& [id, i] : matches)
-      all.push_back({landmarks.at(id).X, Vec2(frame.observations[i].x, frame.observations[i].y)});
-    const int needed = config.relocalization_min_inliers;
-    if (static_cast<int>(all.size()) < needed) return 0;
+    Matches matches = match_local(frame, predicted, radius, radius, current, unmapped);
+    const auto with_live = [&] {
+      std::vector<PoseObservation> all = observations;
+      for (const auto& [id, i] : matches)
+        all.push_back({landmarks.at(id).X, Vec2(frame.observations[i].x, frame.observations[i].y)});
+      return all;
+    };
+    std::vector<PoseObservation> all = with_live();
     SE3 found = predicted;
     std::vector<char> fit;
     const std::uint32_t seed = static_cast<std::uint32_t>(frame.frame_index * 2246822519U);
-    if (ransac_pnp(K, all, config.recovery_threshold_px, config.ransac_iterations, seed, found, fit) < needed) return 0;
-    const int count = optimize_pose(K, all, found, config.reprojection_threshold_px, fit);
-    if (count < needed) return 0;
+    int count = fit_pose(all, seed, config.ransac_iterations, config.relocalization_min_inliers, found, fit);
+    bool prior = true;
+    if (count == 0 && config.place_search_interval >= 0) {
+      prior = false;
+      matches.clear();
+      for (const auto& match : place_matches(frame, [&](std::uint64_t id) {
+             return !current.count(landmarks.at(id).track) || !local.count(id);
+           }, unmapped))
+        (landmarks.at(match.first).segment == segment ? matches : elsewhere).push_back(match);
+      all = with_live();
+      found = predicted;
+      count = fit_pose(all, seed + 1, config.place_ransac_iterations, config.place_min_inliers, found, fit);
+      // The evidence has to come from the descriptor matches: the live
+      // correspondences agree with any pose near the last one.
+      if (count > 0 && std::count(fit.begin() + static_cast<std::ptrdiff_t>(observations.size()), fit.end(), 1) <
+                           config.place_min_inliers)
+        count = 0;
+    }
+    if (count == 0) return 0;
     std::vector<double> offsets;  // how far the prediction was, in the image
     const std::size_t live = observations.size();
     for (std::size_t m = 0; m < matches.size(); ++m) {
       if (!fit[live + m]) continue;
       const auto& [id, i] = matches[m];
       const Vec3& X = landmarks.at(id).X;
-      offsets.push_back((K.project(predicted * X) - K.project(found * X)).norm());
+      if ((predicted * X).z() > 1e-6) offsets.push_back((K.project(predicted * X) - K.project(found * X)).norm());
       associate(id, frame.observations[i].track_id, frame, result);
       ids.push_back(frame.observations[i].track_id);
       observations.push_back(all[live + m]);
@@ -766,13 +875,172 @@ struct VisualOdometry::Impl {
     pose = found;
     result.correspondences = static_cast<int>(all.size());
     result.relocalized = true;
-    char text[200];
-    std::snprintf(text, sizeof text,
-                  "relocalized after %d coasted frames: %d inliers of %zu matches within %.0f px; prediction was off by "
-                  "%.1f px (median), sigma %.1f px",
-                  coasted, count, all.size(), radius, median(offsets), sigma);
+    char text[240];
+    if (prior)
+      std::snprintf(text, sizeof text,
+                    "relocalized after %d coasted frames: %d inliers of %zu matches within %.0f px; prediction was off "
+                    "by %.1f px (median), sigma %.1f px",
+                    coasted, count, all.size(), radius, median(offsets), sigma);
+    else
+      std::snprintf(text, sizeof text,
+                    "relocalized after %d coasted frames by descriptor, without the predicted pose: %d inliers of %zu "
+                    "matches; prediction was off by %.1f px (median), sigma %.1f px",
+                    coasted, count, all.size(), median(offsets), sigma);
     result.event = text;
+    result.place_segment = prior ? -1 : segment;
+    result.place_inliers = prior ? 0 : count;
     return count;
+  }
+
+  int sightings_in(int keyframe) const {
+    int count = 0;
+    for (auto id : local)
+      for (const auto& o : landmarks.at(id).observations) count += o.keyframe == keyframe;
+    return count;
+  }
+
+  // Tracking continues, from this frame, in the segment that most of the
+  // descriptor `matches` belong to and that gives a P3P pose (another segment
+  // than the one being tracked, or any segment when there is none). The
+  // current segment ends; the frame becomes a keyframe of the resumed one,
+  // whose local keyframes are the old keyframes that saw the landmarks found.
+  // Returns false, with nothing changed, when no segment gives a pose.
+  bool resume(const TrackedFrame& frame, const std::unordered_map<std::uint64_t, Vec2>& current,
+              const Matches& matches, OdometryFrameResult& result) {
+    std::map<int, Matches> by_segment;
+    for (const auto& match : matches) by_segment[landmarks.at(match.first).segment].push_back(match);
+    std::vector<int> order;
+    for (const auto& [id, group] : by_segment) order.push_back(id);
+    std::stable_sort(order.begin(), order.end(),
+                     [&](int l, int r) { return by_segment[l].size() > by_segment[r].size(); });
+    int target = -1, count = 0;
+    SE3 pose;
+    std::vector<char> fit;
+    std::vector<PoseObservation> all;
+    for (int id : order) {
+      all.clear();
+      for (const auto& [landmark, i] : by_segment[id])
+        all.push_back({landmarks.at(landmark).X, Vec2(frame.observations[i].x, frame.observations[i].y)});
+      const std::uint32_t seed = static_cast<std::uint32_t>(frame.frame_index * 2246822519U + 2 + id);
+      count = fit_pose(all, seed, config.place_ransac_iterations, config.place_min_inliers, pose, fit);
+      if (count > 0) { target = id; break; }
+    }
+    if (target < 0) return false;
+    const Matches& group = by_segment[target];
+    const std::size_t matched = group.size();
+
+    if (state == OdometryState::coasting) frames.resize(frames.size() - coasted);  // never confirmed
+    end_segment();
+    segment = target;
+    for (const auto& kf : keyframes)
+      if (kf.segment == segment) segment_keyframes.push_back(kf.id);
+    // Local keyframes: those with the most sightings of the landmarks found, most last.
+    std::map<int, int> sightings;
+    for (std::size_t m = 0; m < group.size(); ++m)
+      if (fit[m])
+        for (const auto& o : landmarks.at(group[m].first).observations) ++sightings[o.keyframe];
+    std::vector<std::pair<int, int>> ranked;  // (sightings, keyframe)
+    for (const auto& [keyframe, n] : sightings) ranked.emplace_back(n, keyframe);
+    std::sort(ranked.begin(), ranked.end());
+    if (ranked.size() > static_cast<std::size_t>(config.local_map_keyframes))
+      ranked.erase(ranked.begin(), ranked.end() - config.local_map_keyframes);
+    std::unordered_set<int> recent;
+    for (const auto& [n, keyframe] : ranked) {
+      local_keyframes.push_back(keyframe);
+      recent.insert(keyframe);
+    }
+    for (const auto& [id, landmark] : landmarks)
+      if (landmark.segment == segment &&
+          std::any_of(landmark.observations.begin(), landmark.observations.end(),
+                      [&](const Sighting& o) { return recent.count(o.keyframe) > 0; }))
+        local.insert(id);
+
+    std::vector<PoseObservation> observations;
+    std::vector<Vec3> points;
+    std::vector<std::uint64_t> tracks;
+    for (std::size_t m = 0; m < group.size(); ++m) {
+      if (!fit[m]) continue;
+      const auto& [id, i] = group[m];
+      associate(id, frame.observations[i].track_id, frame, result);
+      observations.push_back(all[m]);
+      points.push_back(all[m].X);
+      tracks.push_back(frame.observations[i].track_id);
+    }
+    motion.reset(pose_covariance(K, observations, pose, std::vector<char>(observations.size(), 1)), 1);
+    report_uncertainty(image_sigma(pose, motion.pose, points), result);
+    const int id = add_keyframe(frame.frame_index, pose, current);
+    for (auto track : tracks) {
+      auto& landmark = landmarks.at(track_landmark.at(track));
+      landmark.observations.push_back(sighting(id, track));
+      add_color(landmark, track, colors);
+    }
+    triangulate_new(id);
+    local_bundle_adjustment();
+    cull(current);
+    last_pose = previous_pose = keyframes[id].pose;  // no velocity yet
+    frames_since_keyframe = 0;
+    frames_since_place_search = 0;
+    keyframe_landmarks = sightings_in(id);
+    frames.push_back({frame.frame_index, frame.timestamp_ns, segment, id, SE3{}, true, false, result.confidence});
+    state = OdometryState::tracking;
+    std::sort(tracks.begin(), tracks.end());
+    result.state = state;
+    result.has_pose = true;
+    result.keyframe = true;
+    result.relocalized = true;
+    result.pose = to_pose(last_pose);
+    result.correspondences = static_cast<int>(matched);
+    result.inliers = count;
+    result.pose_inliers = tracks;
+    result.place_segment = segment;
+    result.place_inliers = count;
+    result.event = "resumed segment " + std::to_string(segment) + " by descriptor, without a pose prior: " +
+                   std::to_string(count) + " inliers of " + std::to_string(matched) + " matches";
+    return true;
+  }
+
+  // While tracking: look, without a pose prior, for landmarks outside the
+  // local map. Those of this segment that project within
+  // reassociation_radius_px of their match under the tracked pose are
+  // re-associated like local ones. A P3P pose from the others means the place
+  // was mapped before, in this segment with drift or in another segment;
+  // that is reported (place_*), not corrected.
+  void search_places(const TrackedFrame& frame, const SE3& pose,
+                     const std::unordered_set<std::uint64_t>& inlier_tracks, OdometryFrameResult& result) {
+    std::map<int, Matches> by_segment;
+    for (const auto& match : place_matches(frame, [&](std::uint64_t id) { return !local.count(id); },
+                                           [](std::uint64_t) { return true; })) {
+      const auto& [id, i] = match;
+      const auto& o = frame.observations[i];
+      const Landmark& landmark = landmarks.at(id);
+      if (landmark.segment == segment && config.reassociation_radius_px > 0 &&
+          reprojects(pose, landmark.X, Vec2(o.x, o.y), config.reassociation_radius_px)) {
+        if (!track_landmark.count(o.track_id) || inlier_tracks.count(o.track_id)) {
+          associate(id, o.track_id, frame, result);
+          ++result.place_reassociated;
+        }
+        continue;
+      }
+      by_segment[landmark.segment].push_back(match);
+    }
+    for (const auto& [id, group] : by_segment) {
+      std::vector<PoseObservation> all;
+      for (const auto& [landmark, i] : group)
+        all.push_back({landmarks.at(landmark).X, Vec2(frame.observations[i].x, frame.observations[i].y)});
+      SE3 found;
+      std::vector<char> fit;
+      const std::uint32_t seed = static_cast<std::uint32_t>(frame.frame_index * 2246822519U + 2 + id);
+      const int count = fit_pose(all, seed, config.place_ransac_iterations, config.place_min_inliers, found, fit);
+      if (count <= result.place_inliers) continue;
+      result.place_segment = id;
+      result.place_inliers = count;
+      result.place_offset_px = 0;
+      if (id != segment) continue;
+      std::vector<double> offsets;  // drift: how far the tracked pose puts these landmarks from where they are seen
+      for (std::size_t m = 0; m < all.size(); ++m)
+        if (fit[m] && (pose * all[m].X).z() > 1e-6) offsets.push_back((K.project(pose * all[m].X) - all[m].u).norm());
+      result.place_offset_px = median(offsets);
+    }
   }
 
   // No pose from the map this frame: report the motion model's prediction
@@ -815,6 +1083,8 @@ struct VisualOdometry::Impl {
       Landmark& absorbed = node.mapped();
       if (auto t = track_landmark.find(absorbed.track); t != track_landmark.end() && t->second == other)
         track_landmark.erase(t);
+      local.erase(other);
+      places.erase(other);
       Landmark& survivor = landmarks.at(kept);
       for (const auto& o : absorbed.observations)
         if (std::none_of(survivor.observations.begin(), survivor.observations.end(),
@@ -832,18 +1102,19 @@ struct VisualOdometry::Impl {
       track_landmark.erase(it);
     landmark.track = track;
     landmark.last_frame = frame.frame_index;
-    update_descriptor(landmark);
+    update_descriptor(kept, landmark);
     track_landmark[track] = kept;
+    local.insert(kept);
     ++result.reassociated;
   }
 
-  // The segment ends: its landmarks are retired and a new segment initializes
-  // from this frame.
+  // The segment ends (its landmarks stay in the map) and a new segment
+  // initializes from this frame.
   void lose(const TrackedFrame& frame, OdometryFrameResult& result, const std::string& why) {
     state = OdometryState::initializing;
     result.state = OdometryState::lost;
     result.event = why;
-    clear_segment();
+    end_segment();
     segment = next_segment++;
     reference = frame;
   }
@@ -852,12 +1123,13 @@ struct VisualOdometry::Impl {
     const int id = static_cast<int>(keyframes.size());
     keyframes.push_back({id, frame_index, segment, pose, std::move(observations)});
     segment_keyframes.push_back(id);
+    local_keyframes.push_back(id);
     return id;
   }
 
   std::vector<int> window() const {
-    const int count = std::min<int>(config.window_keyframes, static_cast<int>(segment_keyframes.size()));
-    return {segment_keyframes.end() - count, segment_keyframes.end()};
+    const int count = std::min<int>(config.window_keyframes, static_cast<int>(local_keyframes.size()));
+    return {local_keyframes.end() - count, local_keyframes.end()};
   }
 
   void triangulate_new(int id) {
@@ -887,7 +1159,7 @@ struct VisualOdometry::Impl {
           if (seen != keyframes[k].observations.end() && reprojects(keyframes[k].pose, X, seen->second, threshold))
             landmark.observations.push_back(sighting(k, track_id));
         }
-        if (landmark.observations.size() >= 2) add_active(std::move(landmark));
+        if (landmark.observations.size() >= 2) add_landmark(std::move(landmark));
         break;
       }
     }
@@ -906,9 +1178,9 @@ struct VisualOdometry::Impl {
       problem.fixed.push_back(c == 0 || (c == 1 && active.size() >= 3));
     }
     std::vector<std::uint64_t> point_ids;
-    for (const auto& [id, landmark] : landmarks) {
+    for (auto id : local) {
       int seen = 0;
-      for (const auto& o : landmark.observations) seen += camera_of.count(o.keyframe) > 0;
+      for (const auto& o : landmarks.at(id).observations) seen += camera_of.count(o.keyframe) > 0;
       if (seen >= 2) point_ids.push_back(id);
     }
     std::sort(point_ids.begin(), point_ids.end());
@@ -925,30 +1197,29 @@ struct VisualOdometry::Impl {
     for (std::size_t p = 0; p < point_ids.size(); ++p) landmarks.at(point_ids[p]).X = problem.points[p];
   }
 
-  // Drop observations that no longer reproject and points left with fewer
-  // than two; retire points that left the local map (no live track, no
-  // sighting in the last local_map_keyframes keyframes).
+  // Over the local map: drop observations that no longer reproject and points
+  // left with fewer than two; points with no live track and no sighting in
+  // the last local_map_keyframes local keyframes leave the local map (they
+  // stay in the map).
   void cull(const std::unordered_map<std::uint64_t, Vec2>& current) {
-    const std::size_t local = std::min<std::size_t>(config.local_map_keyframes, segment_keyframes.size());
-    const int oldest_local = segment_keyframes[segment_keyframes.size() - local];  // ids increase in a segment
-    std::vector<std::uint64_t> ended;
-    for (auto it = landmarks.begin(); it != landmarks.end();) {
-      auto& obs = it->second.observations;
+    const std::size_t count = std::min<std::size_t>(config.local_map_keyframes, local_keyframes.size());
+    const std::unordered_set<int> recent(local_keyframes.end() - static_cast<std::ptrdiff_t>(count),
+                                         local_keyframes.end());
+    for (auto id : sorted_local()) {
+      Landmark& landmark = landmarks.at(id);
+      auto& obs = landmark.observations;
       obs.erase(std::remove_if(obs.begin(), obs.end(), [&](const Sighting& o) {
-        return !reprojects(keyframes[o.keyframe].pose, it->second.X, o.u, 2 * config.reprojection_threshold_px);
+        return !reprojects(keyframes[o.keyframe].pose, landmark.X, o.u, 2 * config.reprojection_threshold_px);
       }), obs.end());
-      const bool seen = !obs.empty() && obs.back().keyframe >= oldest_local;  // sightings sorted by keyframe
-      const bool ended_here = !current.count(it->second.track) && !seen;
-      const bool enough = obs.size() >= 2;
-      if (enough && ended_here) ended.push_back(it->first);
-      if (!enough) it = erase_active(it);
-      else ++it;
-    }
-    std::sort(ended.begin(), ended.end());
-    for (auto id : ended) {
-      auto it = landmarks.find(id);
-      retired.push_back(map_point(id, it->second));
-      erase_active(it);
+      if (obs.size() < 2) {
+        erase_landmark(id);
+        continue;
+      }
+      const bool seen = std::any_of(obs.begin(), obs.end(), [&](const Sighting& o) { return recent.count(o.keyframe) > 0; });
+      if (seen || current.count(landmark.track)) continue;
+      if (auto t = track_landmark.find(landmark.track); t != track_landmark.end() && t->second == id)
+        track_landmark.erase(t);
+      local.erase(id);
     }
   }
 };
@@ -989,26 +1260,46 @@ std::size_t VisualOdometry::stable_prefix() const {
   const auto window = impl_->window();
   if (window.empty()) return frames.size();
   // Reference keyframe ids are non-decreasing along the frame records.
+  const int oldest = *std::min_element(window.begin(), window.end());
   std::size_t prefix = frames.size();
-  while (prefix > 0 && frames[prefix - 1].keyframe >= window.front()) --prefix;
+  while (prefix > 0 && frames[prefix - 1].keyframe >= oldest) --prefix;
   return prefix;
 }
 
 std::size_t VisualOdometry::trajectory_size() const { return impl_->frames.size(); }
 
-std::vector<MapPoint> VisualOdometry::active_map() const {
+std::vector<MapPoint> VisualOdometry::map() const {
   std::vector<MapPoint> points;
   points.reserve(impl_->landmarks.size());
   for (const auto& [id, landmark] : impl_->landmarks) points.push_back(impl_->map_point(id, landmark));
+  std::sort(points.begin(), points.end(),
+            [](const MapPoint& l, const MapPoint& r) { return l.landmark_id < r.landmark_id; });
   return points;
 }
-std::size_t VisualOdometry::retired_count() const { return impl_->retired.size(); }
-std::vector<MapPoint> VisualOdometry::retired_map(std::size_t first) const {
-  const auto& retired = impl_->retired;
-  if (first >= retired.size()) return {};
-  return {retired.begin() + static_cast<std::ptrdiff_t>(first), retired.end()};
+std::size_t VisualOdometry::map_size() const { return impl_->landmarks.size(); }
+std::vector<LandmarkObservation> VisualOdometry::landmark_observations() const {
+  std::vector<LandmarkObservation> observations;
+  for (const auto& [id, landmark] : impl_->landmarks)
+    for (const auto& o : landmark.observations)
+      observations.push_back({id, impl_->keyframes[o.keyframe].frame_index});
+  std::sort(observations.begin(), observations.end(), [](const LandmarkObservation& l, const LandmarkObservation& r) {
+    return l.landmark_id != r.landmark_id ? l.landmark_id < r.landmark_id : l.frame_index < r.frame_index;
+  });
+  return observations;
 }
 bool VisualOdometry::has_landmark(std::uint64_t track_id) const { return impl_->track_landmark.count(track_id) > 0; }
+std::vector<TrackedLandmark> VisualOdometry::tracked_landmarks() const {
+  std::vector<TrackedLandmark> tracked;
+  tracked.reserve(impl_->track_landmark.size());
+  for (const auto& [track, id] : impl_->track_landmark) {
+    const auto& landmark = impl_->landmarks.at(id);
+    tracked.push_back({track, id, {float(landmark.X.x()), float(landmark.X.y()), float(landmark.X.z())},
+                       landmark.first_frame});
+  }
+  std::sort(tracked.begin(), tracked.end(),
+            [](const TrackedLandmark& l, const TrackedLandmark& r) { return l.track_id < r.track_id; });
+  return tracked;
+}
 const OdometryFrameResult& VisualOdometry::last() const { return impl_->last; }
 const VisualOdometryConfig& VisualOdometry::config() const { return impl_->config; }
 }  // namespace slam_native

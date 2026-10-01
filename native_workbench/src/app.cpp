@@ -731,11 +731,10 @@ struct Session {
     runtime.landmark_ids = features.landmark_ids;
     {
       std::unordered_map<std::uint64_t, std::uint64_t> first_frames;  // by track
-      for (const auto& p : trajectory_view.active_map()) first_frames.emplace(p.track_id, p.first_frame);
+      for (const auto& t : odometry->tracked_landmarks()) first_frames.emplace(t.track_id, t.first_frame);
       runtime.landmark_first_frames.assign(runtime.landmark_ids.size(), Runtime::kNoLandmark);
       for (std::size_t i = 0; i < runtime.landmark_ids.size(); ++i)
-        if (auto it = first_frames.find(runtime.landmark_ids[i]);
-            it != first_frames.end() && odometry->has_landmark(runtime.landmark_ids[i]))
+        if (auto it = first_frames.find(runtime.landmark_ids[i]); it != first_frames.end())
           runtime.landmark_first_frames[i] = it->second;
     }
     runtime.corrections = features.correction_distances;

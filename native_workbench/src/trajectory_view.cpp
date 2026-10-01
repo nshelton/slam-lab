@@ -42,9 +42,8 @@ ImU32 segment_color(int segment, int alpha = 255) {
 
 void TrajectoryView::reset() {
   samples_.clear();
-  retired_.clear();
-  active_.clear();
-  points_renderer_.clear();
+  local_.clear();
+  outside_.clear();
 }
 
 void TrajectoryView::update(const VisualOdometry& odometry) {
@@ -53,13 +52,9 @@ void TrajectoryView::update(const VisualOdometry& odometry) {
   samples_.resize(std::min(samples_.size(), stable));
   auto tail = odometry.trajectory(samples_.size());
   samples_.insert(samples_.end(), tail.begin(), tail.end());
-  if (odometry.retired_count() < retired_.size()) {  // odometry was reset
-    retired_.clear();
-    points_renderer_.clear();
-  }
-  auto fresh = odometry.retired_map(retired_.size());
-  retired_.insert(retired_.end(), fresh.begin(), fresh.end());
-  active_ = odometry.active_map();
+  local_.clear();
+  outside_.clear();
+  for (auto& point : odometry.map()) (point.local ? local_ : outside_).push_back(point);
 }
 
 void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_width, int frame_height) {
@@ -78,9 +73,9 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
   ImGui::SameLine();
   ImGui::Text("segment %d  |  %.1f ms", last.segment, last.ms);
   ImGui::Text("Inliers %d / %d  |  keyframes %zu", last.inliers, last.correspondences, last.keyframes);
-  // Active: the odometry's live landmarks (still refined); retired: final
-  // positions kept for display. Their sum is what the view can draw.
-  ImGui::Text("Map: %zu active, %zu retired", active_.size(), retired_.size());
+  // Local: the landmarks the odometry tracks and refines now; the rest are
+  // kept and can be found again by descriptor.
+  ImGui::Text("Map: %zu landmarks, %zu in the local map", local_.size() + outside_.size(), local_.size());
   if (last.has_pose && !last.predicted) ImGui::Text("Median reprojection %.2f px", last.median_reprojection_px);
   if (last.has_pose) ImGui::Text("Pose confidence %.2f  (sigma %.1f px)", last.confidence, last.pose_sigma_px);
   ImGui::PushTextWrapPos(0);
@@ -98,9 +93,10 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
   }
   ImGui::Checkbox("Map points", &show_points_);
   ImGui::SameLine();
-  ImGui::Checkbox("Retired", &show_retired_);
+  ImGui::Checkbox("Not local", &show_outside_);
   if (ImGui::IsItemHovered())
-    ImGui::SetTooltip("Landmarks whose tracks ended; no longer refined. Active points are brighter.");
+    ImGui::SetTooltip("Landmarks outside the local map: no live track and not seen by the recent keyframes.\n"
+                      "They stay in the map and are found again by descriptor. Local points are brighter.");
   ImGui::SameLine();
   ImGui::Checkbox("Follow", &follow_);
   ImGui::SameLine();
@@ -121,9 +117,9 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
     ImGui::SliderFloat("Point size", &point_size_, 0.001F, 0.2F, "%.3f", ImGuiSliderFlags_Logarithmic);
     if (ImGui::IsItemHovered())
       ImGui::SetTooltip("World-space diameter; 1 = the first keyframe's median scene depth.");
-    if (show_retired_) {
+    if (show_outside_) {
       ImGui::SameLine();
-      ImGui::Checkbox("Dim retired", &dim_retired_);
+      ImGui::Checkbox("Dim not local", &dim_outside_);
     }
     if (color_mode_ == 2) {
       ImGui::SetNextItemWidth(110);
@@ -295,11 +291,11 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
     const int only = all_segments_ ? -1 : segment;
     const auto color = static_cast<PointColor>(color_mode_);
     const auto now = static_cast<float>(current->frame_index);
-    const PointCloudStyle retired{point_size_, dim_retired_ ? 0.6F : 1.0F, color, only, now, age_span_};
-    const PointCloudStyle active{point_size_, 1.0F, color, only, now, age_span_};
+    const PointCloudStyle outside{point_size_, dim_outside_ ? 0.6F : 1.0F, color, only, now, age_span_};
+    const PointCloudStyle local{point_size_, 1.0F, color, only, now, age_span_};
     points_renderer_.render(draw, {origin.x, origin.y}, {origin.x + size.x, origin.y + size.y},
-                            io.DisplayFramebufferScale.x, camera, show_retired_ ? &retired_ : nullptr, retired,
-                            &active_, active);
+                            io.DisplayFramebufferScale.x, camera, show_outside_ ? &outside_ : nullptr, outside,
+                            &local_, local);
   }
   const TrajectorySample* previous = nullptr;
   for (const auto& s : samples_) {

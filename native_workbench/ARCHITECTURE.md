@@ -28,10 +28,11 @@ NVDEC frame (native orientation, source px, lens-distorted)
   VisualOdometry (CPU, UI thread; src/visual_odometry.cpp)
     undistort (k1) → init (E/H RANSAC) → per-frame pose (Huber LM from constant velocity
     / constant position; P3P RANSAC recovery) → keyframes (incl. emergency): triangulate,
-    sliding-window BA (8 KF), cull → retire landmarks; no pose → coast on the motion
-    model + relocalize in the local map; coasting runs out → new segment
+    sliding-window BA (8 KF), cull (landmarks leave the local map, never the map); no pose →
+    coast on the motion model + relocalize in the local map, then by descriptor over the whole
+    map (PlaceIndex) → resume that segment; nothing found → new segment
             ▼
-  OdometryFrameResult (pose, covariance, confidence, inlier/outlier track IDs), trajectory, active + retired map
+  OdometryFrameResult (pose, covariance, confidence, inlier/outlier track IDs), trajectory, map
             ▼
   TrajectoryView (ImGui 3D + instanced GL map points), video overlay (pose-inlier view), CSV exports
 ```
@@ -111,17 +112,28 @@ In `VisualOdometry::Impl` (`src/visual_odometry.cpp`):
   motion model below.
 - At a keyframe, outlier landmarks are **deleted** (`landmarks.erase`,
   they're usually short-baseline depths and get re-triangulated).
-- `cull()`: observations that fail 2× the reprojection threshold are
-  dropped; a landmark with < 2 observations is **deleted**; a landmark whose
-  track is gone and which no window keyframe observes is **retired**
-  (appended to `retired`, final, never refined again).
+- **Nothing is retired** (since 2026-10-01). `landmarks` holds every landmark
+  of the run, all segments, with its sightings and latest descriptor. The
+  **local map** (`local`, a set of ids) is the part being tracked: the current
+  segment's landmarks that a live track observes or that one of the last
+  `local_map_keyframes` local keyframes saw. Only the local map is projected
+  into frames, re-associated at a pose and bundle-adjusted, so the per-frame
+  cost does not grow with the map.
+- `cull()` (local map only): observations that fail 2× the reprojection
+  threshold are dropped; a landmark with < 2 observations is **deleted**; a
+  landmark whose track is gone and which no local keyframe observes **leaves
+  the local map** and stays in the map, where the search without a pose prior
+  finds it again (below).
 - When coasting runs out (`lose()`), and on resolution change,
-  `clear_segment()` retires the segment's landmarks. The next segment starts
-  from the current frame with a new frame and scale.
+  `end_segment()` empties the local map; the segment's landmarks stay. The
+  next segment starts from the current frame with a new frame and scale,
+  unless an earlier segment is found first (`resume()`).
 - `MapPoint` (public) carries: track ID, position, mean RGB of keyframe
-  observations, segment, keyframe count, first/last frame.
-  `active_map()`, `retired_map(first)`, `retired_count()`;
-  `write_map_csv()` exports both.
+  observations, segment, keyframe count, first/last frame, `local`.
+  `map()` returns every landmark by id, `landmark_observations()` the
+  keyframes that observe each, `tracked_landmarks()` the few hundred tracks
+  that observe a landmark now (for per-frame use); `write_map_csv()` exports
+  the map.
 
 ### Camera motion model, pose uncertainty, coasting and relocalization
 
@@ -172,8 +184,75 @@ Added 2026-10-01 (`track()`, `relocalize()`, `coast()` in
   acceleration (the synthetic occlusion test: 14.8 px off at σ = 4.3 px after
   20 frames; the 16 px floor covers it).
 
+### Search without a pose prior (place recognition)
+
+Added 2026-10-01 (`src/place_index.*`; `place_matches()`, `resume()`,
+`search_places()` and the second half of `relocalize()` in
+`src/visual_odometry.cpp`).
+
+- **`PlaceIndex`** holds the latest descriptor of every landmark (updated
+  whenever its track is a pose inlier). `match()` is brute force and exact:
+  queries × entries cosine in blocks of 2,048 entries on up to 8 threads,
+  mutual best, cosine ≥ `min_descriptor_similarity`, cosine distance ≤
+  `place_ratio` × the runner-up's. It is the seam for an approximate index or
+  a different descriptor.
+- **A pose from matches alone**: P3P RANSAC (`place_ransac_iterations`, 4 px)
+  per segment, most matches first, refined by `optimize_pose` on the RANSAC
+  inliers only (over all matches the robust fit is pulled off: 95 raw inliers
+  became 48); accepted with ≥ `place_min_inliers` (20). On fr1_room the
+  count is 3–7 where the place is new and 14–95 on the revisit.
+- **Frame without a pose from its tracks** (`track()` → `relocalize()`): the
+  search around the predicted pose runs first, as before. When it fails, the
+  frame's tracks without a landmark are matched against the whole map. A pose
+  in the current segment relocalizes as the prior-gated search does, but the
+  ≥ 20 inliers must be descriptor matches: the live correspondences agree with
+  any pose near the last one (fr1_room frame 848 passed with 22 inliers
+  counting them, kept one segment and doubled the ATE). A pose in another
+  segment ends the current one and calls `resume()`.
+- **While a new segment initializes** (`initialize()`): the same search on
+  every frame, over all landmarks; a pose resumes that segment instead of
+  starting another.
+- **`resume()`**: the frame becomes a keyframe of the old segment. The local
+  keyframes become the old keyframes with the most sightings of the landmarks
+  found (up to `local_map_keyframes`, most last), so the bundle-adjustment
+  window ties the new keyframe to keyframes that share landmarks with it, and
+  the local map is what those keyframes saw. The matched tracks take over
+  their landmarks; the motion model restarts with zero velocity.
+- **While tracking** (`search_places()`, every `place_search_interval`
+  frames): all tracks against the landmarks outside the local map. Matches in
+  this segment that project within `reassociation_radius_px` of the track
+  under the tracked pose are re-associated like local ones
+  (`place_reassociated`). A P3P pose from the remaining matches means the
+  place was mapped before, in this segment with drift or in another segment.
+  It is reported (`place_segment`, `place_inliers`, `place_offset_px`) and
+  **not corrected**: that needs a pose graph or a wider bundle adjustment,
+  and segment merging (next step).
+
+Measured 2026-10-01 (TUM + dreamworks, three start frames each, against
+`baselines/v4`; scratch run, not yet a saved baseline):
+
+- With the search off (`place-interval -1`) the trajectories are byte-identical
+  to v4 in all 12 runs compared, and the VO costs the same: keeping every
+  landmark is free.
+- TUM ATE is unchanged within the spread (fr3 5.3 ± 2.4 → 6.0 ± 1.4 cm,
+  fr1_xyz 1.7 → 1.8, the others equal): nothing is corrected yet.
+- dreamworks from frame 300: 2 segments → 1. The loss at frame 675 is now a
+  relocalization at 679 by descriptor (25 inliers of 86 matches). The
+  relocalizations after the columns come 2 frames earlier (571 instead of 573).
+- Landmarks re-associated from outside the local map: 0–51 per run (most on
+  fr1_xyz and fr3). Drift is usually above the 2 px gate.
+- Revisits found while tracking: fr1_room 7 (segment 0 seen from segment 1),
+  fr3 2–13, fr2_desk 0–9, fr1_xyz 5–11, at a median 7–114 px from where the
+  tracked pose puts those landmarks. That offset is the drift a correction
+  step would remove.
+- Cost: one search is about 50 ms at 20,000 landmarks (800 queries, 8
+  threads). The VO goes from 2.1 to 3.5 ms/frame on TUM, with a 30–100 ms
+  frame every `place_search_interval` frames on the UI thread.
+
 Not done:
 
+- **Loop correction and segment merging.** `search_places()` finds revisits
+  and reports them; nothing moves the old keyframes or joins two segments.
 - **Feeding the pose back to the tracker.** For tracks with landmarks, the
   predicted pose gives a predicted pixel (`K.project(T_pred * X)`, then
   *distort* with k1, since the tracker works in distorted pixels). The
@@ -182,10 +261,8 @@ Not done:
   usually better than a pose prediction, so treat the pose as a fallback.
 - **Outlier feedback.** The tracker never learns that the VO rejected a
   track (`pose_outliers`).
-- **A search without a pose prior** (place recognition) for when coasting
-  runs out, and loop closure.
-- Threading: the VO and keyframe BA (≈10–12 ms) run synchronously on the UI
-  thread; the lens estimator shows the worker pattern
+- Threading: the VO, keyframe BA (≈10–12 ms) and the place search (≈50 ms
+  every 30 frames) run synchronously on the UI thread; the lens estimator shows the worker pattern
   (`BackgroundFocalEstimator`).
 
 ### Lens model
@@ -245,14 +322,16 @@ ORB-SLAM3 is the independent reference (`scripts/run_orbslam3.sh`); on
 
 - `slam-native-focal`: FOV + k1 estimate from a tracks CSV.
 - Bench keys: `flow-sigma`, `det-sigma`, `hfov`, `k1`, `fx fy cx cy`,
-  `kf-min`, `kf-max`, `kf-emergency-ratio`, `window`, `export-map`,
+  `kf-min`, `kf-max`, `kf-emergency-ratio`, `window`, `place-interval`,
+  `place-ratio`, `place-inliers`, `export-map`,
   `export-features PATH` (raw detections + descriptors in the feature-cache
   format).
 - Tracks CSV: `frame_index,timestamp_ns,track_id,x,y[,r,g,b]`. Map CSV:
-  `track_id,segment,x,y,z,r,g,b,has_color,keyframe_observations,first_frame,last_frame,retired,landmark_id`
+  `track_id,segment,x,y,z,r,g,b,has_color,keyframe_observations,first_frame,last_frame,local,landmark_id`
   (`track_io.hpp`).
 - CTest: `native_focal_estimation` (synthetic FOV/k1 recovery, background
-  worker parity), retired-map + colour check and P3P checks (exact
+  worker parity), map + colour check, segment resume without a pose prior,
+  re-association outside the local map and P3P checks (exact
   recovery, RANSAC with 60% outliers) in `native_visual_odometry`, Kalman
   fusion and per-track descriptor checks in `native_gpu_flow_tracker`.
 
@@ -450,9 +529,8 @@ centre plus camera→world quaternion).
    - Run a sliding-window bundle adjustment over the last 8 keyframes: Schur
      complement, Levenberg–Marquardt, Huber loss; the two oldest keyframes
      are fixed to hold the gauge and scale.
-   - Cull points with bad observations. Points that can never be observed
-     again are retired into the persistent map (since 2026-09-30; they
-     used to be deleted, so the map only showed the last second or two).
+   - Cull points with bad observations. Points no longer observed leave the
+     local map but stay in the map (see "Search without a pose prior").
 4. Per-frame poses are stored relative to their keyframe, so the displayed
    trajectory follows bundle-adjustment corrections.
    `stable_prefix()` lets the viewer refresh only the part that can still
@@ -500,8 +578,8 @@ live FOV/k1 estimator; the 60° default was far off for `disney_04`
 by *Trajectory* in the Pipeline panel) shows:
 - state, inliers, map size, keyframes and timing;
 - the current segment's path (keyframes as squares), the current camera
-  frustum and the active map points;
-- active and retired map points (retired optionally dimmed), coloured plain,
+  frustum and the map points;
+- map points in and outside the local map (*Not local*, optionally dimmed), coloured plain,
   by image colour or by age (frames since the landmark's first keyframe:
   yellow new, blue at the *Age span* slider's value or older), a grid on the
   X–Z plane at the first keyframe's height (monocular VO knows no floor);
@@ -510,7 +588,7 @@ by *Trajectory* in the Pipeline panel) shows:
   MSAA, depth-tested offscreen target, composited between the grid and the
   path/frustum overlays. The shader applies the display rotation, segment
   filter and world-space size (slider; segment units, ≥ ~1 px), so
-  retired points are uploaded once (append-only) and active points each frame;
+  both sets are uploaded each frame;
 - orbit (perspective, fixed 50° lens), top (X–Z), side and front
   (orthographic) views. The orbit pivot and radius come from the 3D
   trajectory, so orbiting is a true sphere (the old fit used the projected

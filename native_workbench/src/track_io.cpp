@@ -99,17 +99,13 @@ void write_trajectory_csv(std::ostream& out, const std::vector<TrajectorySample>
 }
 
 void write_map_csv(std::ostream& out, const VisualOdometry& odometry) {
-  out << "track_id,segment,x,y,z,r,g,b,has_color,keyframe_observations,first_frame,last_frame,retired,"
+  out << "track_id,segment,x,y,z,r,g,b,has_color,keyframe_observations,first_frame,last_frame,local,"
          "landmark_id\n"
       << std::setprecision(9);
-  const auto write = [&](const std::vector<MapPoint>& points, int retired) {
-    for (const auto& p : points)
-      out << p.track_id << ',' << p.segment << ',' << p.position[0] << ',' << p.position[1] << ',' << p.position[2]
-          << ',' << int(p.color[0]) << ',' << int(p.color[1]) << ',' << int(p.color[2]) << ',' << int(p.has_color)
-          << ',' << p.keyframe_observations << ',' << p.first_frame << ',' << p.last_frame << ',' << retired << ','
-          << p.landmark_id << '\n';
-  };
-  write(odometry.retired_map(), 1);
-  write(odometry.active_map(), 0);
+  for (const auto& p : odometry.map())
+    out << p.track_id << ',' << p.segment << ',' << p.position[0] << ',' << p.position[1] << ',' << p.position[2]
+        << ',' << int(p.color[0]) << ',' << int(p.color[1]) << ',' << int(p.color[2]) << ',' << int(p.has_color)
+        << ',' << p.keyframe_observations << ',' << p.first_frame << ',' << p.last_frame << ',' << int(p.local) << ','
+        << p.landmark_id << '\n';
 }
 }  // namespace slam_native

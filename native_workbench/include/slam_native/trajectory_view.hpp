@@ -18,8 +18,6 @@ class TrajectoryView {
   // samples that can still change are re-read).
   void update(const VisualOdometry& odometry);
   void reset();
-  // The odometry's active map as of the last update().
-  [[nodiscard]] const std::vector<MapPoint>& active_map() const { return active_; }
   // Clockwise display rotation of the video (degrees): the view's "up"
   // follows the upright image rather than the sensor's y axis.
   void set_display_rotation(int degrees) { rotation_ = degrees; }
@@ -28,8 +26,10 @@ class TrajectoryView {
 
  private:
   std::vector<TrajectorySample> samples_;
-  std::vector<MapPoint> retired_;  // append-only copy of the odometry's retired map
-  std::vector<MapPoint> active_;
+  // The odometry's map as of the last update(): the landmarks in its local
+  // map (tracked and refined now) and the rest (kept; found again by descriptor).
+  std::vector<MapPoint> local_;
+  std::vector<MapPoint> outside_;
   PointCloudRenderer points_renderer_;
   int mode_{0};           // 0 orbit, 1 top, 2 side, 3 front
   float yaw_{-0.6F};
@@ -40,10 +40,10 @@ class TrajectoryView {
   double last_interaction_{-1e9};    // ImGui time of the last wheel/drag (trackball fade)
   bool follow_{false};
   bool show_points_{true};
-  bool show_retired_{true};
+  bool show_outside_{true};
   int color_mode_{1};            // PointColor: 0 plain, 1 image, 2 age
   float age_span_{300.0F};       // colour by age: frames from new to the ramp's end
-  bool dim_retired_{true};
+  bool dim_outside_{true};
   // World-space diameter of the map points. Segment units: the first
   // keyframe's median scene depth is 1.
   float point_size_{0.02F};

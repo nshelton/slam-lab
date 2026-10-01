@@ -37,7 +37,7 @@ enum class PointColor { plain, image, age };
 
 struct PointCloudStyle {
   float size{0.01F};   // world-space diameter (segment units)
-  float brightness{1};  // multiplies the colour (retired points are dimmer)
+  float brightness{1};  // multiplies the colour (points outside the local map are dimmer)
   PointColor color{PointColor::image};  // image: falls back to plain without a colour
   int segment{-1};      // only this segment's points; < 0 draws all
   float current_frame{};  // PointColor::age: the frame ages are counted from
@@ -73,21 +73,18 @@ class PointCloudRenderer {
   PointCloudRenderer(const PointCloudRenderer&) = delete;
   PointCloudRenderer& operator=(const PointCloudRenderer&) = delete;
 
-  // Forget uploaded points (the owner's retired map was reset). No GL calls.
-  void clear() { retired_.uploaded = 0; }
-
   // Renders both point sets over the screen rectangle [min, max] (logical
   // pixels; the target has pixel_scale x as many) and adds the image to
   // `draw`: anything added before it is behind the points, anything after in
-  // front. `retired` is append-only: only its new tail is uploaded. `active`
-  // is re-uploaded every call. Null sets are skipped.
+  // front. Each set (map points outside and in the local map) has its own
+  // style and is re-uploaded every call. Null sets are skipped.
   // `clouds` (optional): dense clouds, depth-tested with the map points;
   // cloud_point_pixels is their sprite size. A changed cloud_generation drops
   // all uploaded clouds first (the owner removed some).
   void render(ImDrawList* draw, std::array<float, 2> min, std::array<float, 2> max, float pixel_scale,
-              const PointCloudCamera& camera, const std::vector<MapPoint>* retired,
-              const PointCloudStyle& retired_style, const std::vector<MapPoint>* active,
-              const PointCloudStyle& active_style, const std::vector<DenseCloudDraw>* clouds = nullptr,
+              const PointCloudCamera& camera, const std::vector<MapPoint>* outside,
+              const PointCloudStyle& outside_style, const std::vector<MapPoint>* local,
+              const PointCloudStyle& local_style, const std::vector<DenseCloudDraw>* clouds = nullptr,
               float cloud_point_pixels = 2.0F, std::uint64_t cloud_generation = 0);
 
  private:
@@ -106,10 +103,10 @@ class PointCloudRenderer {
   void draw_clouds(const std::vector<DenseCloudDraw>& clouds, const PointCloudCamera& camera, float logical_width,
                    float logical_height, float point_pixels, std::uint64_t generation);
   void ensure_target(int width, int height);
-  void upload(InstanceSet& set, const std::vector<MapPoint>& points, bool incremental);
+  void upload(InstanceSet& set, const std::vector<MapPoint>& points);
   void draw_set(const InstanceSet& set, const PointCloudStyle& style);
 
-  InstanceSet retired_, active_;
+  InstanceSet outside_, local_;
   bool gl_ready_{}, gl_failed_{};
   unsigned int program_{}, mesh_{};
   int u_pivot_{-1}, u_right_{-1}, u_up_{-1}, u_toward_{-1}, u_eye_distance_{-1}, u_perspective_{-1},

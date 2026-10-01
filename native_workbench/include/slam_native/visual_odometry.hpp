@@ -106,9 +106,11 @@ struct VisualOdometryConfig {
   int window_keyframes{8};
   int bundle_iterations{8};
 
-  // Local map and re-association. A landmark stays in the local map while one
-  // of the segment's last local_map_keyframes keyframes saw it, whether or not
-  // a track still observes it; then it is retired. Each tracked frame, local
+  // Local map and re-association. Landmarks are never removed for being old:
+  // the map keeps every landmark of the run. A landmark is in the local map
+  // while a live track observes it or one of the last local_map_keyframes
+  // keyframes saw it; only the local map is projected into frames and
+  // bundle-adjusted. Each tracked frame, local
   // landmarks without a live track that project into view are matched to this
   // frame's tracks within reassociation_radius_px by descriptor (mutual best,
   // cosine >= min_descriptor_similarity). A matched track without a landmark
@@ -136,6 +138,31 @@ struct VisualOdometryConfig {
   double relocalization_radius_px{256.0};
   int relocalization_min_inliers{30};
 
+  // Search without a pose prior. The frame's tracks are matched to landmarks
+  // by descriptor alone, over the whole map (mutual best, cosine >=
+  // min_descriptor_similarity, cosine distance <= place_ratio x the
+  // runner-up's), then P3P RANSAC (place_ransac_iterations) refined on its
+  // inliers, which needs place_min_inliers. Measured on fr1_room, 30
+  // searches before the camera returns to the start and 12 after: 3-7
+  // inliers when the place is new, 14-95 on the revisit (20 or more in 9 of
+  // the 12). It runs
+  // - on a frame without a pose from its tracks: after the search around the
+  //   predicted pose fails, and on every frame while a new segment
+  //   initializes. A pose in the current segment resumes it as above (the
+  //   inliers counted are the descriptor matches, not the live tracks); a pose
+  //   in another segment ends the current one and resumes that one (the frame
+  //   becomes a keyframe tied to the old keyframes that saw those landmarks);
+  // - every place_search_interval frames while tracking, over the landmarks
+  //   outside the local map. Those of this segment that project within
+  //   reassociation_radius_px of their match are re-associated like local
+  //   ones. A pose from the rest is a revisit with drift, or another segment's
+  //   place: reported (OdometryFrameResult::place_*), not corrected yet.
+  // 0: only without a pose; < 0: never.
+  int place_search_interval{30};
+  double place_ratio{0.9};
+  int place_ransac_iterations{1000};
+  int place_min_inliers{20};
+
   void validate() const;
 };
 
@@ -159,7 +186,15 @@ struct OdometryFrameResult {
   int reassociated{};        // landmarks taken over by a new track this frame
   int merged{};              // of those, duplicates folded into the older landmark
   bool predicted{};          // coasting: the pose is the motion model's prediction
-  bool relocalized{};        // the local map was found again by descriptor search
+  bool relocalized{};        // the map was found again by descriptor search
+  // Search without a pose prior (see place_search_interval), when it gave a
+  // P3P pose: the segment of the landmarks found (-1: none), its inliers, and
+  // while tracking in that same segment the median distance in the image
+  // between those landmarks under the tracked pose and their matches (drift).
+  int place_segment{-1};
+  int place_inliers{};
+  double place_offset_px{};
+  int place_reassociated{};  // of `reassociated`: landmarks from outside the local map, found by that search
   // Pose uncertainty, when has_pose. The error is the perturbation delta =
   // (omega, v) with T_true = exp(delta) * T: omega (radians) rotates about the
   // camera centre, v (map units) moves the camera, both in camera axes.
@@ -180,7 +215,8 @@ struct OdometryFrameResult {
 };
 
 // A triangulated landmark. Landmark IDs are unique per run; track_id is the
-// latest track that observed it (several can over its life).
+// latest track that observed it (several can over its life). Landmarks stay
+// in the map for the whole run; `local` ones are being tracked and refined.
 struct MapPoint {
   std::uint64_t landmark_id{};
   std::uint64_t track_id{};
@@ -191,6 +227,20 @@ struct MapPoint {
   int keyframe_observations{};
   std::uint64_t first_frame{};  // first keyframe that observed it
   std::uint64_t last_frame{};   // last frame it was an inlier (or keyframe observation)
+  bool local{};                 // in the local map (see local_map_keyframes)
+};
+
+// A track and the landmark it observes now.
+struct TrackedLandmark {
+  std::uint64_t track_id{};
+  std::uint64_t landmark_id{};
+  std::array<float, 3> position{};  // as MapPoint::position
+  std::uint64_t first_frame{};      // as MapPoint::first_frame
+};
+
+struct LandmarkObservation {
+  std::uint64_t landmark_id{};
+  std::uint64_t frame_index{};  // a keyframe that observed it
 };
 
 struct TrajectorySample {
@@ -223,15 +273,17 @@ class VisualOdometry {
   [[nodiscard]] std::vector<TrajectorySample> trajectory(std::size_t first) const;
   [[nodiscard]] std::size_t stable_prefix() const;
   [[nodiscard]] std::size_t trajectory_size() const;
-  // Landmarks of the current segment's local map (see local_map_keyframes).
-  [[nodiscard]] std::vector<MapPoint> active_map() const;
-  // Landmarks that left the local map, or whose segment ended; all segments,
-  // in retirement order. Append-only until reset() and
-  // final, so viewers can fetch only new ones.
-  [[nodiscard]] std::size_t retired_count() const;
-  [[nodiscard]] std::vector<MapPoint> retired_map(std::size_t first = 0) const;
+  // Every landmark of the run (all segments), by landmark id. None is final:
+  // one outside the local map can be found again and refined.
+  [[nodiscard]] std::vector<MapPoint> map() const;
+  [[nodiscard]] std::size_t map_size() const;
+  // The keyframes that observe each landmark of map(), by landmark id, then frame.
+  [[nodiscard]] std::vector<LandmarkObservation> landmark_observations() const;
   // Track IDs that currently have a 3D landmark (for display).
   [[nodiscard]] bool has_landmark(std::uint64_t track_id) const;
+  // Those tracks with their landmarks, by track id (a few hundred: cheaper
+  // than map() for per-frame use).
+  [[nodiscard]] std::vector<TrackedLandmark> tracked_landmarks() const;
   [[nodiscard]] const OdometryFrameResult& last() const;
   [[nodiscard]] const VisualOdometryConfig& config() const;
 
