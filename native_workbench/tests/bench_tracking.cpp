@@ -58,6 +58,7 @@ int main(int argc, char** argv) {
     OpticalFlowConfig flow_config;
     SuperPointConfig sp_config;
     std::string export_tracks, export_trajectory, export_map, export_features, depth_model, export_keyframe_depth;
+    std::string export_clouds;
     DepthSamplingConfig depth_sampling;
     bool dense_clouds = false;
     KeyframeDepthStore keyframe_depth;
@@ -79,10 +80,16 @@ int main(int argc, char** argv) {
       if (key == "export-keyframe-depth") { export_keyframe_depth = argv[a + 1]; continue; }
       // Build the app's keyframe depth clouds (alignment + multi-view check) and report them.
       if (key == "dense") { dense_clouds = std::stof(argv[a + 1]) != 0; continue; }
-      // Multi-view check tolerance: adaptive (between-view model, default) or the fixed 6 %.
+      // With dense 1: each cloud's points at the end, DIR/clouds.csv
+      // (frame_index,x,y,depth_m,shown,agree,disagree,sigma), x/y native source pixels.
+      if (key == "export-clouds") { export_clouds = argv[a + 1]; continue; }
+      // Multi-view check tolerance: 0 fixed 6 % (default), 1 adaptive (between-view model).
+      // dense-adaptive 2: adaptive but never looser than the fixed tolerance (tightening only).
       if (key == "dense-adaptive") {
         KeyframeDepthConfig dense_config;
-        dense_config.adaptive_tolerance = std::stof(argv[a + 1]) != 0;
+        const float mode = std::stof(argv[a + 1]);
+        dense_config.adaptive_tolerance = mode != 0;
+        if (mode == 2) dense_config.tolerance_max = dense_config.consistency_tolerance;
         keyframe_depth = KeyframeDepthStore(dense_config);
         continue;
       }
@@ -96,6 +103,9 @@ int main(int argc, char** argv) {
         continue;
       }
       if (key == "reloc") { vo_config.relocalization = value != 0; continue; }
+      // Loop closure on/off, and solving it synchronously (deterministic) vs on a worker.
+      if (key == "loop") { vo_config.loop_closure = value != 0; continue; }
+      if (key == "loop-sync") { vo_config.loop_synchronous = value != 0; continue; }
       if (key == "reassoc") { vo_config.reassociation = value != 0; continue; }
       if (key == "reassoc-radius") { vo_config.reassociation_radius_px = value; continue; }
       if (key == "merge") { vo_config.merge_landmarks = value != 0; continue; }
@@ -325,6 +335,8 @@ int main(int argc, char** argv) {
       if (std::getenv("SLAM_VO_VERBOSE") && pose.relocalization_candidates > 0 && !pose.relocalized)
         std::cout << "  vo frame " << pose.frame_index << ": relocalization tried, " << pose.relocalization_candidates
                   << " descriptor matches\n";
+      if (pose.loop_detected || pose.loop_closed)
+        std::cout << "  vo frame " << pose.frame_index << ": " << pose.event << '\n';
       if (pose.state == OdometryState::lost || pose.relocalized || pose.event == "pose re-estimated (P3P RANSAC)")
         std::cout << "  vo frame " << pose.frame_index << ": " << pose.event << '\n';
       vo_ms += pose.ms;
@@ -451,6 +463,16 @@ int main(int argc, char** argv) {
       std::printf("dense clouds: %zu keyframes (%zu settled), %zu points: confirmed %.3f, hidden %.3f, unchecked %.3f\n",
                   keyframe_depth.clouds().size(), settled, points, double(confirmed) / std::max<std::size_t>(1, points),
                   double(hidden) / std::max<std::size_t>(1, points), double(unchecked) / std::max<std::size_t>(1, points));
+      if (!export_clouds.empty()) {
+        std::filesystem::create_directories(export_clouds);
+        std::ofstream out(std::filesystem::path(export_clouds) / "clouds.csv");
+        out << "frame_index,x,y,depth_m,shown,agree,disagree,sigma\n" << std::setprecision(7);
+        for (const auto& c : keyframe_depth.clouds())
+          for (std::size_t i = 0; i < c.raw.size(); ++i)
+            out << c.frame_index << ',' << c.pixels[i][0] << ',' << c.pixels[i][1] << ',' << c.raw[i][2] << ','
+                << int(c.shown[i]) << ',' << int(c.agree[i]) << ',' << int(c.disagree[i]) << ','
+                << (i < c.sigma.size() ? c.sigma[i] : -1.0F) << '\n';
+      }
       const auto& difference = keyframe_depth.difference_model();
       const auto& w = difference.weights();
       std::printf("dense between-view model: %s, %zu refs, sigma at 2 m flat centre %.4f; weights bias %.2f edge %.2f "

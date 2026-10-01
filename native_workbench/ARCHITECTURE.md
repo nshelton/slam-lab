@@ -198,6 +198,64 @@ Not done yet: what to do with landmarks that stay untracked in view (the
 magenta rings: occluded, detector misses, or stale/drifted positions);
 relocalization against segments older than the last lost one; loop closure.
 
+### Loop closure (implemented 2026-09-30)
+
+Within a segment, at each keyframe (`detect_loop`, `src/visual_odometry.cpp`;
+maths in `src/pose_graph.{hpp,cpp}`):
+
+- **Archive.** Retired landmarks with descriptors are kept whole (`archive`:
+  position, sightings, descriptor). `retired` (the viewers' list) mirrors them
+  through `retired_index`.
+- **Candidates (spatial).** Keyframes ≥ `loop_min_keyframe_gap` (30)
+  keyframes back whose centre is within 1 × the keyframe's median landmark
+  depth and whose optical axis is within 45°. A candidate that already shares
+  over 20% of the keyframe's landmarks is continuous tracking, not a loop.
+- **Matching.** The candidate's neighbourhood (±2 keyframes; active, dormant
+  or archived landmarks) is projected with the current pose, and
+  `match_projected` finds mutual-best descriptor matches within
+  `loop_search_radius_px` (160) among this frame's tracks that carry a
+  landmark. A RANSAC similarity on the 3D-3D matches
+  (`ransac_similarity`, tolerance 5% of depth) is then checked by
+  reprojection; ≥ `loop_min_inliers` (30) verified.
+- **Correction.** A trivial Sim3 only merges. Otherwise a Sim3 pose graph
+  over the segment's keyframes (consecutive, covisibility ≥ 30 shared
+  landmarks, and the loop edge with weight 10; the candidate fixed) is solved
+  by `optimize_pose_graph` (sparse LM, numeric Jacobians), on a **worker
+  thread** (`std::async`), or synchronously with `loop_synchronous` (bench
+  `loop-sync 1`, tests: deterministic). `apply_loop` (next frame that finds
+  the future ready) applies it as a **delta** to the current estimates:
+  `W_i = S_i_new⁻¹ S_i_old` per keyframe. Keyframes added since take the
+  newest node's correction. Keyframe poses become `(pose · W⁻¹).rigid()`;
+  landmarks (all states) and their covariances move with their most recent
+  keyframe; frame records rescale their relative translation to the new
+  camera units; the loop's (current, old) pairs are merged (archived ones
+  come back via `unretire`). `map_generation()` increments; `TrajectoryView`
+  refetches. `OdometryFrameResult::keyframe_scale_changes` tells the dense
+  clouds to rescale (`KeyframeDepthStore::rescale`).
+
+Results (bench, `loop-sync 1`; `tools/trajectory_vs_gt.py`, aligned on
+the first 25%):
+
+| | ATE | end error | return to start |
+|---|---|---|---|
+| fr3 long_office, off | 0.080 m | 0.187 m | 0.238 m |
+| fr3 long_office, on (3 loops) | **0.042 m** | **0.057 m** | **0.087 m** |
+| fr2_desk, off | 0.295 m | | 0.530 m |
+| fr2_desk, on (4 loops) | 0.252 m | 0.023 m | **0.073 m** |
+
+disney_04 and dreamworks: no loops, identical results; detection costs about
+0.5 ms/frame on average there. fr1_desk: its losses split the loop across
+segments (not handled). The solve takes a few hundred ms at 300 keyframes,
+off the UI thread in the app. Synthetic test (`closes_a_loop`): a circle
+with a 0.5% focal error, ATE 0.21% → 0.10% (sync) / 0.08% (worker).
+
+**Limits / next.** Spatial candidates with a 160 px window only catch drift of
+about 1–2° rotation (synthetic: a 1% focal error is missed). Larger drift
+needs **appearance retrieval** (per-keyframe descriptor sets, GPU voting) as
+the candidate source. Also: loops across segments (map merging), information-
+weighted edges (the correction spreads error into the middle of the run: fr3
+at 50% 0.029 → 0.066 m), and a full BA after the correction.
+
 ### Where to add a camera motion model
 
 - **Current model.** `track()` predicts the pose with constant velocity

@@ -1,12 +1,17 @@
 #include "slam_native/visual_odometry.hpp"
 
+#include "pose_graph.hpp"
 #include "vo_geometry.hpp"
 
 #include <Eigen/Eigenvalues>
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <future>
 #include <cmath>
+#include <map>
 #include <numeric>
 #include <stdexcept>
 #include <unordered_map>
@@ -145,7 +150,9 @@ void VisualOdometryConfig::validate() const {
       reassociation_radius_px > 0 && dormant_max_frames >= 0 && max_dormant_landmarks >= 0 &&
       depth_relative_sigma > 0 && depth_scale_min_samples >= 1 && depth_scale_min_keyframes >= 2 &&
       depth_scale_min_parallax_degrees >= 0 && depth_scale_max_relative_sigma > 0 && depth_scale_drift_sigma >= 0 &&
-      depth_scale_floor_sigma > 0 &&
+      depth_scale_floor_sigma > 0 && loop_min_keyframe_gap >= 1 && loop_max_distance_ratio > 0 &&
+      loop_max_angle_degrees > 0 && loop_min_inliers >= 3 && loop_distance_tolerance > 0 && loop_covisibility_min >= 1 &&
+      loop_cooldown_keyframes >= 0 && loop_edge_weight > 0 &&
       observation_sigma_px > 0 && min_observation_sigma_px > 0 && confidence_depth_ratio > 0 &&
       confidence_two_view >= 0 && confidence_two_view <= 1 && confidence_consistency_scale > 0 &&
       pose_landmark_covariance_scale > 0;
@@ -239,6 +246,23 @@ struct VisualOdometry::Impl {
   // re-find them; then retired. Only with relocalization enabled.
   std::unordered_map<std::uint64_t, Landmark> dormant;
   std::vector<MapPoint> retired;
+  std::unordered_map<std::uint64_t, std::size_t> retired_index;  // landmark id -> position in `retired`
+  // Retired landmarks with descriptors, kept whole for loop matching (and
+  // moved by loop corrections; `retired` mirrors their positions).
+  std::unordered_map<std::uint64_t, Landmark> archive;
+  std::uint64_t map_generation{};
+  int keyframes_since_loop{1 << 30};
+  // A loop correction being solved (on a worker unless loop_synchronous).
+  struct LoopJob {
+    int segment{};
+    std::vector<int> nodes;  // keyframe ids, as in the problem
+    std::vector<Sim3> before;
+    std::future<PoseGraphProblem> solution;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> pairs;  // (current, old) landmark ids
+    std::uint64_t keyframe_frame{}, candidate_frame{};
+    int inliers{};
+  };
+  std::optional<LoopJob> loop_job;
   std::unordered_map<std::uint64_t, std::array<std::uint8_t, 3>> colors;  // this frame's, by track
   std::unordered_map<std::uint64_t, double> sigmas;  // this frame's resolved pixel sigma, by track
   std::unordered_map<std::uint64_t, std::pair<double, double>> depths;  // this frame's (depth, sigma) m, by track
@@ -410,7 +434,28 @@ struct VisualOdometry::Impl {
     point.covariance = {float(C(0, 0)), float(C(0, 1)), float(C(0, 2)), float(C(1, 1)), float(C(1, 2)), float(C(2, 2))};
     return point;
   }
-  void retire(std::uint64_t id, const Landmark& landmark) { retired.push_back(map_point(id, landmark)); }
+  void retire(std::uint64_t id, const Landmark& landmark) {
+    retired_index[id] = retired.size();
+    retired.push_back(map_point(id, landmark));
+    // Kept whole for loop matching (needs a descriptor) and for global BA (needs the sightings).
+    if ((config.loop_closure && !landmark.descriptor.empty()) || config.final_bundle_iterations > 0)
+      archive[id] = landmark;
+  }
+  // Brings a retired landmark back (a loop re-found it): out of the archive
+  // and the retired list (a non-append change: new map generation).
+  std::optional<Landmark> unretire(std::uint64_t id) {
+    auto it = archive.find(id);
+    if (it == archive.end()) return std::nullopt;
+    Landmark landmark = std::move(it->second);
+    archive.erase(it);
+    if (auto r = retired_index.find(id); r != retired_index.end()) {
+      retired.erase(retired.begin() + static_cast<std::ptrdiff_t>(r->second));
+      retired_index.clear();
+      for (std::size_t i = 0; i < retired.size(); ++i) retired_index[retired[i].landmark_id] = i;
+    }
+    ++map_generation;
+    return landmark;
+  }
   // Pose tracking treats landmarks as exact; their position error then acts as
   // extra, direction-dependent pixel noise. Attach each landmark's covariance
   // projected through the predicted pose (J Sigma_X J^T, px^2); optimize_pose
@@ -584,6 +629,8 @@ struct VisualOdometry::Impl {
     }
     OdometryFrameResult result;
     result.frame_index = frame.frame_index;
+    if (loop_job && loop_job->solution.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+      apply_loop(result);
     if (lost && frame.frame_index > lost->last_frame + static_cast<std::uint64_t>(config.relocalization_max_frames))
       expire_lost();
     expire_dormant(frame.frame_index);
@@ -866,6 +913,8 @@ struct VisualOdometry::Impl {
       local_bundle_adjustment();
       cull(current);
       update_depth_scale(id, result);
+      ++keyframes_since_loop;
+      detect_loop(frame, id, result);
       last_pose = keyframes[id].pose;
       frames_since_keyframe = 0;
       keyframe_landmarks = 0;
@@ -1250,6 +1299,314 @@ struct VisualOdometry::Impl {
     ++scale.keyframes;
   }
 
+  // ---- Loop closure ------------------------------------------------------
+
+  // Landmark by id in any state of the current segment's map.
+  const Landmark* find_landmark(std::uint64_t id) const {
+    if (auto it = landmarks.find(id); it != landmarks.end()) return &it->second;
+    if (auto it = dormant.find(id); it != dormant.end()) return &it->second;
+    if (auto it = archive.find(id); it != archive.end()) return &it->second;
+    return nullptr;
+  }
+  static bool sees(const Landmark& landmark, int keyframe) {
+    for (const auto& o : landmark.observations)
+      if (o.keyframe == keyframe) return true;
+    return false;
+  }
+
+  // Looks for a revisit at keyframe `k`; starts (or, synchronously, applies)
+  // the correction. See VisualOdometryConfig::loop_closure.
+  void detect_loop(const TrackedFrame& frame, int k, OdometryFrameResult& result) {
+    if (!config.loop_closure || descriptor_dimension == 0 || loop_job ||
+        keyframes_since_loop < config.loop_cooldown_keyframes)
+      return;
+    const SE3& Tk = keyframes[k].pose;
+    // The keyframe's own landmarks.
+    std::vector<std::uint64_t> current;
+    std::vector<double> depth;
+    for (const auto& [id, landmark] : landmarks) {
+      if (landmark.descriptor.empty() || !sees(landmark, k)) continue;
+      const double z = (Tk * landmark.X).z();
+      if (z <= 1e-9) continue;
+      current.push_back(id);
+      depth.push_back(z);
+    }
+    if (static_cast<int>(current.size()) < config.loop_min_inliers) return;
+    std::vector<std::size_t> order(current.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](auto a, auto b) { return current[a] < current[b]; });
+    {
+      std::vector<std::uint64_t> c2;
+      std::vector<double> d2;
+      for (auto i : order) { c2.push_back(current[i]); d2.push_back(depth[i]); }
+      current = std::move(c2);
+      depth = std::move(d2);
+    }
+    const double scene = median(depth);
+    const std::unordered_set<std::uint64_t> current_set(current.begin(), current.end());
+    // Spatial candidates: old keyframes near this one, looking the same way.
+    const Vec3 centre = Tk.center(), axis = Tk.R.row(2).transpose();
+    std::vector<std::pair<double, std::size_t>> candidates;  // (distance, position in segment_keyframes)
+    const int last = static_cast<int>(segment_keyframes.size()) - 1 - config.loop_min_keyframe_gap;
+    for (int p = 0; p <= last; ++p) {
+      const SE3& Tc = keyframes[segment_keyframes[p]].pose;
+      const double distance = (Tc.center() - centre).norm();
+      const double angle = std::acos(std::clamp(axis.dot(Tc.R.row(2).transpose()), -1.0, 1.0));
+      if (distance <= config.loop_max_distance_ratio * scene && angle <= config.loop_max_angle_degrees * kDegree)
+        candidates.emplace_back(distance, static_cast<std::size_t>(p));
+    }
+    std::sort(candidates.begin(), candidates.end());
+    if (candidates.size() > 3) candidates.resize(3);
+    const bool debug = std::getenv("SLAM_VO_LOOP_DEBUG") != nullptr;
+    if (debug)
+      std::fprintf(stderr, "loop kf %llu: %zu current, scene %.3f, %zu candidates (%d keyframes back max)\n",
+                   static_cast<unsigned long long>(keyframes[k].frame_index), current.size(), scene, candidates.size(), last);
+
+    struct Found {
+      std::size_t position{};
+      Sim3 S;
+      std::vector<std::pair<std::uint64_t, std::uint64_t>> pairs;
+    };
+    std::optional<Found> best;
+    const std::uint32_t seed = static_cast<std::uint32_t>(keyframes[k].frame_index * 2654435761U);
+    for (const auto& [distance, position] : candidates) {
+      // The candidate's neighbourhood (2 keyframes either side) and its landmarks.
+      std::unordered_set<int> around;
+      for (std::size_t q = position >= 2 ? position - 2 : 0; q <= std::min(position + 2, segment_keyframes.size() - 1); ++q)
+        around.insert(segment_keyframes[q]);
+      std::vector<std::uint64_t> old;
+      int shared = 0;
+      const auto gather = [&](const std::unordered_map<std::uint64_t, Landmark>& source) {
+        for (const auto& [id, landmark] : source) {
+          if (landmark.segment != segment || landmark.descriptor.empty()) continue;
+          bool near = false;
+          for (const auto& o : landmark.observations) near |= around.count(o.keyframe) > 0;
+          if (!near) continue;
+          if (current_set.count(id)) ++shared;
+          else old.push_back(id);
+        }
+      };
+      gather(landmarks);
+      gather(dormant);
+      gather(archive);
+      // Already sharing the map with the candidate: continuous tracking, not a loop.
+      if (debug)
+        std::fprintf(stderr, "  candidate %llu: %zu old, %d shared\n",
+                     static_cast<unsigned long long>(keyframes[segment_keyframes[position]].frame_index), old.size(), shared);
+      if (shared * 5 > static_cast<int>(current.size()) || static_cast<int>(old.size()) < config.loop_min_inliers)
+        continue;
+      std::sort(old.begin(), old.end());
+      // Mutual-best descriptor matches with this frame's tracks that carry a
+      // landmark, within loop_search_radius_px of the old landmarks'
+      // projections under the current pose (spatial candidates mean moderate drift).
+      std::vector<std::uint64_t> kept_old;
+      std::vector<std::pair<Vec2, const std::vector<float>*>> points;
+      for (auto id : old) {
+        const Landmark* landmark = find_landmark(id);
+        const Vec3 xc = Tk * landmark->X;
+        if (xc.z() <= 1e-9) continue;
+        kept_old.push_back(id);
+        points.emplace_back(K.project(xc), &landmark->descriptor);
+      }
+      std::unordered_map<std::uint64_t, std::size_t> current_index;
+      for (std::size_t a = 0; a < current.size(); ++a) current_index[current[a]] = a;
+      std::vector<Vec3> X, Y;
+      std::vector<double> tolerance;
+      std::vector<std::pair<std::uint64_t, std::uint64_t>> pairs;
+      std::vector<Vec2> pixels;  // the current landmark's observation in keyframe k
+      for (const auto& [b, i] : match_projected(frame, points, config.loop_search_radius_px, [&](std::uint64_t track) {
+             auto it = track_landmark.find(track);
+             return it != track_landmark.end() && current_index.count(it->second);
+           })) {
+        const auto& o = frame.observations[static_cast<std::size_t>(i)];
+        const std::uint64_t cur = track_landmark.at(o.track_id);
+        X.push_back(landmarks.at(cur).X);
+        Y.push_back(find_landmark(kept_old[b])->X);
+        tolerance.push_back(config.loop_distance_tolerance * depth[current_index.at(cur)]);
+        pairs.emplace_back(cur, kept_old[b]);
+        pixels.emplace_back(o.x, o.y);
+      }
+      if (debug) std::fprintf(stderr, "    %zu descriptor matches\n", pairs.size());
+      if (static_cast<int>(pairs.size()) < config.loop_min_inliers) continue;
+      Sim3 S;
+      std::vector<char> inliers;
+      if (ransac_similarity(X, Y, tolerance, 400, seed, S, inliers) < config.loop_min_inliers) continue;
+      // Verify by reprojection: the old points through the corrected keyframe pose.
+      const Sim3 corrected = Sim3::from(Tk) * S.inverse();
+      std::vector<std::pair<std::uint64_t, std::uint64_t>> verified;
+      for (std::size_t i = 0; i < pairs.size(); ++i) {
+        if (!inliers[i]) continue;
+        const Vec3 xc = corrected * Y[i];
+        if (xc.z() > 1e-9 && (K.project(xc) - pixels[i]).norm() <= 2 * config.relocalization_threshold_px)
+          verified.push_back(pairs[i]);
+      }
+      if (debug) std::fprintf(stderr, "    %d ransac inliers, %zu verified, scale %.3f\n",
+                              static_cast<int>(std::count(inliers.begin(), inliers.end(), 1)), verified.size(), S.s);
+      if (static_cast<int>(verified.size()) < config.loop_min_inliers) continue;
+      if (!best || verified.size() > best->pairs.size()) best = Found{position, S, std::move(verified)};
+    }
+    if (!best) return;
+    const int c = segment_keyframes[best->position];
+    result.loop_detected = true;
+    result.loop_keyframe = static_cast<std::int64_t>(keyframes[k].frame_index);
+    result.loop_candidate = static_cast<std::int64_t>(keyframes[c].frame_index);
+    result.loop_inliers = static_cast<int>(best->pairs.size());
+    keyframes_since_loop = 0;
+    // Trivial correction: the map already agrees; just merge the duplicates.
+    const double rotation = log_so3(best->S.R).norm(), shift = (best->S * Tk.center() - Tk.center()).norm();
+    if (std::abs(std::log(best->S.s)) < 0.005 && rotation < 0.2 * kDegree && shift < 0.005 * scene) {
+      const int merged = merge_loop_pairs(best->pairs);
+      result.event = "loop with keyframe " + std::to_string(keyframes[c].frame_index) + " already closed: " +
+                     std::to_string(merged) + " landmarks merged";
+      return;
+    }
+
+    // Pose graph over the segment's keyframes.
+    LoopJob job;
+    job.segment = segment;
+    job.pairs = std::move(best->pairs);
+    job.keyframe_frame = keyframes[k].frame_index;
+    job.candidate_frame = keyframes[c].frame_index;
+    job.inliers = result.loop_inliers;
+    PoseGraphProblem problem;
+    std::unordered_map<int, int> node_of;
+    for (int id : segment_keyframes) {
+      node_of[id] = static_cast<int>(job.nodes.size());
+      job.nodes.push_back(id);
+      job.before.push_back(Sim3::from(keyframes[id].pose));
+      problem.nodes.push_back(job.before.back());
+      problem.fixed.push_back(id == c);
+    }
+    const auto relative = [&](int a, int b) { return problem.nodes[a] * problem.nodes[b].inverse(); };
+    for (int i = 1; i < static_cast<int>(job.nodes.size()); ++i) problem.edges.push_back({i, i - 1, relative(i, i - 1), 1.0});
+    // Covisibility edges: keyframe pairs sharing enough landmarks.
+    std::map<std::pair<int, int>, int> shared;
+    const auto count = [&](const std::unordered_map<std::uint64_t, Landmark>& source) {
+      for (const auto& [id, landmark] : source) {
+        if (landmark.segment != segment) continue;
+        std::vector<int> seen;
+        for (const auto& o : landmark.observations)
+          if (auto it = node_of.find(o.keyframe); it != node_of.end()) seen.push_back(it->second);
+        std::sort(seen.begin(), seen.end());
+        seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
+        for (std::size_t a = 0; a < seen.size(); ++a)
+          for (std::size_t b = a + 1; b < seen.size(); ++b)
+            if (seen[b] - seen[a] > 1) ++shared[{seen[b], seen[a]}];
+      }
+    };
+    count(landmarks);
+    count(dormant);
+    count(archive);
+    for (const auto& [edge, n] : shared)
+      if (n >= config.loop_covisibility_min) problem.edges.push_back({edge.first, edge.second, relative(edge.first, edge.second), 1.0});
+    const Sim3 k_corrected = Sim3::from(Tk) * best->S.inverse();
+    problem.edges.push_back({node_of.at(k), node_of.at(c), k_corrected * problem.nodes[node_of.at(c)].inverse(),
+                             config.loop_edge_weight});
+    if (config.loop_synchronous) {
+      std::promise<PoseGraphProblem> done;
+      optimize_pose_graph(problem);
+      done.set_value(std::move(problem));
+      job.solution = done.get_future();
+      loop_job = std::move(job);
+      apply_loop(result);
+    } else {
+      job.solution = std::async(std::launch::async, [problem = std::move(problem)]() mutable {
+        optimize_pose_graph(problem);
+        return problem;
+      });
+      loop_job = std::move(job);
+      result.event = "loop detected with keyframe " + std::to_string(keyframes[c].frame_index) + " (" +
+                     std::to_string(result.loop_inliers) + " landmarks); correcting in the background";
+    }
+  }
+
+  // Merges each (current, old) landmark pair of a loop, bringing the old one
+  // back into the active map. Returns the number merged.
+  int merge_loop_pairs(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& pairs) {
+    int merged = 0;
+    for (const auto& [cur, old] : pairs) {
+      if (!landmarks.count(cur) || cur == old) continue;
+      if (!landmarks.count(old)) {
+        if (auto it = dormant.find(old); it != dormant.end()) {
+          landmarks.insert(dormant.extract(it));
+        } else if (auto back = unretire(old)) {
+          landmarks.emplace(old, std::move(*back));
+        } else {
+          continue;
+        }
+      }
+      // The current landmark carries the live track; keep the better-observed one.
+      const std::uint64_t live = landmarks.at(cur).track;
+      const bool tracked = track_landmark.count(live) && track_landmark.at(live) == cur;
+      const std::uint64_t kept = landmarks.at(old).observations.size() >= landmarks.at(cur).observations.size() ? old : cur;
+      merge(kept, kept == old ? cur : old);
+      if (tracked) attach(kept, live);
+      ++merged;
+    }
+    return merged;
+  }
+
+  // Applies a solved loop correction as a delta to the current estimates
+  // (bundle adjustment may have moved the window meanwhile; keyframes added
+  // since take the newest node's correction).
+  void apply_loop(OdometryFrameResult& result) {
+    LoopJob job = std::move(*loop_job);
+    loop_job.reset();
+    PoseGraphProblem solved = job.solution.get();
+    if (job.segment != segment) return;  // the segment was lost meanwhile
+    // W: old world -> new world for points anchored at each keyframe.
+    std::unordered_map<int, Sim3> W;
+    for (std::size_t i = 0; i < job.nodes.size(); ++i) W[job.nodes[i]] = solved.nodes[i].inverse() * job.before[i];
+    const Sim3 newest = W.at(job.nodes.back());
+    const auto correction = [&](int keyframe) -> const Sim3& {
+      auto it = W.find(keyframe);
+      return it != W.end() ? it->second : newest;
+    };
+    // Keyframes: pose' = pose * W^-1, then back to a rigid pose in the new units.
+    std::unordered_map<int, double> unit_scale;
+    for (int id : segment_keyframes) {
+      const Sim3 corrected = Sim3::from(keyframes[id].pose) * correction(id).inverse();
+      keyframes[id].pose = corrected.rigid();
+      unit_scale[id] = corrected.s;
+      result.keyframe_scale_changes.emplace_back(keyframes[id].frame_index, corrected.s);
+    }
+    // Landmarks move with their most recent keyframe.
+    const auto move = [&](std::unordered_map<std::uint64_t, Landmark>& source) {
+      for (auto& [id, landmark] : source) {
+        if (landmark.segment != segment) continue;
+        const int anchor = landmark.observations.empty() ? job.nodes.back() : landmark.observations.back().keyframe;
+        const Sim3& w = correction(anchor);
+        landmark.X = w * landmark.X;
+        landmark.covariance = w.s * w.s * w.R * landmark.covariance * w.R.transpose();
+      }
+    };
+    move(landmarks);
+    move(dormant);
+    move(archive);
+    for (const auto& [id, landmark] : archive)
+      if (landmark.segment == segment)
+        if (auto r = retired_index.find(id); r != retired_index.end()) {
+          retired[r->second].position = {float(landmark.X.x()), float(landmark.X.y()), float(landmark.X.z())};
+          retired[r->second].covariance = map_point(id, landmark).covariance;
+        }
+    // Frames are stored relative to their keyframe: rescale to its new units.
+    for (auto& record : frames)
+      if (record.segment == segment)
+        if (auto it = unit_scale.find(record.keyframe); it != unit_scale.end()) record.relative.t /= it->second;
+    const int latest = segment_keyframes.back();
+    for (SE3* pose : {&last_pose, &previous_pose}) *pose = (Sim3::from(*pose) * correction(latest).inverse()).rigid();
+    if (auto it = depth_scales.find(segment); it != depth_scales.end()) it->second.log_scale += std::log(unit_scale.at(latest));
+    const int merged = merge_loop_pairs(job.pairs);
+    ++map_generation;
+    result.loop_closed = true;
+    result.loop_keyframe = static_cast<std::int64_t>(job.keyframe_frame);
+    result.loop_candidate = static_cast<std::int64_t>(job.candidate_frame);
+    result.loop_inliers = job.inliers;
+    result.event = "loop closed: keyframe " + std::to_string(job.keyframe_frame) + " with " +
+                   std::to_string(job.candidate_frame) + " (" + std::to_string(job.inliers) + " landmarks), " +
+                   std::to_string(job.nodes.size()) + " keyframes corrected, " + std::to_string(merged) + " merged";
+  }
+
   void lose(const TrackedFrame& frame, OdometryFrameResult& result, const char* why) {
     state = OdometryState::initializing;
     result.state = OdometryState::lost;
@@ -1320,6 +1677,63 @@ struct VisualOdometry::Impl {
         break;
       }
     }
+  }
+
+  // All keyframes of `seg` and every landmark (active, dormant, archived) with
+  // >= 2 sightings in them; the segment's first two keyframes fix the gauge.
+  bool global_bundle_adjustment(int seg, int iterations) {
+    if (loop_job || iterations <= 0) return false;
+    std::vector<int> nodes;
+    for (const auto& kf : keyframes)
+      if (kf.segment == seg) nodes.push_back(kf.id);
+    if (nodes.size() < 3) return false;
+    BundleProblem problem;
+    std::unordered_map<int, int> camera_of;
+    for (std::size_t c = 0; c < nodes.size(); ++c) {
+      camera_of[nodes[c]] = static_cast<int>(c);
+      problem.cameras.push_back(keyframes[nodes[c]].pose);
+      problem.fixed.push_back(c < 2);
+    }
+    std::vector<std::pair<std::uint64_t, Landmark*>> points;
+    const auto gather = [&](std::unordered_map<std::uint64_t, Landmark>& source) {
+      std::vector<std::uint64_t> ids;
+      for (auto& [id, landmark] : source) {
+        if (landmark.segment != seg) continue;
+        int seen = 0;
+        for (const auto& o : landmark.observations) seen += camera_of.count(o.keyframe) > 0;
+        if (seen >= 2) ids.push_back(id);
+      }
+      std::sort(ids.begin(), ids.end());
+      for (auto id : ids) points.emplace_back(id, &source.at(id));
+    };
+    gather(landmarks);
+    gather(dormant);
+    gather(archive);
+    for (std::size_t p = 0; p < points.size(); ++p) {
+      problem.points.push_back(points[p].second->X);
+      for (const auto& o : points[p].second->observations)
+        if (auto it = camera_of.find(o.keyframe); it != camera_of.end())
+          problem.observations.push_back({it->second, static_cast<int>(p), o.u, o.sigma});
+    }
+    // Tracking continuity: the latest frames are stored relative to the newest keyframe.
+    const int newest = seg == segment && !segment_keyframes.empty() ? segment_keyframes.back() : -1;
+    const SE3 newest_before = newest >= 0 ? keyframes[newest].pose : SE3{};
+    bundle_adjust(K, problem, iterations, config.reprojection_threshold_px);
+    for (std::size_t c = 0; c < nodes.size(); ++c) keyframes[nodes[c]].pose = problem.cameras[c];
+    for (std::size_t p = 0; p < points.size(); ++p) {
+      Landmark& landmark = *points[p].second;
+      landmark.X = problem.points[p];
+      update_quality(landmark);
+      if (auto r = retired_index.find(points[p].first); r != retired_index.end())
+        retired[r->second] = map_point(points[p].first, landmark);
+    }
+    if (newest >= 0) {
+      const SE3 correction = newest_before.inverse() * keyframes[newest].pose;  // old -> new, applied on the right
+      last_pose = last_pose * correction;
+      previous_pose = previous_pose * correction;
+    }
+    ++map_generation;
+    return true;
   }
 
   void local_bundle_adjustment() {
@@ -1395,6 +1809,15 @@ VisualOdometry::VisualOdometry(VisualOdometryConfig config) : impl_(std::make_un
 VisualOdometry::~VisualOdometry() = default;
 
 OdometryFrameResult VisualOdometry::process(const TrackedFrame& frame) { return impl_->process(frame); }
+bool VisualOdometry::global_bundle_adjust(int iterations) {
+  if (iterations <= 0) iterations = impl_->config.final_bundle_iterations;
+  std::vector<int> segments;
+  for (const auto& kf : impl_->keyframes)
+    if (std::find(segments.begin(), segments.end(), kf.segment) == segments.end()) segments.push_back(kf.segment);
+  bool any = false;
+  for (int seg : segments) any |= impl_->global_bundle_adjustment(seg, iterations);
+  return any;
+}
 
 void VisualOdometry::reset() {
   auto config = impl_->config;
@@ -1430,6 +1853,7 @@ std::size_t VisualOdometry::stable_prefix() const {
 }
 
 std::size_t VisualOdometry::trajectory_size() const { return impl_->frames.size(); }
+std::uint64_t VisualOdometry::map_generation() const { return impl_->map_generation; }
 
 std::vector<MapPoint> VisualOdometry::active_map() const {
   std::vector<MapPoint> points;

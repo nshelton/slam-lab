@@ -8,6 +8,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace slam_native {
@@ -28,6 +29,7 @@ class TrajectoryView {
 
  private:
   std::vector<TrajectorySample> samples_;
+  std::uint64_t map_generation_{};  // VisualOdometry::map_generation() the caches belong to
   std::vector<MapPoint> retired_;  // append-only copy of the odometry's retired map
   std::vector<MapPoint> active_;
   PointCloudRenderer points_renderer_;

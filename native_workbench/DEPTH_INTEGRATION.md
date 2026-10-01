@@ -368,6 +368,35 @@ describes errors largely *shared* by neighbouring views (median ~0.15–0.2),
 while inter-view disagreement after alignment is 2–4 %. A per-point
 tolerance would need a model of the *difference* between views.
 
+**Between-view model: built, measured, off (2026-09-30).**
+`KeyframeDepthConfig::adaptive_tolerance` replaces the fixed 6 % with
+`clamp(2.5 σ_diff, 3 %, 15 %)`, where σ_diff comes from a second
+`DepthConfidenceModel`. Its cues are the edge strength in the other view's
+map, log depth, image radius there, and the angle between the viewing rays.
+It is trained only on residuals of points an earlier keyframe already
+confirmed. Bench: `dense-adaptive 0|1|2` (2 = never looser than 6 %),
+`export-clouds DIR`. Scored against TUM ground-truth depth
+(`tools/dense_vs_gt.py`; per-keyframe median scale, error
+`|Δ log z|`):
+
+| fr3_long_office | bad points (> 10 %) hidden | good points hidden |
+|---|---|---|
+| fixed 6 % | **6.2 %** | 0.4 % |
+| adaptive | 1.7 % | 0.1 % |
+| adaptive, capped at 6 % | 6.3 % | 0.5 % |
+
+(fr1_room: fixed 17.6 % / 9.0 %, adaptive 5.1 % / 2.9 %.) The adaptive
+tolerance is *weaker, not smarter*. The 29.7 k points it newly shows on fr3
+have median error 0.31 (84 % above 10 %). The model correctly learns that
+views disagree more at wide baselines and near edges, but that is also where
+the bad points are, so a wider tolerance forgives them. Capped, it hides
+1.6 k extra points (72 % bad): the right direction, but negligible. Default
+**off**. The ground truth also shows the bigger gap: even the fixed check
+hides only 6 % of fr3's bad points, and 28 % of *shown* points are more than
+10 % off after a per-keyframe scale. Much of that may be low-frequency shape
+error that the scale grid would remove, which a grid-aligned version of this
+score would separate.
+
 ## Phase 1: metric scale per segment (output only)
 
 The VO keeps solving in its own units (the solver and its tests are

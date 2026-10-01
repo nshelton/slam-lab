@@ -276,6 +276,19 @@ bool KeyframeDepthStore::settle(std::uint64_t frame_index, double log_scale, con
   return true;
 }
 
+bool KeyframeDepthStore::rescale(std::uint64_t frame_index, double factor) {
+  KeyframeCloud* cloud = find(frame_index);
+  if (!cloud || !(factor > 0) || !std::isfinite(factor)) return false;
+  cloud->metres_per_unit *= factor;
+  const double shift = std::log(factor);
+  for (auto& r : recent_)
+    if (r.frame_index == frame_index) {
+      r.log_scale += shift;
+      for (auto& g : r.grid) g += shift;
+    }
+  return true;
+}
+
 void KeyframeDepthStore::clear() {
   clouds_.clear();
   recent_.clear();

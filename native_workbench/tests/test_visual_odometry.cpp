@@ -2,6 +2,7 @@
 #include "slam_native/covariance_shape.hpp"
 #include "slam_native/track_io.hpp"
 #include "slam_native/visual_odometry.hpp"
+#include "pose_graph.hpp"   // internal loop-closure maths, unit-tested directly
 #include "vo_geometry.hpp"  // internal geometry, unit-tested directly
 
 #include <Eigen/Geometry>
@@ -305,6 +306,158 @@ void distortion_round_trip() {
       }
 }
 
+// Similarity alignment (exact and RANSAC) and the Sim3 pose graph: a drifted
+// chain of keyframes around a circle is pulled back by one loop edge.
+void loop_closure_maths() {
+  std::mt19937 rng(9);
+  std::uniform_real_distribution<double> u(-1, 1);
+  const vo::Sim3 truth{1.7, vo::exp_so3(vo::Vec3(0.3, -0.2, 0.5)), vo::Vec3(0.4, -1, 2)};
+  std::vector<vo::Vec3> X, Y;
+  for (int i = 0; i < 60; ++i) {
+    X.emplace_back(3 * u(rng), 3 * u(rng), 3 * u(rng));
+    Y.push_back(truth * X.back());
+  }
+  const vo::Sim3 fit = vo::align_similarity(X, Y);
+  require(std::abs(fit.s - truth.s) < 1e-9 && (fit.t - truth.t).norm() < 1e-9 &&
+          vo::log_so3(fit.R * truth.R.transpose()).norm() < 1e-9, "align_similarity is not exact");
+  for (int i = 0; i < 60; i += 2) Y[static_cast<std::size_t>(i)] += vo::Vec3(5 * u(rng), 5 * u(rng), 5 * u(rng));
+  vo::Sim3 model;
+  std::vector<char> inliers;
+  const int count = vo::ransac_similarity(X, Y, std::vector<double>(X.size(), 0.01), 300, 3, model, inliers);
+  require(count == 30 && std::abs(model.s - truth.s) < 1e-6, "ransac_similarity with 50% outliers");
+
+  // Ground truth: 40 cameras on a circle looking outwards (world -> camera).
+  const int n = 40;
+  std::vector<vo::Sim3> poses;
+  for (int i = 0; i < n; ++i) {
+    const double a = 2 * M_PI * i / n;
+    const vo::Mat3 Rwc = Eigen::AngleAxisd(-a, vo::Vec3::UnitY()).toRotationMatrix();
+    const vo::Vec3 c(3 * std::sin(a), 0, 3 * std::cos(a));
+    poses.push_back({1, Rwc.transpose(), -(Rwc.transpose() * c)});
+  }
+  // Odometry: true relative motions with a little rotation, translation and
+  // scale error each; integrated, the chain drifts.
+  vo::PoseGraphProblem problem;
+  problem.nodes.push_back(poses[0]);
+  for (int i = 1; i < n; ++i) {
+    vo::Sim3 relative = poses[i] * poses[i - 1].inverse();
+    relative = vo::Sim3{1.01, vo::exp_so3(vo::Vec3(0.002, 0.004, -0.002)), vo::Vec3(0.004, 0.002, 0)} * relative;
+    problem.nodes.push_back(relative * problem.nodes.back());
+  }
+  for (int i = 1; i < n; ++i)
+    problem.edges.push_back({i, i - 1, problem.nodes[i] * problem.nodes[i - 1].inverse(), 1.0});
+  // Loop: the last camera relative to the first, as truth says.
+  problem.edges.push_back({n - 1, 0, poses[n - 1] * poses[0].inverse(), 10.0});
+  problem.fixed.assign(n, 0);
+  problem.fixed[0] = 1;
+  const auto centre_error = [&](const std::vector<vo::Sim3>& nodes) {
+    double worst = 0;
+    for (int i = 0; i < n; ++i) {
+      const vo::Vec3 c = -(nodes[i].R.transpose() * nodes[i].t) / nodes[i].s;
+      const vo::Vec3 t = -(poses[i].R.transpose() * poses[i].t);
+      worst = std::max(worst, (c - t).norm());
+    }
+    return worst;
+  };
+  const double before = centre_error(problem.nodes);
+  const auto report = vo::optimize_pose_graph(problem);
+  const double after = centre_error(problem.nodes);
+  std::cout << "pose graph: worst camera-centre error " << before << " -> " << after << " (cost "
+            << report.initial_cost << " -> " << report.final_cost << ", " << report.iterations << " iterations)\n";
+  require(after < 0.2 * before, "pose graph did not pull the drifted chain back");
+}
+
+// A camera circling inside a cylinder of points (1.2 laps, so the start is
+// revisited with new track IDs), with a slightly wrong focal length so the
+// VO drifts. Colour encodes the point index, as in make_scene.
+Scene make_loop_scene(int frame_count = 700, int lap = 480) {
+  std::mt19937 rng(21);
+  std::uniform_real_distribution<double> u(0, 1);
+  std::normal_distribution<double> noise(0, 0.5);
+  const int width = 1920, height = 1080;
+  const auto K = CameraIntrinsics::from_horizontal_fov(width, height, 60);
+  Scene scene;
+  for (int i = 0; i < 3000; ++i) {
+    const double a = 2 * M_PI * u(rng);
+    scene.points.emplace_back(6 * std::sin(a), -2 + 4 * u(rng), 6 * std::cos(a));
+  }
+  std::vector<std::uint64_t> id(scene.points.size());
+  std::uint64_t next_id = 0;
+  for (auto& v : id) v = next_id++;
+  std::vector<char> seen(scene.points.size(), 0);
+  for (int f = 0; f < frame_count; ++f) {
+    const double theta = 2 * M_PI * f / lap;
+    const Eigen::Vector3d c(2 * std::sin(theta), 0.05 * std::sin(5 * theta), 2 * std::cos(theta));
+    const Eigen::Matrix3d Rwc = Eigen::AngleAxisd(theta, Eigen::Vector3d::UnitY()).toRotationMatrix();  // looks outwards
+    const Eigen::Matrix3d R = Rwc.transpose();
+    const Eigen::Vector3d t = -R * c;
+    scene.centers.push_back(c);
+    scene.rotations.push_back(R);
+    TrackedFrame frame{static_cast<std::uint64_t>(f), f * 16'666'667LL, width, height, {}, 0, {}};
+    for (std::size_t p = 0; p < scene.points.size(); ++p) {
+      const Eigen::Vector3d xc = R * scene.points[p] + t;
+      bool visible = xc.z() > 0.5;
+      double x = 0, y = 0;
+      if (visible) {
+        x = K.fx * xc.x() / xc.z() + K.cx + noise(rng);
+        y = K.fy * xc.y() / xc.z() + K.cy + noise(rng);
+        visible = x >= 0 && y >= 0 && x < width && y < height && u(rng) >= 0.03;
+      }
+      if (!visible) {
+        if (seen[p]) id[p] = next_id++;
+        seen[p] = 0;
+        continue;
+      }
+      seen[p] = 1;
+      frame.observations.push_back({id[p], static_cast<float>(x), static_cast<float>(y), true,
+                                    {static_cast<std::uint8_t>(p % 256), static_cast<std::uint8_t>(p / 256), 77}});
+    }
+    scene.frames.push_back(std::move(frame));
+  }
+  return scene;
+}
+
+void closes_a_loop() {
+  const auto scene = make_loop_scene();
+  const auto frames = occluded(scene, -1, -1);  // descriptors, no occlusion
+  double ate_without = 0;
+  for (const int mode : {0, 1, 2}) {  // off, synchronous, worker thread
+    VisualOdometryConfig config;
+    // True 60: a 0.5% focal error drifts ~1.5 deg of rotation per lap (larger
+    // drift needs appearance retrieval; spatial candidates search 160 px).
+    config.horizontal_fov_degrees = 60.3;
+    config.loop_closure = mode > 0;
+    config.loop_synchronous = mode == 1;
+    VisualOdometry odometry(config);
+    int detected = -1, closed = -1;
+    std::string event;
+    for (const auto& frame : frames) {
+      const auto r = odometry.process(frame);
+      if (r.loop_detected && detected < 0) detected = static_cast<int>(r.frame_index);
+      if (r.loop_closed && closed < 0) {
+        closed = static_cast<int>(r.frame_index);
+        event = r.event;
+        require(!r.keyframe_scale_changes.empty(), "a correction must report keyframe scale changes");
+      }
+    }
+    const auto result = evaluate(scene, odometry.trajectory());
+    static const char* names[] = {"off", "synchronous", "worker"};
+    std::cout << "loop scene, loop closure " << names[mode] << ": " << result.segments << " segment(s), ATE "
+              << 100 * result.ate_fraction << "% of path";
+    if (mode > 0) std::cout << "; detected at " << detected << ", closed at " << closed << ": " << event;
+    std::cout << '\n';
+    if (mode == 0) {
+      require(detected < 0 && closed < 0 && odometry.map_generation() == 0, "loop closure while disabled");
+      ate_without = result.ate_fraction;
+      continue;
+    }
+    require(detected >= 480 && closed >= detected, "the revisit was not detected and closed");
+    require(odometry.map_generation() > 0, "a loop correction must change the map generation");
+    require(mode == 1 ? closed == detected : closed >= detected, "synchronous corrections apply in the same frame");
+    require(result.ate_fraction <= 1.05 * ate_without, "loop closure made the trajectory worse");
+  }
+}
+
 // Pose-only optimization must converge to the exact pose from a nearby start.
 void pose_optimizer_converges() {
   std::mt19937 rng(1);
@@ -507,9 +660,11 @@ int main() {
     confidence_flags_unverified_points();
     pose_optimizer_converges();
     p3p_recovers_pose();
+    loop_closure_maths();
     relocalizes_after_occlusion();
     distortion_round_trip();
     reassociates_broken_tracks();
+    closes_a_loop();
     // Noise-free data must be reproduced essentially exactly (regression for
     // rotation drift off SO(3), which made poses diverge geometrically).
     const auto clean = make_scene(true, 240, 5, {0, 0, 0, 0, 0});

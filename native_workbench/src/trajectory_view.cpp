@@ -48,6 +48,12 @@ void TrajectoryView::reset() {
 }
 
 void TrajectoryView::update(const VisualOdometry& odometry) {
+  if (odometry.map_generation() != map_generation_) {  // a loop correction moved old poses and points
+    map_generation_ = odometry.map_generation();
+    samples_.clear();
+    retired_.clear();
+    points_renderer_.clear();
+  }
   const std::size_t stable = std::min(odometry.stable_prefix(), samples_.size());
   if (odometry.trajectory_size() < samples_.size()) samples_.clear();  // odometry was reset
   samples_.resize(std::min(samples_.size(), stable));

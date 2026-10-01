@@ -106,7 +106,7 @@ struct Runtime {
   bool close_requested{};
   bool restart_requested{};
   bool show_features{true};
-  int point_display_mode{}; // 0: tracked points, 1: all raw SuperPoint detections, 2: pose inliers
+  int point_display_mode{2}; // 0: tracked points, 1: all raw SuperPoint detections, 2: pose inliers (default)
   float flow_sigma{};       // tracker position fusion; <= 0 snaps to detections
   int display_rotation{};   // clockwise degrees; display only (processing uses native frames)
   int metadata_rotation{};
@@ -129,6 +129,8 @@ struct Runtime {
   float depth_near{}, depth_far{};  // colour range (2nd / 98th percentile)
   OdometryFrameResult odometry;
   int relocalizations{};             // since the odometry was (re)created
+  int loops_closed{};
+  std::string last_loop;             // its event text
   std::size_t reassociations{};      // landmarks re-found by new tracks, same span
   std::string last_relocalization;   // its event text
   bool export_requested{};
@@ -328,12 +330,14 @@ void draw_sidebar(Runtime& runtime,
   if (runtime.odometry.has_pose) {
     ImGui::Text("Pose inliers: %d / %d", runtime.odometry.inliers, runtime.odometry.correspondences);
   }
-  ImGui::Text("Relocalized: %d", runtime.relocalizations);
+  ImGui::Text("Relocalized: %d   Loops closed: %d", runtime.relocalizations, runtime.loops_closed);
+  if (ImGui::IsItemHovered() && !(runtime.last_relocalization.empty() && runtime.last_loop.empty()))
+    ImGui::SetTooltip("Last relocalization: %s\nLast loop closure: %s",
+                      runtime.last_relocalization.empty() ? "-" : runtime.last_relocalization.c_str(),
+                      runtime.last_loop.empty() ? "-" : runtime.last_loop.c_str());
   ImGui::Text("Untracked in view: %zu, re-found %d (%zu)",
               runtime.odometry.untracked_landmarks.size(), runtime.odometry.reassociated,
               runtime.reassociations);
-  if (!runtime.last_relocalization.empty() && ImGui::IsItemHovered())
-    ImGui::SetTooltip("%s", runtime.last_relocalization.c_str());
   const double elapsed = std::chrono::duration<double>(Clock::now() - runtime.started).count();
   ImGui::Text("Throughput: %.1f frames/s", elapsed > 0 ? runtime.stats.inferred_frames / elapsed : 0);
   ImGui::Separator();
@@ -888,6 +892,8 @@ struct Session {
     focal.restart_tracks();
     runtime.odometry = {};
     runtime.relocalizations = 0;
+    runtime.loops_closed = 0;
+    runtime.last_loop.clear();
     runtime.reassociations = 0;
     runtime.last_relocalization.clear();
     runtime.trails.clear();
@@ -1028,6 +1034,11 @@ struct Session {
                                     runtime.odometry.event;
     }
     const auto& r = runtime.odometry;
+    for (const auto& [frame, factor] : r.keyframe_scale_changes) keyframe_depth.rescale(frame, factor);
+    if (r.loop_closed) {
+      ++runtime.loops_closed;
+      runtime.last_loop = "frame " + std::to_string(r.frame_index) + ": " + r.event;
+    }
     if (r.settled_keyframe >= 0)  // that keyframe's scale from its final geometry
       keyframe_depth.settle(static_cast<std::uint64_t>(r.settled_keyframe), r.settled_log_scale,
                             r.settled_scale_grid_valid ? &r.settled_scale_grid : nullptr);
@@ -1151,6 +1162,8 @@ struct Session {
     reset_depth_pipeline();
     runtime.odometry = {};
     runtime.relocalizations = 0;
+    runtime.loops_closed = 0;
+    runtime.last_loop.clear();
     runtime.reassociations = 0;
     runtime.last_relocalization.clear();
   }

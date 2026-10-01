@@ -151,10 +151,43 @@ struct VisualOdometryConfig {
   // already observes (that track must be a pose inlier): the same point
   // triangulated twice under two tracks.
   bool merge_landmarks{true};
+
+  // Loop closure (needs descriptors). At each keyframe, older keyframes of the
+  // segment (>= loop_min_keyframe_gap keyframes back) whose camera centre is
+  // within loop_max_distance_ratio x the keyframe's median landmark depth and
+  // whose optical axis is within loop_max_angle_degrees are candidates. Their
+  // landmarks (active, dormant or retired) are matched to the keyframe's by
+  // descriptor (mutual best, cosine >= relocalization_min_similarity); a
+  // RANSAC similarity on the 3D-3D matches (|S X - Y| <= loop_distance_
+  // tolerance x depth) with >= loop_min_inliers that also reprojects closes
+  // the loop. A Sim3 pose graph over the segment's keyframes (consecutive,
+  // covisibility and loop edges) is optimized; the correction moves keyframes,
+  // landmarks and frames (map_generation() changes) and the loop's duplicate
+  // landmarks are merged. Trivial corrections only merge.
+  bool loop_closure{true};
+  int loop_min_keyframe_gap{30};
+  double loop_max_distance_ratio{1.0};
+  double loop_max_angle_degrees{45.0};
+  int loop_min_inliers{30};
+  double loop_search_radius_px{160.0};  // descriptor search around old landmarks' projections
+  double loop_distance_tolerance{0.05};
+  int loop_covisibility_min{30};   // shared landmarks for a covisibility edge
+  int loop_cooldown_keyframes{10};
+  double loop_edge_weight{10.0};
+  // Solve the pose graph on the calling thread, applying the correction in
+  // the same frame (deterministic: bench, tests). Otherwise a worker thread
+  // solves it and a later frame applies it.
+  bool loop_synchronous{false};
+  // Global bundle adjustment (VisualOdometry::global_bundle_adjust): all
+  // keyframes and landmarks of a segment, with every sighting. Keeps all
+  // retired landmarks' sightings for it when > 0. Tools run it before
+  // exporting (TUM suite, 20 iterations at the end: mean ATE 10.0 -> 8.4 cm,
+  // fr2_desk 12.3 -> 6.4, no sequence worse).
+  int final_bundle_iterations{20};
   // Cull also re-checks observations from keyframes outside the BA window
   // (dropping those that no longer reproject within 2x the threshold). Off:
   // only windowed observations are checked, as before.
-  bool cull_stale_observations{false};
+  bool cull_stale_observations{true};
 
   // Metric scale from network depth (DEPTH_INTEGRATION.md Phases 0-1; output
   // only, the solver is unchanged). At each keyframe, landmarks with
@@ -187,7 +220,7 @@ struct VisualOdometryConfig {
   // to its observation's noise, anisotropically (Mahalanobis residual), so a
   // poorly triangulated landmark stops pulling the pose along its uncertain
   // direction but still constrains it across (CONFIDENCE_DESIGN.md, phase 2).
-  bool pose_landmark_uncertainty{false};
+  bool pose_landmark_uncertainty{true};
   // With it: still reject outliers by plain pixel error (the covariance only
   // shapes the weights). A wrongly matched young landmark is uncertain along
   // its epipolar line, so a Mahalanobis gate would let it slide there.
@@ -195,7 +228,7 @@ struct VisualOdometryConfig {
   // Multiplies the landmark covariance used for those weights. The
   // geometry-only covariance holds the keyframes fixed and so is optimistic:
   // actual / predicted error ~1.4 on synthetic data (variance ~2).
-  double pose_landmark_covariance_scale{1.0};
+  double pose_landmark_covariance_scale{2.0};
   double observation_sigma_px{1.0};
   double min_observation_sigma_px{0.5};
   // MapPoint::confidence (diagnostic) = precision x verification. Precision
@@ -262,6 +295,15 @@ struct OdometryFrameResult {
   // low-frequency shape errors as well as its scale (DEPTH_INTEGRATION.md).
   bool keyframe_scale_grid_valid{};
   ScaleGrid keyframe_scale_grid{};
+  // Loop closure. Detected: a verified loop this frame (with an asynchronous
+  // solve the correction arrives in a later frame). Closed: a correction was
+  // applied this frame; keyframe_scale_changes lists (frame index, factor) for
+  // the keyframes whose camera units changed (multiply their metres-per-unit).
+  bool loop_detected{};
+  bool loop_closed{};
+  std::int64_t loop_keyframe{-1}, loop_candidate{-1};  // frame indices
+  int loop_inliers{};
+  std::vector<std::pair<std::uint64_t, double>> keyframe_scale_changes;
   // On keyframes: the keyframe that just left the bundle-adjustment window
   // (-1 = none) and its scale refitted at its now-final pose and landmarks.
   // Consumers should replace that keyframe's provisional scale with it.
@@ -329,6 +371,13 @@ class VisualOdometry {
   VisualOdometry& operator=(const VisualOdometry&) = delete;
 
   OdometryFrameResult process(const TrackedFrame& frame);
+  // Global bundle adjustment of every segment (iterations: Levenberg-Marquardt
+  // steps; <= 0 uses config final_bundle_iterations). Gauge: each segment's
+  // first two keyframes fixed. Moves keyframes, landmarks (all states) and the
+  // retired map, refreshes their uncertainty, keeps tracking continuous and
+  // bumps map_generation(). Returns false (nothing done) while an asynchronous
+  // loop correction is pending.
+  bool global_bundle_adjust(int iterations = 0);
   void reset();
 
   [[nodiscard]] std::vector<TrajectorySample> trajectory() const;
@@ -338,13 +387,17 @@ class VisualOdometry {
   [[nodiscard]] std::vector<TrajectorySample> trajectory(std::size_t first) const;
   [[nodiscard]] std::size_t stable_prefix() const;
   [[nodiscard]] std::size_t trajectory_size() const;
+  // Changes when existing trajectory samples or retired points change other
+  // than by appending (a loop correction): viewers then refetch everything.
+  [[nodiscard]] std::uint64_t map_generation() const;
   // Landmarks that are not final: those of the current segment still being
   // refined (tracked or in the bundle-adjustment window), plus, with
   // relocalization, recently ended ones and a lost segment's map, which may
   // still be re-found (see relocalization_max_frames).
   [[nodiscard]] std::vector<MapPoint> active_map() const;
   // Landmarks that left the window after their track ended, or whose segment
-  // ended; all segments, in retirement order. Append-only until reset(), and
+  // ended; all segments, in retirement order. Append-only until reset() or a
+  // map_generation() change (a loop correction moves them), and
   // final (never refined again), so viewers can fetch only new ones.
   [[nodiscard]] std::size_t retired_count() const;
   [[nodiscard]] std::vector<MapPoint> retired_map(std::size_t first = 0) const;

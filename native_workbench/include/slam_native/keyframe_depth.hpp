@@ -74,7 +74,11 @@ struct KeyframeDepthConfig {
   // there, angle between the two viewing rays), trained only on residuals of
   // points an earlier keyframe already confirmed (so see-through outliers
   // cannot loosen it). Tolerance = clamp(sigmas x predicted sigma, min, max).
-  bool adaptive_tolerance{true};
+  // Off: measured against TUM ground-truth depth (tools/dense_vs_gt.py), it
+  // hides far fewer bad points than the fixed tolerance (fr3: 1.7 % vs 6.2 %
+  // of points with > 10 % depth error), and capped at the fixed tolerance it
+  // changes nothing (6.3 %). See DEPTH_INTEGRATION.md.
+  bool adaptive_tolerance{false};
   float tolerance_sigmas{2.5F};
   float tolerance_min{0.03F};
   float tolerance_max{0.15F};
@@ -109,6 +113,11 @@ class KeyframeDepthStore {
   // The keyframe's settled scale (OdometryFrameResult::settled_*). Re-applies
   // it to the cloud's points. False if the keyframe has no cloud.
   bool settle(std::uint64_t frame_index, double log_scale, const ScaleGrid* grid);
+  // The keyframe's camera units changed by `factor` (a loop correction,
+  // OdometryFrameResult::keyframe_scale_changes): metres per unit multiply by
+  // it. Points are unchanged; viewers divide by metres_per_unit. False if the
+  // keyframe has no cloud.
+  bool rescale(std::uint64_t frame_index, double factor);
 
   [[nodiscard]] const std::vector<KeyframeCloud>& clouds() const { return clouds_; }
   [[nodiscard]] const DepthConfidenceModel& confidence_model() const { return confidence_; }
