@@ -1,5 +1,7 @@
 #include "vo_geometry.hpp"
 
+#include <optional>
+
 #include <Eigen/Cholesky>
 #include <Eigen/Eigenvalues>
 #include <Eigen/LU>
@@ -323,18 +325,35 @@ int ransac_pnp(const Intrinsics& K, const std::vector<PoseObservation>& observat
   return best;
 }
 
+// M = sigma^2 (sigma^2 I + C)^-1 for each observation with a landmark
+// covariance (see PoseObservation); empty optional = identity.
+std::vector<std::optional<Eigen::Matrix2d>> metrics(const std::vector<PoseObservation>& observations) {
+  std::vector<std::optional<Eigen::Matrix2d>> M(observations.size());
+  for (std::size_t i = 0; i < observations.size(); ++i) {
+    const auto& o = observations[i];
+    if (o.landmark_covariance.isZero()) continue;
+    const double s2 = o.sigma * o.sigma;
+    M[i] = s2 * (s2 * Eigen::Matrix2d::Identity() + o.landmark_covariance).inverse();
+  }
+  return M;
+}
+
 int optimize_pose(const Intrinsics& K, const std::vector<PoseObservation>& observations, SE3& pose,
-                  double inlier_threshold, std::vector<char>& inliers, int iterations) {
+                  double inlier_threshold, std::vector<char>& inliers, int iterations, bool pixel_gate) {
   const int count = static_cast<int>(observations.size());
   inliers.assign(count, 1);
+  const auto M = metrics(observations);
+  // Squared residual in sigma-pixels: |e|^2, or e^T M e with a landmark covariance.
+  const auto distance2 = [&](int i, const Vec2& e) { return M[i] ? e.dot(*M[i] * e) : e.squaredNorm(); };
   const auto evaluate = [&](const SE3& T, bool robust) {
     double cost = 0;
     for (int i = 0; i < count; ++i) {
       if (!inliers[i]) continue;
       const Vec3 xc = T * observations[i].X;
       if (xc.z() < kMinDepth) { cost += robust ? 1e6 : 0; continue; }
-      const double e2 = (K.project(xc) - observations[i].u).squaredNorm();
-      cost += robust ? huber_cost(e2, inlier_threshold) : e2;
+      const double e2 = distance2(i, K.project(xc) - observations[i].u);
+      const double information = 1.0 / (observations[i].sigma * observations[i].sigma);
+      cost += information * (robust ? huber_cost(e2, inlier_threshold) : e2);
     }
     return cost;
   };
@@ -350,9 +369,15 @@ int optimize_pose(const Intrinsics& K, const std::vector<PoseObservation>& obser
         if (xc.z() < kMinDepth) continue;
         const Vec2 e = K.project(xc) - observations[i].u;
         const Eigen::Matrix<double, 2, 6> J = projection_jacobian(K, xc) * perturbation_jacobian(xc);
-        const double w = huber_weight(e.squaredNorm(), inlier_threshold);
-        H += w * J.transpose() * J;
-        g -= w * J.transpose() * e;
+        const double w = huber_weight(distance2(i, e), inlier_threshold) /
+                         (observations[i].sigma * observations[i].sigma);
+        if (M[i]) {
+          H += w * J.transpose() * *M[i] * J;
+          g -= w * J.transpose() * (*M[i] * e);
+        } else {
+          H += w * J.transpose() * J;
+          g -= w * J.transpose() * e;
+        }
       }
       bool improved = false;
       for (int attempt = 0; attempt < 6 && !improved; ++attempt) {
@@ -378,8 +403,9 @@ int optimize_pose(const Intrinsics& K, const std::vector<PoseObservation>& obser
     // Classify, then refine on inliers only.
     for (int i = 0; i < count; ++i) {
       const Vec3 xc = pose * observations[i].X;
+      const Vec2 e = K.project(xc) - observations[i].u;
       inliers[i] = xc.z() > kMinDepth &&
-          (K.project(xc) - observations[i].u).squaredNorm() <= inlier_threshold * inlier_threshold;
+          (pixel_gate ? e.squaredNorm() : distance2(i, e)) <= inlier_threshold * inlier_threshold;
     }
   }
   return static_cast<int>(std::count(inliers.begin(), inliers.end(), 1));
@@ -401,7 +427,7 @@ BundleReport bundle_adjust(const Intrinsics& K, BundleProblem& problem, int iter
     for (const auto& ob : problem.observations) {
       const Vec3 xc = T[ob.camera] * X[ob.point];
       if (xc.z() < kMinDepth) { cost += 2 * huber_px * 100; continue; }
-      cost += huber_cost((K.project(xc) - ob.u).squaredNorm(), huber_px);
+      cost += huber_cost((K.project(xc) - ob.u).squaredNorm(), huber_px) / (ob.sigma * ob.sigma);
     }
     return cost;
   };
@@ -426,7 +452,7 @@ BundleReport bundle_adjust(const Intrinsics& K, BundleProblem& problem, int iter
       W[o].setZero();
       if (xc.z() < kMinDepth) continue;
       const Vec2 e = K.project(xc) - ob.u;
-      const double w = huber_weight(e.squaredNorm(), huber_px);
+      const double w = huber_weight(e.squaredNorm(), huber_px) / (ob.sigma * ob.sigma);
       const Eigen::Matrix<double, 2, 3> Jproj = projection_jacobian(K, xc);
       const Eigen::Matrix<double, 2, 3> Jp = Jproj * T.R;
       Hpp[ob.point] += w * Jp.transpose() * Jp;
@@ -498,5 +524,32 @@ BundleReport bundle_adjust(const Intrinsics& K, BundleProblem& problem, int iter
   }
   report.final_cost = cost;
   return report;
+}
+
+Mat3 point_information(const Intrinsics& K, const Vec3& X, const std::vector<PointView>& views) {
+  Mat3 H = Mat3::Zero();
+  for (const auto& view : views) {
+    const Vec3 xc = view.camera * X;
+    if (xc.z() < kMinDepth) continue;
+    const Eigen::Matrix<double, 2, 3> J = projection_jacobian(K, xc) * view.camera.R;
+    H += J.transpose() * J / (view.sigma * view.sigma);
+  }
+  return H;
+}
+
+Eigen::Matrix<double, 6, 6> pose_information(const Intrinsics& K, const std::vector<PoseObservation>& observations,
+                                             const SE3& pose, const std::vector<char>& inliers) {
+  Eigen::Matrix<double, 6, 6> H = Eigen::Matrix<double, 6, 6>::Zero();
+  const auto M = metrics(observations);
+  for (std::size_t i = 0; i < observations.size(); ++i) {
+    if (!inliers.empty() && !inliers[i]) continue;
+    const Vec3 xc = pose * observations[i].X;
+    if (xc.z() < kMinDepth) continue;
+    const Eigen::Matrix<double, 2, 6> J = projection_jacobian(K, xc) * perturbation_jacobian(xc);
+    const double s2 = observations[i].sigma * observations[i].sigma;
+    if (M[i]) H += J.transpose() * *M[i] * J / s2;
+    else H += J.transpose() * J / s2;
+  }
+  return H;
 }
 }  // namespace slam_native::vo

@@ -16,3 +16,4 @@ archive/
 *.rrd
 /third_party/
 pointcache/
+out/

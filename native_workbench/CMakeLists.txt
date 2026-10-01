@@ -128,6 +128,7 @@ if(SLAM_NATIVE_BUILD_APP)
     src/main.cpp
     src/app.cpp
     src/launcher.cpp
+    src/video_thumbnail.cpp
     src/descriptor_projection.cpp
     src/ffmpeg_cuda_decoder.cpp
     src/tensorrt_superpoint.cu
@@ -140,6 +141,8 @@ if(SLAM_NATIVE_BUILD_APP)
     src/fov_view.cpp
     src/color_sampler.cu
     src/depth_estimator.cu
+    src/depth_sampling.cpp
+    src/keyframe_depth.cpp
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
@@ -191,9 +194,19 @@ if(SLAM_NATIVE_BUILD_APP)
     add_executable(slam-native-snapshot tests/snapshot_app.cpp ${transport_sources})
     target_include_directories(slam-native-snapshot PRIVATE ${transport_includes})
     target_link_libraries(slam-native-snapshot PRIVATE ${transport_libraries})
+    add_executable(slam-native-snapshot-launcher tests/snapshot_launcher.cpp ${transport_sources})
+    target_include_directories(slam-native-snapshot-launcher PRIVATE ${transport_includes})
+    target_link_libraries(slam-native-snapshot-launcher PRIVATE ${transport_libraries})
     add_executable(slam-native-gpu-tracker-test tests/test_flow_tracker.cpp src/flow_association.cu)
     target_link_libraries(slam-native-gpu-tracker-test PRIVATE slam-native-store CUDA::cudart)
     add_test(NAME native_gpu_flow_tracker COMMAND slam-native-gpu-tracker-test)
+    # Depth sampling and keyframe clouds on synthetic maps (no engine or video needed).
+    add_executable(slam-native-depth-test tests/test_depth.cpp src/depth_estimator.cu src/depth_sampling.cpp
+      src/keyframe_depth.cpp)
+    target_include_directories(slam-native-depth-test PRIVATE include ${TENSORRT_INCLUDE_DIR})
+    target_link_libraries(slam-native-depth-test PRIVATE slam-native-vo CUDA::cudart ${TENSORRT_LIBRARY}
+      ${CMAKE_DL_LIBS})
+    add_test(NAME native_depth COMMAND slam-native-depth-test)
     add_executable(slam-native-display-test
       tests/test_display.cpp
       src/ffmpeg_cuda_decoder.cpp
@@ -219,6 +232,9 @@ if(SLAM_NATIVE_BUILD_APP)
       src/optical_flow.cu
       src/flow_association.cu
       src/color_sampler.cu
+      src/depth_estimator.cu
+      src/depth_sampling.cpp
+      src/keyframe_depth.cpp
     )
     target_include_directories(slam-native-tracking-bench PRIVATE include third_party/nvof ${TENSORRT_INCLUDE_DIR})
     target_link_libraries(slam-native-tracking-bench PRIVATE slam-native-store slam-native-vo PkgConfig::FFMPEG

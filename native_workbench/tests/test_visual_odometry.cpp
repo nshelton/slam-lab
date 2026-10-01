@@ -243,12 +243,14 @@ void reassociates_broken_tracks() {
   std::unordered_map<std::uint64_t, std::size_t> truth;  // track -> true point (colour-encoded)
   for (const auto& frame : frames)
     for (const auto& o : frame.observations) truth[o.track_id] = o.color[0] + 256U * o.color[1];
-  int landmarks_off = 0;
-  for (const bool enabled : {false, true}) {
+  int landmarks_off = 0, landmarks_no_merge = 0;
+  for (const int mode : {0, 1, 2}) {  // off, re-association without merging, with merging
+    const bool enabled = mode > 0;
     VisualOdometryConfig config;
     config.reassociation = enabled;
+    config.merge_landmarks = mode == 2;
     VisualOdometry odometry(config);
-    int reassociated = 0, wrong = 0, reported = 0;
+    int reassociated = 0, wrong = 0, reported = 0, merged = 0;
     for (const auto& frame : frames) {
       const auto r = odometry.process(frame);
       reported += static_cast<int>(r.untracked_landmarks.size());
@@ -258,21 +260,35 @@ void reassociates_broken_tracks() {
         ++reassociated;
         wrong += truth.at(p.track_id) != truth.at(p.new_track_id);
       }
+      merged += r.merged;
       require(r.reassociated == static_cast<int>(std::count_if(r.untracked_landmarks.begin(),
           r.untracked_landmarks.end(), [](const auto& p) { return p.reassociated; })), "re-association count");
     }
-    const int landmarks = static_cast<int>(odometry.retired_count() + odometry.active_map().size());
-    std::cout << "broken tracks, re-association " << (enabled ? "on" : "off") << ": " << landmarks
-              << " landmarks, " << reassociated << " re-associated (" << wrong << " wrong), "
+    auto map = odometry.retired_map();
+    const auto active = odometry.active_map();
+    map.insert(map.end(), active.begin(), active.end());
+    std::unordered_map<std::uint64_t, int> id_count;
+    for (const auto& point : map) ++id_count[point.landmark_id];
+    for (const auto& [id, n] : id_count) require(n == 1, "a landmark id appears twice in the map");
+    const int landmarks = static_cast<int>(map.size());
+    static const char* names[] = {"off", "on, no merging", "on, merging"};
+    std::cout << "broken tracks, re-association " << names[mode] << ": " << landmarks << " landmarks, "
+              << reassociated << " re-associated (" << merged << " merges, " << wrong << " wrong), "
               << reported / static_cast<int>(frames.size()) << " untracked in view per frame\n";
     if (!enabled) {
       landmarks_off = landmarks;
-      require(reassociated == 0, "re-association while disabled");
+      require(reassociated == 0 && merged == 0, "re-association while disabled");
       continue;
     }
     require(reassociated > 300, "too few re-associations");
     require(wrong * 100 <= reassociated, "more than 1% of re-associations joined different points");
     require(landmarks * 10 < landmarks_off * 9, "re-association did not reduce duplicate landmarks");
+    if (mode == 1) {
+      landmarks_no_merge = landmarks;
+      require(merged == 0, "merged while merging is disabled");
+    } else {
+      require(merged > 0 && landmarks < landmarks_no_merge, "merging did not reduce duplicate landmarks");
+    }
   }
 }
 
@@ -355,8 +371,113 @@ void p3p_recovers_pose() {
   require(count >= 70 && rotation < 0.2, "P3P RANSAC did not find the pose");
 }
 
+// Uncertainty diagnostics (CONFIDENCE_DESIGN.md phase 0): every final map
+// point carries one, low-confidence points really are worse, and the
+// predicted relative depth sigma is of the right order (normalized error ~1).
+void reports_uncertainty() {
+  const auto scene = make_scene(true, 240, 5, {0.7, 0.08, 0.01, 0, 0});  // pixel noise, no movers/outliers
+  VisualOdometry odometry;
+  int tracked = 0, with_sigma = 0;
+  for (const auto& frame : scene.frames) {
+    const auto r = odometry.process(frame);
+    if (r.state != OdometryState::tracking || !r.has_pose) continue;
+    ++tracked;
+    with_sigma += std::isfinite(r.rotation_sigma_degrees) && r.rotation_sigma_degrees > 0 &&
+                  std::isfinite(r.translation_sigma_ratio) && r.translation_sigma_ratio > 0;
+  }
+  require(tracked > 100 && with_sigma >= tracked - 2, "pose uncertainty missing on tracked frames");
+  auto map = odometry.retired_map();
+  require(map.size() > 200, "too few retired landmarks");
+  Eigen::Matrix3Xd estimated(3, map.size()), truth(3, map.size());
+  for (std::size_t i = 0; i < map.size(); ++i) {
+    const auto& point = map[i];
+    require(!std::isnan(point.depth_sigma_ratio) && point.confidence >= 0 && point.confidence <= 1 &&
+            point.max_parallax_degrees > 0, "retired landmark without uncertainty");
+    estimated.col(i) = Eigen::Vector3d(point.position[0], point.position[1], point.position[2]);
+    truth.col(i) = scene.points[point.color[0] + 256U * point.color[1]];
+  }
+  // Align by the camera trajectory (a few wild low-parallax points would
+  // dominate a fit on the map itself).
+  const auto trajectory = odometry.trajectory();
+  Eigen::Matrix3Xd centers(3, trajectory.size()), true_centers(3, trajectory.size());
+  for (std::size_t i = 0; i < trajectory.size(); ++i) {
+    const auto c = trajectory[i].pose.center();
+    centers.col(i) = Eigen::Vector3d(c[0], c[1], c[2]);
+    true_centers.col(i) = scene.centers[trajectory[i].frame_index];
+  }
+  const Eigen::Matrix4d S = Eigen::umeyama(centers, true_centers, true);
+  std::vector<double> confident, doubtful, normalized;
+  for (std::size_t i = 0; i < map.size(); ++i) {
+    const Eigen::Vector3d X = S.topLeftCorner<3, 3>() * estimated.col(i) + S.topRightCorner<3, 1>();
+    const double relative = (X - truth.col(i)).norm() / (truth.col(i) - scene.centers[map[i].last_frame]).norm();
+    // Precision only (this scene has no wrong matches, so the view-count
+    // verification in `confidence` carries no information here): the depth
+    // sigma bands where precision 1 / (1 + (r / 0.05)^2) is > 0.9 and < 0.5.
+    if (map[i].depth_sigma_ratio < 0.05F / 3) confident.push_back(relative);
+    if (map[i].depth_sigma_ratio > 0.05F) doubtful.push_back(relative);
+    if (std::isfinite(map[i].depth_sigma_ratio)) normalized.push_back(relative / map[i].depth_sigma_ratio);
+  }
+  const auto median = [](std::vector<double> v) {
+    std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(v.size() / 2), v.end());
+    return v[v.size() / 2];
+  };
+  require(confident.size() > 50 && doubtful.size() > 20, "confidence does not spread over the map");
+  const double good = median(confident), bad = median(doubtful), ratio = median(normalized);
+  std::cout << "uncertainty: " << map.size() << " retired points, relative error median " << good
+            << " (precise, n=" << confident.size() << ") vs " << bad << " (imprecise, n=" << doubtful.size()
+            << "), error / predicted sigma median " << ratio << ", pose sigma on " << with_sigma << "/" << tracked
+            << " tracked frames\n";
+  require(bad > 1.5 * good, "imprecise points are not worse than precise ones");  // measured 2.2x
+  require(ratio > 0.2 && ratio < 5, "predicted depth sigma is off by more than 5x");
+}
+
+// Verification and consistency: on the default scene, the 80 independently
+// moving points produce wrong landmarks (their observations agree with no
+// static point). They die young, so they are over-represented among landmarks
+// seen by only two keyframes, and when they do get 3+ views their windowed
+// reprojection RMS is about twice the map's (median 1.04 vs 0.56). Their
+// confidence (precision x verification x consistency) is much lower. Note: by gross position error alone the view count is confounded:
+// in a forward walk the longest-seen static points sit near the focus of
+// expansion, with the least parallax (the precision term covers that).
+void confidence_flags_unverified_points() {
+  const auto scene = make_scene(true);
+  constexpr std::size_t kMovers = 80;  // make_scene: points [0, movers) move
+  VisualOdometry odometry;
+  for (const auto& frame : scene.frames) odometry.process(frame);
+  int two = 0, two_movers = 0, many = 0, many_movers = 0;
+  std::vector<double> mover_confidence, static_confidence, mover_precision, static_precision;
+  for (const auto& point : odometry.retired_map()) {
+    const bool mover = point.color[0] + 256U * point.color[1] < kMovers;
+    if (point.keyframe_observations == 2) { ++two; two_movers += mover; }
+    if (point.keyframe_observations >= 4) { ++many; many_movers += mover; }
+    (mover ? mover_confidence : static_confidence).push_back(point.confidence);
+    const double q = point.depth_sigma_ratio / 0.05;  // precision term alone (no view count)
+    (mover ? mover_precision : static_precision).push_back(std::isfinite(q) ? 1 / (1 + q * q) : 0.0);
+  }
+  const auto rate = [](int k, int n) { return n ? 100.0 * k / n : 0.0; };
+  const auto median = [](std::vector<double> v) {
+    std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(v.size() / 2), v.end());
+    return v[v.size() / 2];
+  };
+  require(two > 50 && many > 50 && mover_confidence.size() > 20, "too few points per class");
+  std::cout << "verification: moving-point landmarks are " << rate(two_movers, two) << "% of 2-view points (n="
+            << two << ") vs " << rate(many_movers, many) << "% of >=4-view (n=" << many << "); median confidence "
+            << median(mover_confidence) << " (moving, n=" << mover_confidence.size() << ") vs "
+            << median(static_confidence) << " (static); precision alone " << median(mover_precision) << " vs "
+            << median(static_precision) << "\n";
+  require(rate(two_movers, two) > 2 * rate(many_movers, many), "wrong landmarks are not concentrated in 2-view points");
+  // Measured: moving / static median 0.91 with precision alone, 0.76 adding
+  // the view-count verification, 0.38 adding the reprojection consistency.
+  const double with_views = median(mover_confidence) / median(static_confidence);
+  const double precision_only = median(mover_precision) / median(static_precision);
+  require(with_views < 0.6 && with_views < precision_only - 0.2,
+          "verification and consistency do not flag wrong landmarks");
+}
+
 int main() {
   try {
+    reports_uncertainty();
+    confidence_flags_unverified_points();
     pose_optimizer_converges();
     p3p_recovers_pose();
     relocalizes_after_occlusion();
@@ -435,6 +556,29 @@ int main() {
     }
     std::cout << "CSV replay max centre difference " << difference << '\n';
     require(difference < 1e-3, "CSV replay differs (float32 round trip should be tiny)");
+    {
+      // Named optional columns: colour, sigma and depth survive a round trip.
+      TrackedFrame frame{7, 123, 1920, 1080, {}, 0, {}};
+      TrackObservation a{1, 10.5F, 20.25F, true, {1, 2, 3}};
+      a.sigma_px = 0.8F;
+      a.depth_m = 4.5F;
+      a.depth_sigma_m = 0.6F;
+      TrackObservation b{2, 30, 40, true, {4, 5, 6}};  // depth unknown
+      frame.observations = {a, b};
+      const auto depth_path = std::filesystem::temp_directory_path() / "slam-native-vo-test-depth.csv";
+      {
+        std::ofstream out(depth_path);
+        write_tracks_header(out, 1920, 1080, TrackColumns{true, true, true});
+        write_tracks(out, frame, TrackColumns{true, true, true});
+      }
+      const auto back = read_tracks_csv(depth_path);
+      std::filesystem::remove(depth_path);
+      require(back.size() == 1 && back[0].observations.size() == 2, "depth CSV lost rows");
+      const auto& p = back[0].observations[0];
+      const auto& q = back[0].observations[1];
+      require(p.has_color && p.color[2] == 3 && p.sigma_px == 0.8F && p.depth_m == 4.5F && p.depth_sigma_m == 0.6F &&
+              q.depth_m == 0 && q.color[0] == 4, "named tracks CSV columns did not round-trip");
+    }
     std::cout << "visual odometry checks passed\n";
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

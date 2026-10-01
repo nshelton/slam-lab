@@ -1,5 +1,7 @@
+#define GL_GLEXT_PROTOTYPES
 #include "slam_native/launcher.hpp"
 
+#include <GLFW/glfw3.h>
 #include <imgui.h>
 #include <misc/cpp/imgui_stdlib.h>
 #include <sqlite3.h>
@@ -194,6 +196,19 @@ fs::path default_point_cache(const fs::path& repository_root, const AppConfig& c
   return repository_root / "pointcache" / name.str();
 }
 
+fs::path thumbnail_path(const fs::path& repository_root, const fs::path& video) {
+  std::error_code error;
+  const fs::path canonical = fs::weakly_canonical(video, error);
+  std::string stem = video.stem().string();
+  if (stem.empty()) stem = "video";
+  for (char& character : stem)
+    if (!std::isalnum(static_cast<unsigned char>(character)) && character != '-' && character != '_') character = '-';
+  std::ostringstream name;
+  name << stem << '-' << std::hex << std::setw(12) << std::setfill('0')
+       << (fnv1a(canonical.string() + '\n' + file_stamp(canonical)) >> 16) << ".ppm";
+  return repository_root / "pointcache" / "thumbnails" / name.str();
+}
+
 std::string format_bytes(std::uintmax_t bytes) {
   constexpr const char* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
   double value = static_cast<double>(bytes);
@@ -212,6 +227,164 @@ Launcher::Launcher(AppConfig initial, fs::path repository_root)
       recents_(RecentSessions::default_storage_path()),
       repository_root_(std::move(repository_root)),
       video_(initial_.video.string()), engine_(initial_.engine.string()) {}
+
+Launcher::~Launcher() {
+  {
+    std::lock_guard lock(thumbnail_mutex_);
+    thumbnail_stop_ = true;
+  }
+  thumbnail_wake_.notify_all();
+  if (thumbnail_thread_.joinable()) thumbnail_thread_.join();
+  for (auto& [video, slot] : thumbnails_)
+    if (slot.texture) glDeleteTextures(1, &slot.texture);
+}
+
+// Worker: decode queued videos one at a time (disk cache first).
+void Launcher::thumbnail_worker() {
+  for (;;) {
+    fs::path video;
+    {
+      std::unique_lock lock(thumbnail_mutex_);
+      thumbnail_wake_.wait(lock, [&] { return thumbnail_stop_ || !thumbnail_queue_.empty(); });
+      if (thumbnail_stop_) return;
+      video = thumbnail_queue_.front();
+      thumbnail_queue_.pop_front();
+    }
+    ThumbnailResult result{video, std::nullopt, {}};
+    try {
+      const fs::path cached = thumbnail_path(repository_root_, video);
+      result.image = load_ppm(cached);
+      if (!result.image) {
+        std::error_code error;
+        if (!fs::is_regular_file(video, error)) throw std::runtime_error("file missing");
+        result.image = make_thumbnail(video);
+        save_ppm(cached, *result.image);
+      }
+    } catch (const std::exception& error) {
+      result.error = error.what();
+    }
+    std::lock_guard lock(thumbnail_mutex_);
+    thumbnail_results_.push_back(std::move(result));
+  }
+}
+
+Launcher::ThumbnailSlot& Launcher::thumbnail(const fs::path& video) {
+  auto [it, inserted] = thumbnails_.try_emplace(video);
+  if (inserted) {
+    {
+      std::lock_guard lock(thumbnail_mutex_);
+      thumbnail_queue_.push_back(video);
+    }
+    if (!thumbnail_thread_.joinable()) thumbnail_thread_ = std::thread([this] { thumbnail_worker(); });
+    thumbnail_wake_.notify_one();
+  }
+  return it->second;
+}
+
+// Main thread: upload finished thumbnails as textures.
+void Launcher::collect_thumbnails() {
+  std::vector<ThumbnailResult> results;
+  {
+    std::lock_guard lock(thumbnail_mutex_);
+    results.swap(thumbnail_results_);
+  }
+  for (auto& result : results) {
+    auto& slot = thumbnails_[result.video];
+    if (!result.image) {
+      slot.state = ThumbnailSlot::State::failed;
+      slot.error = result.error;
+      continue;
+    }
+    GLint previous = 0, alignment = 4;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous);
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+    if (!slot.texture) glGenTextures(1, &slot.texture);
+    glBindTexture(GL_TEXTURE_2D, slot.texture);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, result.image->width, result.image->height, 0, GL_RGB, GL_UNSIGNED_BYTE,
+                 result.image->rgb.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous));
+    slot.state = ThumbnailSlot::State::ready;
+    slot.width = result.image->width;
+    slot.height = result.image->height;
+  }
+}
+
+bool Launcher::draw_recent_grid() {
+  constexpr int kColumns = 4;
+  const auto& recents = recents_.entries();
+  if (recents.empty()) {
+    ImGui::TextDisabled("No recent videos yet: load a sequence below.");
+    return false;
+  }
+  collect_thumbnails();
+  const ImGuiStyle& style = ImGui::GetStyle();
+  const float cell_width = (ImGui::GetContentRegionAvail().x - (kColumns - 1) * style.ItemSpacing.x) / kColumns;
+  const float image_height = cell_width * 9.0F / 16.0F;
+  const float text_height = ImGui::GetTextLineHeight();
+  ImDrawList* draw = ImGui::GetWindowDrawList();
+  bool start = false;
+  for (std::size_t i = 0; i < recents.size() && i < RecentSessions::kCapacity; ++i) {
+    const RecentSession& recent = recents[i];
+    if (i % kColumns) ImGui::SameLine();
+    ImGui::PushID(static_cast<int>(i));
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const ImVec2 size{cell_width, image_height + text_height + 6};
+    const bool clicked = ImGui::InvisibleButton("recent", size);
+    const bool hovered = ImGui::IsItemHovered();
+    const bool selected = absolute_path(video_) == recent.video;
+    std::error_code error;
+    const bool exists = fs::is_regular_file(recent.video, error);
+    if (clicked) {
+      video_ = recent.video.string();
+      if (!recent.engine.empty()) engine_ = recent.engine.string();
+      error_.clear();
+      start = exists && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+    }
+    // Image area: thumbnail letterboxed into 16:9, or a placeholder.
+    const ImVec2 i0 = p0, i1{p0.x + cell_width, p0.y + image_height};
+    draw->AddRectFilled(i0, i1, IM_COL32(24, 26, 30, 255), 4.0F);
+    const ThumbnailSlot& slot = thumbnail(recent.video);
+    if (slot.state == ThumbnailSlot::State::ready) {
+      const float scale = std::min(cell_width / slot.width, image_height / slot.height);
+      const float w = slot.width * scale, h = slot.height * scale;
+      const ImVec2 a{i0.x + 0.5F * (cell_width - w), i0.y + 0.5F * (image_height - h)};
+      draw->AddImage(static_cast<ImTextureID>(slot.texture), a, {a.x + w, a.y + h});
+    } else {
+      const char* label = slot.state == ThumbnailSlot::State::pending ? "loading..." :
+                          exists ? "no preview" : "file missing";
+      const ImVec2 text = ImGui::CalcTextSize(label);
+      draw->AddText({i0.x + 0.5F * (cell_width - text.x), i0.y + 0.5F * (image_height - text.y)},
+                    IM_COL32(150, 150, 150, 255), label);
+    }
+    if (!exists) draw->AddRectFilled(i0, i1, IM_COL32(0, 0, 0, 140), 4.0F);
+    const ImU32 border = selected ? ImGui::GetColorU32(ImGuiCol_ButtonActive) :
+                         hovered ? ImGui::GetColorU32(ImGuiCol_ButtonHovered) : IM_COL32(60, 64, 72, 255);
+    draw->AddRect(i0, i1, border, 4.0F, 0, selected ? 3.0F : 1.0F);
+    // Name, clipped to the cell; with the parent folder when another recent
+    // video has the same file name (e.g. the TUM sequences' rgb.mp4).
+    std::string name = recent.video.filename().string();
+    if (std::count_if(recents.begin(), recents.end(),
+                      [&](const RecentSession& other) { return other.video.filename() == recent.video.filename(); }) > 1)
+      name = recent.video.parent_path().filename().string() + "/" + name;
+    draw->PushClipRect({p0.x, i1.y}, {p0.x + cell_width, p0.y + size.y}, true);
+    draw->AddText({p0.x + 2, i1.y + 3}, exists ? ImGui::GetColorU32(ImGuiCol_Text) :
+                                          ImGui::GetColorU32(ImGuiCol_TextDisabled), name.c_str());
+    draw->PopClipRect();
+    if (hovered) {
+      ImGui::SetTooltip("%s%s%s\nClick to select, double-click to open", recent.video.c_str(),
+                        exists ? "" : "\n(file missing)",
+                        slot.state == ThumbnailSlot::State::failed && exists ? ("\npreview: " + slot.error).c_str() : "");
+    }
+    ImGui::PopID();
+  }
+  return start;
+}
 
 void Launcher::set_error(std::string error) { error_ = std::move(error); }
 
@@ -346,33 +519,20 @@ void Launcher::draw_browser() {
 
 bool Launcher::draw(AppConfig& selected, DatabaseSummary& database_summary) {
   ImGui::SetNextWindowPos({30, 30}, ImGuiCond_FirstUseEver);
-  ImGui::SetNextWindowSize({900, 590}, ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize({900, 840}, ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSizeConstraints({700, 780}, {100000, 100000});  // room for the 4x4 grid
   ImGui::Begin("Open SLAM session");
   ImGui::TextWrapped("SuperPoint detections are cached. Tracks are rebuilt in memory on each run using optical flow.");
   ImGui::Separator();
   ImGui::TextUnformatted("Tracking: SuperPoint + NVIDIA optical flow");
   ImGui::TextUnformatted("Recent videos");
-  ImGui::SetNextItemWidth(-1);
-  ImGui::BeginDisabled(recents_.entries().empty());
-  if (ImGui::BeginCombo("##recent-videos", "Select a recent video...")) {
-    for (const RecentSession& recent : recents_.entries()) {
-      const std::string label = recent.video.filename().string() + "  —  " +
-                                recent.video.parent_path().string();
-      if (ImGui::Selectable(label.c_str())) {
-        video_ = recent.video.string();
-        if (!recent.engine.empty()) engine_ = recent.engine.string();
-        error_.clear();
-      }
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", recent.video.c_str());
-    }
-    ImGui::EndCombo();
-  }
-  ImGui::EndDisabled();
+  const bool open_recent = draw_recent_grid();
+  ImGui::Spacing();
   ImGui::TextUnformatted("Video");
-  ImGui::SetNextItemWidth(-95);
+  ImGui::SetNextItemWidth(-170);
   ImGui::InputText("##video", &video_);
   ImGui::SameLine();
-  if (ImGui::Button("Browse##video")) open_browser(Target::video);
+  if (ImGui::Button("Load new sequence...")) open_browser(Target::video);
   ImGui::TextUnformatted("TensorRT engine");
   ImGui::SetNextItemWidth(-95);
   ImGui::InputText("##engine", &engine_);
@@ -401,7 +561,8 @@ bool Launcher::draw(AppConfig& selected, DatabaseSummary& database_summary) {
   const bool valid = fs::is_regular_file(session.video, video_error) &&
                      fs::is_regular_file(session.engine, engine_error) && stats.error.empty();
   ImGui::BeginDisabled(!valid);
-  const bool start = ImGui::Button(stats.exists ? "Replay with cache" : "Start session", {160, 34});
+  const bool start = ImGui::Button(stats.exists ? "Replay with cache" : "Start session", {160, 34}) ||
+                     (open_recent && valid);
   ImGui::EndDisabled();
   if (!valid) ImGui::TextDisabled("Select an existing video and engine.");
   if (start) {

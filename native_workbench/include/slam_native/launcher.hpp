@@ -2,11 +2,18 @@
 
 #include "slam_native/app.hpp"
 #include "slam_native/recent_sessions.hpp"
+#include "slam_native/video_thumbnail.hpp"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
+#include <map>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace slam_native {
@@ -45,9 +52,21 @@ std::string format_bytes(std::uintmax_t bytes);
 // settings, schema), so a cache always matches the session that opens it.
 std::filesystem::path default_point_cache(const std::filesystem::path& repository_root, const AppConfig& config);
 
+// Where a video's launcher thumbnail is cached:
+// <repository>/pointcache/thumbnails/<video stem>-<hash>.ppm, keyed by the
+// video's path, size and modification time.
+std::filesystem::path thumbnail_path(const std::filesystem::path& repository_root, const std::filesystem::path& video);
+
+// The session picker: a 4x4 grid of recent videos with thumbnails (click to
+// select, double-click to start), "Load new sequence..." (file browser) and
+// the engine. Needs the OpenGL context (thumbnail textures); thumbnails are
+// decoded on a worker thread and cached on disk.
 class Launcher {
  public:
   Launcher(AppConfig initial, std::filesystem::path repository_root);
+  ~Launcher();
+  Launcher(const Launcher&) = delete;
+  Launcher& operator=(const Launcher&) = delete;
   bool draw(AppConfig& selected, DatabaseSummary& database_summary);
   void set_error(std::string error);
   void record_recent(const AppConfig& config);
@@ -59,6 +78,17 @@ class Launcher {
   void refresh_entries();
   void change_directory(const std::filesystem::path& directory);
   [[nodiscard]] std::string& target_path();
+  // Recent-video grid; returns true on a double-click (start that session).
+  bool draw_recent_grid();
+  struct ThumbnailSlot {
+    enum class State { pending, ready, failed } state{State::pending};
+    unsigned int texture{};
+    int width{}, height{};
+    std::string error;
+  };
+  ThumbnailSlot& thumbnail(const std::filesystem::path& video);
+  void collect_thumbnails();
+  void thumbnail_worker();
 
   AppConfig initial_;
   RecentSessions recents_;
@@ -75,6 +105,19 @@ class Launcher {
   std::string browser_filename_;
   std::string browser_error_;
   std::vector<std::filesystem::directory_entry> entries_;
+
+  std::map<std::filesystem::path, ThumbnailSlot> thumbnails_;
+  struct ThumbnailResult {
+    std::filesystem::path video;
+    std::optional<Thumbnail> image;
+    std::string error;
+  };
+  std::mutex thumbnail_mutex_;
+  std::condition_variable thumbnail_wake_;
+  std::deque<std::filesystem::path> thumbnail_queue_;   // videos to decode (worker)
+  std::vector<ThumbnailResult> thumbnail_results_;      // decoded, to upload (main thread)
+  bool thumbnail_stop_{};
+  std::thread thumbnail_thread_;
 };
 
 }  // namespace slam_native

@@ -23,8 +23,9 @@ engine() {  # onnx engine [trtexec args...]
   shift 2
   [[ -s "$out" ]] && { echo "keep $out"; return; }
   echo "build $out"
-  trtexec --onnx="$onnx" --saveEngine="$out" "$@" > "${out%.engine}.log" 2>&1 ||
-    { echo "trtexec failed, see ${out%.engine}.log"; exit 1; }
+  trtexec --onnx="$onnx" --saveEngine="$out.part" "$@" > "${out%.engine}.log" 2>&1 ||
+    { echo "trtexec failed, see ${out%.engine}.log"; rm -f "$out.part"; exit 1; }
+  mv "$out.part" "$out"
   grep -E "GPU Compute Time: min" "${out%.engine}.log" || true
 }
 

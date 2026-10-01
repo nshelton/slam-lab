@@ -9,9 +9,25 @@
 #include <string>
 
 namespace slam_native {
-void write_tracks_header(std::ostream& out, int width, int height, bool colors) {
-  out << "# size " << width << ' ' << height << "\nframe_index,timestamp_ns,track_id,x,y" << (colors ? ",r,g,b" : "")
-      << '\n';
+void write_tracks_header(std::ostream& out, int width, int height, TrackColumns columns) {
+  out << "# size " << width << ' ' << height << "\nframe_index,timestamp_ns,track_id,x,y"
+      << (columns.colors ? ",r,g,b" : "") << (columns.sigmas ? ",sigma" : "")
+      << (columns.depths ? ",depth,depth_sigma" : "") << '\n';
+}
+
+void write_tracks_header(std::ostream& out, int width, int height, bool colors, bool sigmas) {
+  write_tracks_header(out, width, height, TrackColumns{colors, sigmas, false});
+}
+
+void write_tracks(std::ostream& out, const TrackedFrame& frame, TrackColumns columns) {
+  out << std::setprecision(9);
+  for (const auto& o : frame.observations) {
+    out << frame.frame_index << ',' << frame.timestamp_ns << ',' << o.track_id << ',' << o.x << ',' << o.y;
+    if (columns.colors) out << ',' << int(o.color[0]) << ',' << int(o.color[1]) << ',' << int(o.color[2]);
+    if (columns.sigmas) out << ',' << std::max(o.sigma_px, 0.0F);
+    if (columns.depths) out << ',' << std::max(o.depth_m, 0.0F) << ',' << std::max(o.depth_sigma_m, 0.0F);
+    out << '\n';
+  }
 }
 
 void write_tracks(std::ostream& out, const TrackedFrame& frame) {
@@ -19,6 +35,7 @@ void write_tracks(std::ostream& out, const TrackedFrame& frame) {
   for (const auto& o : frame.observations) {
     out << frame.frame_index << ',' << frame.timestamp_ns << ',' << o.track_id << ',' << o.x << ',' << o.y;
     if (o.has_color) out << ',' << int(o.color[0]) << ',' << int(o.color[1]) << ',' << int(o.color[2]);
+    if (o.sigma_px > 0) out << ',' << o.sigma_px;
     out << '\n';
   }
 }
@@ -29,6 +46,7 @@ std::vector<TrackedFrame> read_tracks_csv(const std::filesystem::path& path, int
   std::vector<TrackedFrame> frames;
   std::string line;
   int file_width = 0, file_height = 0;
+  std::vector<std::string> header_extras;
   std::size_t number = 0;
   while (std::getline(in, line)) {
     ++number;
@@ -39,7 +57,16 @@ std::vector<TrackedFrame> read_tracks_csv(const std::filesystem::path& path, int
       if (header >> word && word == "size") header >> file_width >> file_height;
       continue;
     }
-    if (line.rfind("frame_index", 0) == 0) continue;
+    if (line.rfind("frame_index", 0) == 0) {  // header row: names of the optional columns
+      header_extras.clear();
+      std::istringstream names(line);
+      std::string name;
+      int column = 0;
+      while (std::getline(names, name, ',')) {
+        if (column++ >= 5) header_extras.push_back(name);
+      }
+      continue;
+    }
     std::istringstream row(line);
     std::uint64_t frame_index{}, track_id{};
     std::int64_t timestamp{};
@@ -55,13 +82,27 @@ std::vector<TrackedFrame> read_tracks_csv(const std::filesystem::path& path, int
       frames.push_back({frame_index, timestamp, 0, 0, {}, 0, {}});
     }
     TrackObservation observation{track_id, x, y};
-    int r{}, g{}, b{};
-    char c5{}, c6{}, c7{};
-    if (row >> c5 >> r >> c6 >> g >> c7 >> b && c5 == ',' && c6 == ',' && c7 == ',') {
+    // Optional extras, told apart by count: sigma | r,g,b | r,g,b,sigma.
+    std::vector<double> extra;
+    char comma{};
+    double value{};
+    while (row >> comma >> value && comma == ',') extra.push_back(value);
+    const auto set_color = [&](std::size_t first) {
       observation.has_color = true;
-      observation.color = {static_cast<std::uint8_t>(std::clamp(r, 0, 255)),
-                           static_cast<std::uint8_t>(std::clamp(g, 0, 255)),
-                           static_cast<std::uint8_t>(std::clamp(b, 0, 255))};
+      for (int c = 0; c < 3; ++c)
+        observation.color[c] = static_cast<std::uint8_t>(std::clamp(static_cast<int>(extra[first + c]), 0, 255));
+    };
+    if (!header_extras.empty() && extra.size() == header_extras.size()) {
+      for (std::size_t k = 0; k < extra.size(); ++k) {
+        const auto& name = header_extras[k];
+        if (name == "r" && k + 2 < extra.size()) set_color(k);
+        else if (name == "sigma") observation.sigma_px = static_cast<float>(extra[k]);
+        else if (name == "depth") observation.depth_m = static_cast<float>(extra[k]);
+        else if (name == "depth_sigma") observation.depth_sigma_m = static_cast<float>(extra[k]);
+      }
+    } else {
+      if (extra.size() == 3 || extra.size() == 4) set_color(0);
+      if (extra.size() == 1 || extra.size() == 4) observation.sigma_px = static_cast<float>(extra.back());
     }
     frames.back().observations.push_back(observation);
   }
@@ -89,13 +130,15 @@ void write_trajectory_csv(std::ostream& out, const std::vector<TrajectorySample>
 }
 
 void write_map_csv(std::ostream& out, const VisualOdometry& odometry) {
-  out << "track_id,segment,x,y,z,r,g,b,has_color,keyframe_observations,first_frame,last_frame,retired\n"
+  out << "track_id,segment,x,y,z,r,g,b,has_color,keyframe_observations,first_frame,last_frame,retired,"
+         "depth_sigma_ratio,max_parallax_deg,reprojection_rms,confidence,landmark_id\n"
       << std::setprecision(9);
   const auto write = [&](const std::vector<MapPoint>& points, int retired) {
     for (const auto& p : points)
       out << p.track_id << ',' << p.segment << ',' << p.position[0] << ',' << p.position[1] << ',' << p.position[2]
           << ',' << int(p.color[0]) << ',' << int(p.color[1]) << ',' << int(p.color[2]) << ',' << int(p.has_color)
-          << ',' << p.keyframe_observations << ',' << p.first_frame << ',' << p.last_frame << ',' << retired << '\n';
+          << ',' << p.keyframe_observations << ',' << p.first_frame << ',' << p.last_frame << ',' << retired << ',' << p.depth_sigma_ratio << ','
+          << p.max_parallax_degrees << ',' << p.reprojection_rms << ',' << p.confidence << ',' << p.landmark_id << '\n';
   };
   write(odometry.retired_map(), 1);
   write(odometry.active_map(), 0);

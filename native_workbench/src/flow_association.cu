@@ -62,6 +62,7 @@ struct TrackRecord {
   float correction;   // matched: |detection - prediction|
   float similarity;   // matched: descriptor cosine
   float fb_error;     // forward-backward residual of the prediction
+  float variance;     // position variance per axis after this frame (px^2)
   unsigned length, misses, kind;
   int detection;      // index of the supporting detection this frame; -1 when coasted
   unsigned long long id, first_frame, last_frame;
@@ -390,6 +391,7 @@ __global__ void build(const Counts* counts, const int* slot_detection, const int
   record.id = track.id;
   record.first_frame = track.first_frame;
   record.last_frame = track.last_frame;
+  record.variance = track.variance;
   records[slot] = record;
 }
 
@@ -633,7 +635,7 @@ void FlowTracker::associate(FrameFeatures& frame, const DeviceFlowField* flow,
   frame.landmark_ids.clear();
   frame.landmark_similarities.clear();
   frame.landmark_updates.clear();
-  frame.track_confidences.clear();
+  frame.track_sigmas_px.clear();
   frame.superpoint_supported.clear();
   frame.flow_predictions.clear();
   frame.correction_distances.clear();
@@ -651,6 +653,7 @@ void FlowTracker::associate(FrameFeatures& frame, const DeviceFlowField* flow,
     frame.flow_predictions.push_back(record.kind == kNew ? Keypoint{nan, nan, 0} :
         Keypoint{record.prediction_x, record.prediction_y, 0});
     frame.correction_distances.push_back(record.correction);
+    frame.track_sigmas_px.push_back(std::sqrt(record.variance));
     if (have_descriptors) {
       if (record.detection >= 0) {
         const auto row = detection_descriptors.begin() + static_cast<std::ptrdiff_t>(record.detection) * kDimension;

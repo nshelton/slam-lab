@@ -1,4 +1,5 @@
 #include "slam_native/superpoint.hpp"
+#include "slam_native/tensorrt_logger.hpp"
 
 #include <NvInfer.h>
 #include <cub/block/block_scan.cuh>
@@ -22,15 +23,6 @@ void cuda_check(cudaError_t result, const char* operation) {
     throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(result));
   }
 }
-
-class Logger final : public nvinfer1::ILogger {
- public:
-  void log(Severity severity, const char* message) noexcept override {
-    if (severity <= Severity::kWARNING) {
-      fprintf(stderr, "TensorRT: %s\n", message);
-    }
-  }
-};
 
 template <typename T>
 struct TrtDelete {
@@ -155,7 +147,7 @@ class TensorRtSuperPoint final : public SuperPoint {
     input.seekg(0);
     std::vector<char> bytes(static_cast<std::size_t>(size));
     input.read(bytes.data(), size);
-    runtime_.reset(nvinfer1::createInferRuntime(logger_));
+    runtime_.reset(nvinfer1::createInferRuntime(tensorrt_logger()));
     if (!runtime_) throw std::runtime_error("Cannot create TensorRT runtime");
     engine_.reset(runtime_->deserializeCudaEngine(bytes.data(), bytes.size()));
     if (!engine_) throw std::runtime_error("Cannot deserialize TensorRT engine");
@@ -318,7 +310,6 @@ class TensorRtSuperPoint final : public SuperPoint {
   }
 
   SuperPointConfig config_;
-  Logger logger_;
   std::unique_ptr<nvinfer1::IRuntime, TrtDelete<nvinfer1::IRuntime>> runtime_;
   std::unique_ptr<nvinfer1::ICudaEngine, TrtDelete<nvinfer1::ICudaEngine>> engine_;
   std::unique_ptr<nvinfer1::IExecutionContext, TrtDelete<nvinfer1::IExecutionContext>> context_;

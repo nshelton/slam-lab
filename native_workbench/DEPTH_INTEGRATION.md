@@ -1,13 +1,88 @@
 # Depth inference integration: design proposal
 
-Status: **draft for review** (2026-09-30). Builds on the existing
+Status: **draft for review**, revision 2 (2026-09-30). Builds on the existing
 `DepthEstimator` (`include/slam_native/depth_estimator.hpp`) and on
-`CONFIDENCE_DESIGN.md`; read `ARCHITECTURE.md` "Start here" first.
+`CONFIDENCE_DESIGN.md`; read `ARCHITECTURE.md` "Start here" first. Next step:
+**dense depth at keyframes** (Phase 2, with the minimum of Phases 0–1 it
+needs), then provisional landmarks.
+
+### Revision 2: what changed since the first draft
+
+- **Landed in the VO (same day):** landmarks have their own IDs
+  (`MapPoint::landmark_id`, a `track → landmark` index; tracks attach to and
+  leave landmarks), and re-association can **merge** duplicate landmarks. Any
+  per-landmark depth state below lives on the landmark, never on a track.
+- **Landed from the confidence work** (`CONFIDENCE_DESIGN.md` phases 0–1):
+  observations carry `TrackObservation::sigma_px`, and
+  `use_observation_sigma` is now **on by default**, so trajectories differ
+  from before. Compare with `--set use_observation_sigma=0`. Each landmark has
+  a geometry-only covariance (`update_quality`, called in `cull`), and
+  `MapPoint::confidence` = precision × a view-count factor
+  (`confidence_two_view`), so 2-view, low-parallax points already score low.
+- **New sections by the confidence session:** Phase 0 cues, Phase 0b
+  (self-calibrated per-pixel σ map), the circularity rule, and a proposed
+  answer to Q5. They are kept below as written.
+- **Decisions for the first implementation (user, 2026-09-30):**
+  DA-V2-S on **every frame** (indoor/outdoor weights per clip); live app
+  **delays the VO by one frame** so depth always matches its frame; dense view
+  as **point sprites per keyframe** (voxels later); **this session** does
+  Phase 2 with the minimal Phases 0–1 (per-track sampling, tracks CSV `depth`,
+  per-segment scale, `KeyframeDepthStore`, dense view). The confidence session
+  builds Phase 0b on the sampled data. Provisional landmarks follow,
+  coordinated with it.
+- **New here:** the rotation failure on `castle.mp4` (below), and
+  "Provisional landmarks: inverse depth", the building block that Phases 4–5
+  and the rotation fix share. It includes the constraints agreed with the
+  confidence session.
 
 Goal: use the monocular metric depth network to make the camera pose and map
 better (metric scale, faster and more robust initialization, occlusion
 reasoning, depth priors) and to show the scene densely, without making the
 tracker-agnostic VO depend on any particular depth model.
+
+## Implementation status (2026-09-30)
+
+Done (Phase 2 with the minimal Phases 0–1):
+
+- **Observation depth**: `TrackObservation::depth_m / depth_sigma_m`; tracks
+  CSV `depth,depth_sigma` columns (optional columns now read by header name;
+  `TrackColumns` on the writer).
+- **Sampling** (`depth_sampling.hpp`): the policy above, including the 3×3
+  edge test (foreground depth, 3× σ, or dropped) and clamp/padding rejection.
+- **Bench**: `depth <preset or engine stem>` runs the model synchronously
+  on every frame (≈ 3.9 ms/frame for DA-V2-S); `depth scale segment N` and
+  `depth:` report lines.
+- **VO scale** (output only): per-keyframe `keyframe_log_scale` /
+  `keyframe_scale_samples` / `keyframe_scale_spread`, and a per-segment
+  log-scale filter (`metric_scale`, `metric_scale_sigma`, `segment_scale()`).
+  Reference landmarks: ≥ 3 keyframes, ≥ 2° parallax, non-edge sample.
+- **Live app**: the VO runs one frame behind (pending queue, max 2 frames;
+  drained in `advance()` too). Depth is sampled at the tracks, and colours
+  for the cloud grid are sampled while the frame is alive.
+- **Dense keyframe clouds**: `KeyframeDepthStore` (grid = every 4th output
+  pixel, flying pixels and far points dropped, camera frame in metres),
+  drawn by `PointCloudRenderer` as point sprites with each keyframe's
+  *current* pose and **local** scale (the keyframe's own estimate, else the
+  segment's). Trajectory view: "Dense depth" checkbox and size.
+- CTest `native_depth`: grid/transform inversion for all rotations, the
+  sampling policy, back-projection and edge dropping.
+
+Measured (bench, DA-V2-S; the confidence session's Phase 0b agrees):
+
+| Clip | network error on reference landmarks (log, p50) | keyframe log-scale p10/p50/p90 | trend per 100 frames |
+|---|---|---|---|
+| TUM fr3 long_office | 0.083 | 1.15 / 1.31 / 1.48 | 0.000 |
+| disney_04 | 0.167 | 0.71 / 1.11 / 1.32 | −0.025 |
+| castle 95–115 s | 0.148 | 0.88 / 1.12 / 2.04 | −0.12 |
+| dreamworks | 0.077 | 0.34 / 1.68 / 1.82 | −0.20 |
+
+- **Absolute scale is biased**: on TUM the ground truth gives 2.40 m/unit,
+  the network 3.46 (+44 %, log +0.36), stable over the sequence. So metres
+  stay an *estimate* (Phase 1), never trusted directly.
+- **The VO's scale drifts within a segment** on some clips (dreamworks:
+  monotonic, ≈ 5× over the clip; TUM: none). One scale per segment is
+  therefore wrong for output; clouds use per-keyframe scale. Fixing the drift
+  itself is Phase 5's job (the depth prior), which this data motivates.
 
 ## Where we start
 
@@ -38,6 +113,19 @@ never triangulated, which is most of the view when walking forward. Since
 today, landmarks persist (dormant, relocalization) and every frame reports the
 landmarks that project into view but are untracked (the magenta rings), with
 no way yet to tell *why* they are untracked.
+
+**Rotation starves the map (`castle.mp4`, ≈ 108.5–113 s, 60 fps drone).** The
+camera pitches up towards the horizon at ≈ 13°/s while barely translating
+(baseline / depth ≈ 0.14–0.49° per 0.5 s). Pose tracking stays good: inliers
+≈ correspondences, median reprojection < 1 px. But the tracks that *have a
+landmark* fall from ≈ 850 to ≈ 30. Old landmarks rotate out of view, and the
+new content can't be triangulated: there's no keyframe pair in the window with
+≥ 0.5° parallax. Faster keyframes make it worse, because they shorten the
+window in time. The bench run scraped by at 29 correspondences
+(`min_tracked_points` = 20); the app run was lost. Thresholds only move the
+edge: pure rotation carries no depth information. Landmarks whose depth is
+unknown but bounded (inverse depth) fix it, and depth from the network makes
+them good immediately.
 
 ## What depth is good for here, in priority order
 
@@ -151,6 +239,92 @@ the map/trajectory exports, like `pose_propagation.py`), a bench line
 `depth_relative_sigma` (expect 0.1–0.2) and of the edge policy. Decide the
 model here, not before.
 
+> **Addition (2026-09-30, confidence work).** Record per-sample *cues*, not
+> only the edge flag, so Phase 0 also produces the data for the confidence
+> map (next section): log-depth gradient magnitude on the output grid, local
+> image texture, pixel distance to the nearest good landmark, and (when the
+> previous keyframe has depth) the disagreement after warping it with the VO
+> pose. The constant `depth_relative_sigma` stays as the fallback, but the
+> map replaces it once it passes its calibration test.
+
+## Phase 0b: self-calibrated confidence map (addition)
+
+Networks give no usable per-pixel confidence (DA-V2 none at all), and their
+errors are structured, not white. We build our own from the VO's landmarks.
+Everything is in **log depth**, so it is scale-free: the arbitrary VO
+normalization is a constant offset that the fit absorbs.
+
+**Who owns what.** Scale and shape are owned by different sides:
+
+```
+network ──scale (one per segment, slowly varying)──► VO       (Phase 1, Q5)
+VO ──────shape accuracy where parallax is good────────► network σ map (this section)
+```
+
+Never pull individual landmarks onto their network depth. One scale per
+segment, and per-point fusion only as a weighted prior (Phase 5).
+
+**Model.** Per keyframe, after the Phase 1 scale fit, each reference
+landmark's residual `r = log z_net − log(s · z_vo)` is a sample of the
+network's error with known geometric variance σ_geo² (`CONFIDENCE_DESIGN.md`
+Level 3, as `depth_sigma_ratio²`). Predict the network's variance per pixel
+from cheap cues:
+
+```
+σ_net²(u) = exp( w0 + w1·|∇ log D(u)| + w2·texture(u)
+                 + w3·dist_to_landmark(u) + w4·temporal(u) )
+```
+
+and fit `w` by maximum likelihood, `r ~ N(0, σ_net²(u) + σ_geo²)`: a few Newton
+steps per keyframe, weights carried over as a prior from keyframe to keyframe.
+This is the edge test made continuous and self-tuning per sequence (sky,
+glass and the pond come out with large σ if they disagree with geometry).
+Optional refinement: edge-aware interpolation of the actual residuals near
+dense landmarks.
+
+**Circularity rule.** Once Phases 4–5 create or pull landmarks from depth,
+those landmarks partly *are* the network. Only landmarks whose
+**geometry-only** covariance is small may train the map. The VO therefore
+keeps two covariances per landmark (without / with the depth prior) or at
+least a `from_depth` flag, and the "≥ 2° parallax, ≥ 3 observations" filter
+uses the geometry-only one. Depth-initialized (provisional) landmarks never
+qualify until they are re-triangulated.
+
+**Calibration test (gate before any solver use).** Hold out 20 % of the
+eligible landmarks per keyframe. Their normalized residuals
+`r / sqrt(σ_net² + σ_geo²)` must have std ≈ 1 and ≈ 68 % / 95 % coverage at
+1σ / 2σ. On TUM, also compare against the dataset's real depth images.
+Show the map next to the video and the reliability plot in the bench.
+
+**First results (2026-09-30, `tools/depth_confidence.py`, DA-V2-S hypersim,
+bench exports: dreamworks 0–900, castle 95 s + 1200 frames).** These are
+offline measurements only; nothing feeds back into the VO.
+
+- **Scale per keyframe dominates.** With one scale per segment, the
+  per-keyframe median offset has std 0.64 (dreamworks) / 0.37 (castle) in log
+  depth (p5/p95 up to −1.6 / +0.9), and 22 % / 14 % of residuals are gross
+  (factor > 2). Aligning per keyframe cuts gross residuals to 5.3 % / 2.5 %.
+  Either the VO's monocular scale drifts within a segment, or the network's
+  scale flickers between frames; this data cannot tell which. **Implication
+  for Phase 1:** the scale estimator must track at keyframe rate, or the
+  depth prior inherits large errors. To separate the two causes, run the
+  bench with depth on TUM (real depth images and ground-truth poses).
+- **Shape error after per-keyframe alignment:** median |Δ log z| 0.054
+  (dreamworks) / 0.144 (castle). Constant model σ_net = 0.20 / 0.23, not the
+  0.15 assumed in `depth_relative_sigma`.
+- **Cue model (held-out 20 % of landmarks):** on dreamworks it beats the
+  constant clearly (NLL −0.150 → −0.316; normalized std 1.04, 79 % / 93 % at
+  1σ / 2σ). On castle it ties (−0.098 vs −0.094; constant already calibrated:
+  std 0.96, 72 % / 95 %). Strongest cues: log depth (×2.0 per e-fold on
+  dreamworks), distance to the nearest reference landmark (sparse regions are
+  worse), edge flag (×1.7, dreamworks), and image radius. Per-sequence fitting
+  is therefore worthwhile: the same model is right for both clips with
+  different weights.
+- **Tails are heavier than Gaussian** (79 % within 1σ on dreamworks). Use a
+  Student-t (or Gaussian + outlier mixture) for the prior's robust loss.
+- Not yet tried: image gradient / texture cues (they need the depth maps, not
+  per-track samples) and the TUM ground-truth check.
+
 ## Phase 1: metric scale per segment (output only)
 
 The VO keeps solving in its own units (the solver and its tests are
@@ -168,10 +342,22 @@ unchanged), and estimates a per-segment scale online:
   frame). Segments that never reconnect now at least share units, so they can
   be shown side by side at the same scale.
 
-## Phase 2: dense keyframe clouds in the 3D view
+## Phase 2: dense keyframe clouds in the 3D view (next step)
 
 Back-project each keyframe's depth map, coloured from the frame, into the
 trajectory view, so the scene is visible and not just the corner cloud.
+
+**Prerequisites from Phases 0–1, the minimum:** per-track depth samples on
+`TrackObservation` (with the sampling policy above) and a per-segment robust
+log-scale estimate. Without the scale, a metric cloud cannot be drawn in VO
+units. The full Phase 0 study (models, cues) can follow.
+
+**Ownership.** The VO stays depth-map-agnostic: it sees only per-observation
+numbers. Dense maps live app/bench side in a `KeyframeDepthStore` keyed by the
+keyframe's frame index, filled when the VO reports `keyframe = true` for a
+frame whose depth exists (hence "delay the VO by one frame" in live mode). It
+holds the downsampled metric depth, colour and, later, Phase 0b's σ map.
+Poses come from the VO's trajectory (keyframe samples), which follows BA.
 
 - **Data**: per keyframe, a `KeyframeCloud { keyframe id, points in the camera
   frame (metres), rgb }`, subsampled on the output grid (every 4th pixel of
@@ -227,6 +413,84 @@ over the column events (occluded should dominate during a column and vanish
 after it), and the re-association / relocalization inlier rates with and
 without the gate.
 
+## Building block: provisional landmarks (inverse depth)
+
+Phases 4–5 and the rotation fix need the same thing: a landmark whose depth
+is **not yet constrained by geometry**, usable for the pose at once and
+refined as parallax arrives. Only the source of its initial depth differs.
+
+**State.** Anchored to the keyframe that created it: a unit bearing **b** in
+the anchor's camera frame, and inverse depth ρ = 1/z with variance σ_ρ².
+`X = C_anchor + R_anchorᵀ · b / ρ`.
+
+- ρ = 0 is a point at infinity, an ordinary value. Sky and horizon points sit
+  near 0 with a wide σ_ρ and still constrain rotation, which is all a rotating
+  camera needs (castle).
+- Triangulation error is close to Gaussian in ρ and nearly depth-independent:
+  σ_ρ ≈ σ_px / (f · baseline). So the geometry is well modelled in ρ. That is
+  why ρ, not z or log z, is the stored state.
+- ρ must stay > 0: clamp in the solver and rely on the prior. A landmark whose
+  ρ is driven below 0 by reprojection is an outlier.
+
+**Initial depth, two sources.** Flag which on the landmark (`depth_source`:
+`network | scene_median`):
+
+| Source | ρ₀ | σ | When |
+|---|---|---|---|
+| network depth at the track (Phase 0 sampling policy) | 1 / (z_net / s) in VO units | log-space σ_rel (Phase 0, later σ_net from Phase 0b) | depth present, sample not rejected (edge, clamp, sky) |
+| none | 1 / median landmark depth of the keyframe | wide in ρ, covering [0, 1/z_min] | no depth (CSV replay, depth off, estimator busy, rejected sample) |
+
+**Prior residual (in log space, on ρ).** Network error is multiplicative, so
+the prior is Gaussian in log depth:
+`r = (log z_net + log ρ − s) / σ_rel`, with dr/dρ = 1/ρ, defined for ρ > 0. Here
+*s* is the segment's log scale (Phase 1), so scale stays additive. Points
+whose sample was rejected get **no** prior: their ρ stays near the scene
+median or 0 with its wide σ until geometry fixes it.
+*Storage in ρ, comparison in log z:* geometry is Gaussian in ρ, the network is
+Gaussian in log z.
+
+**Life cycle.**
+
+1. *Create* for tracks that `triangulate_new` rejects for low parallax (and,
+   in Phase 4, for every track at a single-frame initialization). Not for
+   tracks that failed the reprojection test: those are outliers, not
+   low-parallax.
+2. *Use* in pose optimization at once, weighted by the projected uncertainty
+   (this composes with the confidence session's `pose_landmark_uncertainty`
+   inflation). **Count them toward `min_tracked_points`**, or a rotating
+   segment still dies with good tracking.
+3. *Refine* in BA (Phase 5) as ρ with the prior term.
+4. *Promote* to a normal XYZ landmark when its **geometry-only** covariance
+   becomes small (parallax ≥ the triangulation threshold and
+   `depth_sigma_ratio` below a bound). Civera's linearity index is the
+   textbook test. Clear the provisional flag; the prior may stay as a weak
+   term.
+5. *Re-anchor* when the anchor keyframe leaves the window (convert to XYZ
+   and back at the new anchor, propagating σ_ρ), or *retire* like any
+   landmark.
+
+**Constraints agreed with the confidence session.**
+
+- Keep the depth prior **out** of `update_quality`'s information matrix.
+  With fewer than 2 views or near-zero parallax, that matrix is singular, so
+  `depth_sigma_ratio` = ∞ and `confidence` = 0. That is intended: the depth is
+  not geometrically constrained. Display, calibration and the "good landmark"
+  filters read this geometry-only covariance.
+- Flag provisional / depth-sourced landmarks explicitly on `Landmark` (a
+  `provisional` flag plus `depth_source`), so the Phase 0b calibration and
+  Phase 0/1 scale fits exclude them until they are re-triangulated (the
+  circularity rule).
+- In BA the prior is **its own residual type** in `bundle_adjust`, not a fake
+  `BundleObservation`.
+- No viewer special case: the view-count factor in `MapPoint::confidence`
+  already scores 2-view, low-parallax points low.
+
+**Acceptance test.** `castle.mp4` 95–115 s (hfov 71.2, k1 −0.011):
+correspondences stay ≥ ~200 through the pitch-up, with no loss, both with
+network depth and with the scene-median fallback (depth off). `disney_04` and
+`dreamworks.MOV` don't regress (losses, inlier ratio, largest segment).
+Synthetic: a pure-rotation segment after initialization keeps tracking.
+
 ## Phase 4: single-frame (re)initialization
 
 With depth, a segment can start from **one** frame: back-project the tracked
@@ -237,10 +501,10 @@ rotation stops being fatal.
 - Use it only after a loss with no successful relocalization within K frames
   (relocalization into the old segment is still preferred: it keeps the
   frame), and at the start of a video that has depth.
-- The landmarks start with depth uncertainty σ_z = `depth_relative_sigma · z`
-  and are *provisional*: they are replaced by triangulated positions once
-  they have parallax (Phase 5), and the segment's scale is the network's
-  rather than the median-depth convention.
+- The landmarks are *provisional* (building block above, source `network`):
+  inverse depth with the log-space prior, promoted once they have parallax.
+  The segment's scale is the network's rather than the median-depth
+  convention.
 - Expected effect on `dreamworks.MOV`: the 7–20 frames after each loss without
   a pose drop to ~1. The first poses are only as good as the network depth, so
   the inlier rate right after init will show whether that is good enough.
@@ -255,19 +519,26 @@ covariance).
   `(log z_net − log (s · z_vo)) / σ_rel`, with the segment log-scale *s* as a
   BA variable. The second fixed keyframe (the scale gauge) is then no longer
   needed: depth observes scale.
-- Landmarks below the parallax threshold (near the focus of expansion: today
-  never created) can be created from depth with a wide prior, and refined as
-  parallax accumulates. That gives more landmarks in exactly the forward-walk
-  case.
+- Landmarks below the parallax threshold (near the focus of expansion, and
+  everything during a rotation: today never created) become provisional
+  landmarks (building block above), refined as parallax accumulates. That
+  gives more landmarks in exactly the forward-walk and pitch-up cases.
 - Keep the prior weak (σ_rel from Phase 0, floored) and robust (Huber in log
   space): network depth has correlated, scene-dependent bias, so it must not
   override geometry where geometry is good.
+- *(Addition)* Use the per-pixel σ_net from Phase 0b, not the constant, once
+  it passes its calibration test. Apply the circularity rule: depth residuals
+  feed the "with prior" landmark covariance only; calibration reads the
+  geometry-only one.
 
 ## API summary
 
 ```cpp
 // visual_odometry.hpp
 struct TrackObservation { ...; float depth_m{0}; float depth_sigma_m{0}; };
+// internal Landmark (visual_odometry.cpp), provisional landmarks:
+//   bool provisional; enum DepthSource { triangulated, network, scene_median } depth_source;
+//   int anchor_keyframe; Vec3 bearing; double inverse_depth, inverse_depth_sigma;
 struct VisualOdometryConfig {
   ...
   bool use_depth{true};                 // master switch; no effect without depth samples
@@ -275,6 +546,8 @@ struct VisualOdometryConfig {
   double depth_gate_sigmas{3.0};        // occlusion / gate threshold k
   bool depth_initialization{false};     // Phase 4
   bool depth_priors{false};             // Phase 5
+  bool provisional_landmarks{false};    // building block; scene-median prior without depth
+  double promote_depth_sigma_ratio{0.1};  // geometry-only bound to leave provisional
 };
 struct OdometryFrameResult {
   ...
@@ -283,6 +556,8 @@ struct OdometryFrameResult {
   // ProjectedLandmark gains: enum Visibility { unknown, occluded, visible, behind } visibility;
 };
 class VisualOdometry { ... double segment_scale(int segment) const; };
+// Shared with CONFIDENCE_DESIGN.md: TrackObservation::sigma_px and the tracks
+// CSV `sigma` column have landed; the `depth` column is added here.
 
 // app side
 struct DepthSample { float metres; float sigma; bool edge; };
@@ -321,13 +596,14 @@ same code.
 
 ## Open questions
 
-1. Which model and resolution? Decided by Phase 0 on our clips, not by
-   benchmarks.
+1. Which model and resolution? *For the first implementation:* DA-V2-S
+   (518×294) on every frame. The final choice still comes from Phase 0 on
+   our clips.
 2. Do we want metres in exports and the UI by default, or as an option
    (`--metric`) until the scale estimate has proven stable?
 3. Dense view: point sprites in `PointCloudRenderer`, or a voxelized
-   accumulated cloud? (Both, eventually: sprites for the BA window, voxels for
-   final keyframes.)
+   accumulated cloud? *Decided:* point sprites per keyframe first; voxels
+   for final keyframes later.
 4. Should depth go into the feature cache (f16 518×294 ≈ 300 KB/frame), so
    cached replays have it, or only per-track samples in the tracks CSV?
    Per-track samples are enough for Phases 0–1 and 3–5; Phase 2 needs maps at
@@ -335,3 +611,21 @@ same code.
 5. Depth-based initialization makes the network's scale the segment's scale.
    Should that replace the median-depth convention everywhere, so that every
    segment is metric from the start?
+   *Proposed answer (2026-09-30):* **yes, early**. The VO's scale is a
+   convention, and the network is the only grounded source, so make it the
+   gauge as soon as Phase 0 shows the per-segment scale is stable. Don't
+   wait for Phase 4. Anchor to the running robust estimate (Phase 1's log-scale
+   filter), never to a single frame's depth: absolute scale is 10–30 % off and
+   scene-dependent.
+6. *Answered (2026-09-30):* how to store depth for landmarks without parallax?
+   Inverse depth as the state; log depth for the network prior and scale (see
+   "Provisional landmarks").
+7. *Answered (2026-09-30, with the confidence session):* does the depth prior
+   enter the landmark covariance? No: the geometry-only covariance stays
+   prior-free (confidence 0 for unconstrained depth). Provisional landmarks
+   are flagged and excluded from calibration, and the BA prior is its own
+   residual term.
+8. Keyframe-trajectory jitter (in-between frames anchored only to the
+   previous keyframe, so BA corrections to the next keyframe are not
+   propagated): known, deferred. Dense clouds are anchored to keyframes, so it
+   doesn't affect them.

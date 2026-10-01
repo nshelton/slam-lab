@@ -1,4 +1,5 @@
 #include "slam_native/depth_estimator.hpp"
+#include "slam_native/tensorrt_logger.hpp"
 
 #include <NvInfer.h>
 #include <cuda_fp16.h>
@@ -96,13 +97,6 @@ namespace {
 void cuda_check(cudaError_t result, const char* operation) {
   if (result != cudaSuccess) throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(result));
 }
-
-class Logger final : public nvinfer1::ILogger {
- public:
-  void log(Severity severity, const char* message) noexcept override {
-    if (severity <= Severity::kWARNING) fprintf(stderr, "TensorRT (depth): %s\n", message);
-  }
-};
 
 template <typename T>
 struct TrtDelete {
@@ -205,7 +199,6 @@ __global__ void postprocess(const T* output, int width, int height, float ratio_
 struct DepthEstimator::Impl {
   DepthModelSpec spec;
   int rotation{};
-  Logger logger;
   std::unique_ptr<nvinfer1::IRuntime, TrtDelete<nvinfer1::IRuntime>> runtime;
   std::unique_ptr<nvinfer1::ICudaEngine, TrtDelete<nvinfer1::ICudaEngine>> engine;
   std::unique_ptr<nvinfer1::IExecutionContext, TrtDelete<nvinfer1::IExecutionContext>> context;
@@ -255,7 +248,7 @@ DepthEstimator::DepthEstimator(DepthModelSpec spec, const std::filesystem::path&
   file.seekg(0);
   std::vector<char> bytes(static_cast<std::size_t>(size));
   file.read(bytes.data(), size);
-  m.runtime.reset(nvinfer1::createInferRuntime(m.logger));
+  m.runtime.reset(nvinfer1::createInferRuntime(tensorrt_logger()));
   if (!m.runtime) throw std::runtime_error("Cannot create TensorRT runtime");
   m.engine.reset(m.runtime->deserializeCudaEngine(bytes.data(), bytes.size()));
   if (!m.engine) throw std::runtime_error("Cannot deserialize depth engine " + engine_path.string());

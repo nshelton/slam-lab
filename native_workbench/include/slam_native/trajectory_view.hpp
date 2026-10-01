@@ -2,6 +2,7 @@
 // ImGui panel showing the live visual-odometry camera trajectory and map.
 // Map points are drawn by PointCloudRenderer (instanced GL geometry); the
 // grid, trajectory and frustum are ImGui draw-list overlays.
+#include "slam_native/keyframe_depth.hpp"
 #include "slam_native/point_cloud_renderer.hpp"
 #include "slam_native/visual_odometry.hpp"
 
@@ -20,6 +21,8 @@ class TrajectoryView {
   // Clockwise display rotation of the video (degrees): the view's "up"
   // follows the upright image rather than the sensor's y axis.
   void set_display_rotation(int degrees) { rotation_ = degrees; }
+  // Keyframe depth clouds to draw (owned by the caller; may be null).
+  void set_depth_store(const KeyframeDepthStore* store) { depth_store_ = store; }
   // `open` toggles the window; frame size sets the drawn frustum's aspect.
   void draw(const VisualOdometry& odometry, bool* open, int frame_width, int frame_height);
 
@@ -38,7 +41,8 @@ class TrajectoryView {
   bool follow_{false};
   bool show_points_{true};
   bool show_retired_{true};
-  bool image_colors_{true};
+  int color_mode_{1};            // PointColor: 0 plain, 1 image, 2 confidence
+  float min_confidence_{0.0F};
   bool dim_retired_{true};
   // World-space diameter of the map points. Segment units: the first
   // keyframe's median scene depth is 1.
@@ -46,6 +50,9 @@ class TrajectoryView {
   int rotation_{};
   bool perspective_{true};  // orbit view only; fixed views are orthographic
   bool all_segments_{false};
+  const KeyframeDepthStore* depth_store_{};
+  bool show_dense_{true};
+  float dense_point_pixels_{2.0F};
 };
 
 }  // namespace slam_native

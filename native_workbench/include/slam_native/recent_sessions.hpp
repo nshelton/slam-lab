@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <filesystem>
 #include <vector>
 
@@ -13,6 +14,8 @@ struct RecentSession {
 
 class RecentSessions {
  public:
+  static constexpr std::size_t kCapacity = 16;  // the launcher shows a 4x4 grid
+
   explicit RecentSessions(std::filesystem::path storage_path);
 
   [[nodiscard]] static std::filesystem::path default_storage_path();

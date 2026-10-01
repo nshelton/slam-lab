@@ -71,7 +71,9 @@ struct FrameFeatures {
   std::vector<float> landmark_similarities;
   std::vector<LandmarkState> landmark_updates;
   // Runtime-only diagnostics, aligned with tracked keypoints.
-  std::vector<float> track_confidences;
+  // 1-sigma position noise per track (pixels, per axis): the flow tracker's
+  // Kalman posterior. Empty when the tracker has no noise model.
+  std::vector<float> track_sigmas_px;
   std::vector<bool> superpoint_supported;
   std::vector<Keypoint> flow_predictions;
   std::vector<float> correction_distances;

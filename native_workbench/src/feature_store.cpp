@@ -329,7 +329,7 @@ void FeatureStore::enqueue(FrameFeatures features) {
     throw std::invalid_argument("Cache requires SuperPoint descriptors");
   }
   if (!features.landmark_ids.empty() || !features.landmark_updates.empty() ||
-      !features.track_confidences.empty() || !features.landmark_similarities.empty() ||
+      !features.track_sigmas_px.empty() || !features.landmark_similarities.empty() ||
       !features.superpoint_supported.empty() || !features.flow_predictions.empty() ||
       !features.correction_distances.empty() || features.new_landmarks || features.matched_landmarks ||
       features.coasted_landmarks) {

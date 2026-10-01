@@ -9,6 +9,8 @@
 #include "slam_native/optical_flow.hpp"
 #include "slam_native/color_sampler.hpp"
 #include "slam_native/depth_estimator.hpp"
+#include "slam_native/depth_sampling.hpp"
+#include "slam_native/keyframe_depth.hpp"
 #include "slam_native/focal_estimation.hpp"
 #include "slam_native/fov_view.hpp"
 #include "slam_native/track_io.hpp"
@@ -37,6 +39,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -477,8 +480,8 @@ void draw_video(Runtime& runtime, bool optical_flow, std::int64_t duration_ns,
         draw->AddCircleFilled(center, 4.0F, IM_COL32(255, 0, 255, 255));
         draw->AddCircle(center, 6.5F, IM_COL32_WHITE, 0, 1.5F);
       } else {
-        draw->AddCircle(center, 5.0F, landmark.dormant ? IM_COL32(255, 0, 255, 110) : IM_COL32(255, 0, 255, 230),
-                        0, 1.5F);
+        // Small filled dot (2 px): there are many, rings cluttered the frame.
+        draw->AddCircleFilled(center, 1.0F, landmark.dormant ? IM_COL32(255, 0, 255, 110) : IM_COL32(255, 0, 255, 230));
       }
     }
   }
@@ -746,8 +749,8 @@ void upload_depth_texture(Runtime& runtime) {
 
 void draw_depth(Runtime& runtime) {
   if (!runtime.show_depth) return;
-  ImGui::SetNextWindowPos({1440, 8}, ImGuiCond_FirstUseEver);
-  ImGui::SetNextWindowSize({360, 640}, ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowPos({1090, 8}, ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize({360, 420}, ImGuiCond_FirstUseEver);
   if (!ImGui::Begin("Depth", &runtime.show_depth)) {
     ImGui::End();
     return;
@@ -823,6 +826,7 @@ struct Session {
                        config.superpoint.detection_threshold);
     flow_tracker = std::make_unique<FlowTracker>(config.flow_tracker);
     odometry = std::make_unique<VisualOdometry>(config.odometry);
+    trajectory_view.set_depth_store(&keyframe_depth);
     next_cache_index = static_cast<std::uint64_t>(store->last_frame_index() + 1);
     runtime.association_radius = config.flow_tracker.association_radius;
     runtime.metadata_rotation = decoder->display_rotation();
@@ -880,6 +884,7 @@ struct Session {
     // Track IDs restart with the tracker, so the camera trajectory does too.
     odometry = std::make_unique<VisualOdometry>(config.odometry);
     trajectory_view.reset();
+    reset_depth_pipeline();
     focal.restart_tracks();
     runtime.odometry = {};
     runtime.relocalizations = 0;
@@ -902,6 +907,7 @@ struct Session {
 
   void advance() {
     poll_depth();
+    drain_pending();
     if (runtime.seek_requested || runtime.restart_requested) {
       const bool restart = runtime.restart_requested;
       runtime.restart_requested = false;
@@ -954,7 +960,7 @@ struct Session {
       cache_features.frame_index = next_cache_index++;
       store->enqueue(std::move(cache_features));
     }
-    submit_depth(frame);
+    const bool depth_submitted = submit_depth(frame);
     runtime.detections = features.keypoints; // Preserve all detections before the tracking cap.
     // GPU hot path: flow fields, detections and track state stay on the device.
     std::optional<DeviceFlowField> field;
@@ -971,16 +977,19 @@ struct Session {
     if (field && runtime.show_flow_vectors) runtime.flow_field = optical_flow->download();
     // Camera pose from the observed (non-coasted) tracks; any tracker's output
     // converted to a TrackedFrame could drive this instead.
-    const TrackedFrame tracked = tracked_frame_from(features, color_sampler.sample(frame, features.keypoints));
-    runtime.odometry = odometry->process(tracked);
-    runtime.reassociations += static_cast<std::size_t>(runtime.odometry.reassociated);
-    if (runtime.odometry.relocalized) {
-      ++runtime.relocalizations;
-      runtime.last_relocalization = "frame " + std::to_string(runtime.odometry.frame_index) + ": " +
-                                    runtime.odometry.event;
+    TrackedFrame tracked = tracked_frame_from(features, color_sampler.sample(frame, features.keypoints));
+    if (depth) {
+      // The VO runs one frame behind, so each frame meets its own depth map
+      // (DEPTH_INTEGRATION.md "Timing"). Colours for the keyframe cloud grid
+      // are sampled now, while the frame is alive.
+      std::vector<std::array<std::uint8_t, 3>> grid_colors;
+      if (!runtime.depth.empty()) grid_colors = color_sampler.sample(frame, keyframe_depth.grid(runtime.depth));
+      pending.push_back({std::move(tracked), std::move(grid_colors), depth_submitted});
+      drain_pending();
+    } else {
+      drain_pending(true);
+      run_odometry(tracked, nullptr, {});
     }
-    trajectory_view.update(*odometry);
-    focal.add(tracked);  // background thread
     runtime.points = features.keypoints;
     runtime.supported = features.superpoint_supported;
     runtime.landmark_ids = features.landmark_ids;
@@ -1002,14 +1011,63 @@ struct Session {
                                    std::chrono::duration<double>(fps > 0 ? 1.0 / fps : 0.0));
   }
 
+  // VO on one tracked frame (with its depth map, when it has one), and the
+  // keyframe's dense cloud.
+  void run_odometry(TrackedFrame& tracked, const DepthMap* map,
+                    const std::vector<std::array<std::uint8_t, 3>>& grid_colors) {
+    if (map) {
+      DepthSamplingConfig sampling;
+      sampling.max_depth_m = depth ? depth->spec().max_depth_m : 0.0F;
+      attach_depth(*map, tracked, sampling);
+    }
+    runtime.odometry = odometry->process(tracked);
+    runtime.reassociations += static_cast<std::size_t>(runtime.odometry.reassociated);
+    if (runtime.odometry.relocalized) {
+      ++runtime.relocalizations;
+      runtime.last_relocalization = "frame " + std::to_string(runtime.odometry.frame_index) + ": " +
+                                    runtime.odometry.event;
+    }
+    const auto& r = runtime.odometry;
+    if (map && r.keyframe && r.has_pose) {
+      // Local scale: this keyframe's own estimate (the VO's scale drifts within
+      // a segment), else the segment's filtered one, else unknown (0).
+      const double scale = std::isfinite(r.keyframe_log_scale) ? std::exp(r.keyframe_log_scale) : r.metric_scale;
+      const auto K = config.odometry.intrinsics ? *config.odometry.intrinsics :
+          CameraIntrinsics::from_horizontal_fov(tracked.width, tracked.height, config.odometry.horizontal_fov_degrees);
+      keyframe_depth.add(r.frame_index, r.segment, scale, *map, grid_colors, K, config.odometry.distortion_k1);
+    }
+    trajectory_view.update(*odometry);
+    focal.add(tracked);  // background thread
+  }
+
+  // Runs the VO on queued frames whose depth has arrived (or was never
+  // submitted). `force`, or more than two queued frames, runs them anyway.
+  void drain_pending(bool force = false) {
+    while (!pending.empty()) {
+      auto& next = pending.front();
+      const auto arrived = depth_maps.find(next.tracked.frame_index);
+      const bool ready = arrived != depth_maps.end() || !next.depth_submitted;
+      if (!ready && !force && pending.size() <= 2) break;
+      run_odometry(next.tracked, arrived != depth_maps.end() ? &arrived->second : nullptr, next.grid_colors);
+      pending.pop_front();
+    }
+  }
+
+  void reset_depth_pipeline() {
+    pending.clear();
+    depth_maps.clear();
+    keyframe_depth.clear();
+  }
+
   // (Re)creates the depth engine for the selected model and display
   // orientation, then queues this frame unless the last one is still running.
-  void submit_depth(const GpuFrame& frame) {
+  // Returns whether this frame was submitted.
+  bool submit_depth(const GpuFrame& frame) {
     poll_depth();
     if (runtime.depth_model < 0) {
       depth.reset();
       runtime.depth = {};
-      return;
+      return false;
     }
     const auto& spec = depth_model_presets()[runtime.depth_model];
     const int rotation = runtime.display_rotation;
@@ -1023,23 +1081,28 @@ struct Session {
       } catch (const std::exception& error) {
         runtime.depth_error = error.what();
         runtime.depth_model = -1;
-        return;
+        return false;
       }
     }
     // The pose's lens, so canonical-camera models agree with the VO.
     const float focal = static_cast<float>(config.odometry.intrinsics ? config.odometry.intrinsics->fx :
         CameraIntrinsics::from_horizontal_fov(frame.width, frame.height, config.odometry.horizontal_fov_degrees).fx);
     try {
-      depth->submit(frame, focal);
+      return depth->submit(frame, focal);
     } catch (const std::exception& error) {
       runtime.depth_error = error.what();
       runtime.depth_model = -1;
       depth.reset();
+      return false;
     }
   }
 
   void poll_depth() {
-    if (depth && depth->poll(runtime.depth)) runtime.depth_dirty = true;
+    if (depth && depth->poll(runtime.depth)) {
+      runtime.depth_dirty = true;
+      depth_maps[runtime.depth.frame_index] = runtime.depth;  // for the delayed VO
+      while (depth_maps.size() > 4) depth_maps.erase(depth_maps.begin());
+    }
   }
 
   // Restart the camera pose from the current frame with a new lens model.
@@ -1049,6 +1112,7 @@ struct Session {
     config.odometry.distortion_k1 = lens.k1;
     odometry = std::make_unique<VisualOdometry>(config.odometry);
     trajectory_view.reset();
+    reset_depth_pipeline();
     runtime.odometry = {};
     runtime.relocalizations = 0;
     runtime.reassociations = 0;
@@ -1098,6 +1162,15 @@ struct Session {
   std::unique_ptr<FlowTracker> flow_tracker;
   std::unique_ptr<VisualOdometry> odometry;
   std::unique_ptr<DepthEstimator> depth;
+  // Tracked frames waiting for their depth map (the VO runs one frame behind).
+  struct PendingFrame {
+    TrackedFrame tracked;
+    std::vector<std::array<std::uint8_t, 3>> grid_colors;  // at keyframe_depth.grid()
+    bool depth_submitted{};
+  };
+  std::deque<PendingFrame> pending;
+  std::map<std::uint64_t, DepthMap> depth_maps;  // recent finished maps by frame index
+  KeyframeDepthStore keyframe_depth;
   TrajectoryView trajectory_view;
   ColorSampler color_sampler;
   BackgroundFocalEstimator focal;

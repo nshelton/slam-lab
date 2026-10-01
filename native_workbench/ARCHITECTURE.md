@@ -276,7 +276,7 @@ it yet.
 | Preset (`--depth-model`) | Engine input | trtexec GPU, 2080 Ti | In-app (incl. pre/post) |
 |---|---|---|---|
 | Depth Anything V2-S (indoor / outdoor) | 518×294 / 294×518, fp16 | 2.3 ms | ~4 ms |
-| Metric3D v2 ViT-S | 1064×616 / 616×1064, fp16 | 23 ms | — |
+| Metric3D v2 ViT-S | 1064×616 / 616×1064, fp16 | 23 ms | ~23 ms |
 
 DAv2 checkpoints: Hypersim (indoor, clamp 20 m) and VKITTI (outdoor, 80 m).
 The ONNX is exported in fp16 (`tools/export_depth_anything_onnx.py`) because
@@ -581,7 +581,9 @@ by *Trajectory* in the Pipeline panel) shows:
 - state, inliers, map size, keyframes and timing;
 - the current segment's path (keyframes as squares), the current camera
   frustum and the active map points;
-- active and retired map points (optionally in image colour), a grid on the
+- live, held (dormant / lost segment) and retired map points, coloured plain,
+  by image colour or by depth confidence (`CONFIDENCE_DESIGN.md`, with a
+  minimum-confidence filter), a grid on the
   X–Z plane at the first keyframe's height (monocular VO knows no floor);
   points are solid, unlit (constant-colour) icosahedrons drawn by `PointCloudRenderer`
   (`src/point_cloud_renderer.cpp`): one instanced GL draw per set into a 4×

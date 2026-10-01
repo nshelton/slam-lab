@@ -1,6 +1,8 @@
 // Headless tracking benchmark on real video (GPU). Not part of CTest.
 // usage: slam-native-tracking-bench VIDEO ENGINE [START_SECONDS] [FRAMES]
 #include "slam_native/color_sampler.hpp"
+#include "slam_native/depth_estimator.hpp"
+#include "slam_native/depth_sampling.hpp"
 #include "slam_native/feature_store.hpp"
 #include "slam_native/flow_tracker.hpp"
 #include "slam_native/optical_flow.hpp"
@@ -13,11 +15,15 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
+#include <random>
 #include <string>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 
 using namespace slam_native;
@@ -48,7 +54,8 @@ int main(int argc, char** argv) {
     FlowTrackerConfig config;
     OpticalFlowConfig flow_config;
     SuperPointConfig sp_config;
-    std::string export_tracks, export_trajectory, export_map, export_features;
+    std::string export_tracks, export_trajectory, export_map, export_features, depth_model, export_keyframe_depth;
+    DepthSamplingConfig depth_sampling;
     VisualOdometryConfig vo_config;
     for (int a = 5; a + 1 < argc; a += 2) {
       const std::string key = argv[a];
@@ -57,12 +64,27 @@ int main(int argc, char** argv) {
       if (key == "export-map") { export_map = argv[a + 1]; continue; }
       // Raw SuperPoint detections + descriptors (f16), in the app's feature-cache format.
       if (key == "export-features") { export_features = argv[a + 1]; continue; }
+      // Depth network (preset name or engine stem, e.g. depth-anything-v2-s-vkitti), run synchronously
+      // on every frame and sampled at the tracks (DEPTH_INTEGRATION.md); "off" disables.
+      if (key == "depth") { depth_model = argv[a + 1] == std::string("off") ? "" : argv[a + 1]; continue; }
+      if (key == "depth-edge") { depth_sampling.edge_ratio = std::stof(argv[a + 1]); continue; }
+      if (key == "depth-drop-edges") { depth_sampling.drop_edges = std::stof(argv[a + 1]) != 0; continue; }
+      // Each keyframe's raw depth map (DIR/kf_<frame>.f32, row-major float32) and
+      // DIR/keyframes.csv (geometry and scale estimates), for tools/depth_consistency.py.
+      if (key == "export-keyframe-depth") { export_keyframe_depth = argv[a + 1]; continue; }
       const float value = std::stof(argv[a + 1]);
       if (key == "hfov") { vo_config.horizontal_fov_degrees = value; continue; }
       if (key == "k1") { vo_config.distortion_k1 = value; continue; }
+      if (key == "fx" || key == "fy" || key == "cx" || key == "cy") {  // full intrinsics (all four)
+        if (!vo_config.intrinsics) vo_config.intrinsics = CameraIntrinsics{};
+        (key == "fx" ? vo_config.intrinsics->fx : key == "fy" ? vo_config.intrinsics->fy :
+         key == "cx" ? vo_config.intrinsics->cx : vo_config.intrinsics->cy) = value;
+        continue;
+      }
       if (key == "reloc") { vo_config.relocalization = value != 0; continue; }
       if (key == "reassoc") { vo_config.reassociation = value != 0; continue; }
       if (key == "reassoc-radius") { vo_config.reassociation_radius_px = value; continue; }
+      if (key == "merge") { vo_config.merge_landmarks = value != 0; continue; }
       if (key == "dormant") { vo_config.dormant_max_frames = static_cast<int>(value); continue; }
       if (key == "radius") config.association_radius = value;
       else if (key == "min-sim") config.min_descriptor_similarity = value;
@@ -79,6 +101,15 @@ int main(int argc, char** argv) {
       else throw std::invalid_argument("unknown option " + key);
     }
     auto superpoint = make_tensorrt_superpoint(argv[2], sp_config);
+    std::unique_ptr<DepthEstimator> depth;  // created on the first frame (needs its size)
+    const DepthModelSpec* depth_spec = nullptr;
+    double depth_ms = 0;
+    std::size_t depth_samples = 0, depth_valid = 0, depth_edges = 0;
+    if (!depth_model.empty()) {
+      depth_spec = find_depth_model(depth_model);
+      if (!depth_spec) throw std::invalid_argument("unknown depth model " + depth_model);
+      depth_sampling.max_depth_m = depth_spec->max_depth_m;
+    }
     OpticalFlow optical_flow(flow_config);
     FlowTracker tracker(config);
     VisualOdometry odometry(vo_config);
@@ -97,7 +128,15 @@ int main(int argc, char** argv) {
     struct Pending { std::uint64_t frame; int bin; };
     std::unordered_map<std::uint64_t, Pending> reassoc_pending;  // new track -> when, diagnostic bin
     std::map<int, std::array<int, 3>> reassoc_bins;  // bin -> inlier, outlier, unresolved
+    std::size_t merged_total = 0;
+    struct KeyframeScale { std::uint64_t frame; double log_scale, spread; int samples; };
+    std::map<int, std::vector<KeyframeScale>> keyframe_scales;  // by segment
     std::size_t reassoc_total = 0, reassoc_inlier = 0, reassoc_outlier = 0, untracked_in_view = 0;
+    // What lies at an untracked landmark's projection (nearest within 3 px):
+    // [0] nothing, [1] raw detection only, [2] track without landmark, [3] track with another landmark.
+    std::array<std::size_t, 4> untracked_class{};
+    std::vector<float> untracked_nearest, random_nearest, tracked_landmark_nearest;
+    std::mt19937 untracked_rng(1);
     double vo_ms = 0, vo_max_ms = 0;
     std::vector<float> vo_inlier_ratio, vo_reprojection;
 
@@ -130,17 +169,82 @@ int main(int argc, char** argv) {
       if (feature_store) feature_store->enqueue(features);
       // Hot path first (timed); host diagnostics afterwards.
       tracker.associate(features, device_field ? &*device_field : nullptr, &device);
-      const auto tracked = tracked_frame_from(features, color_sampler.sample(image, features.keypoints));
+      auto tracked = tracked_frame_from(features, color_sampler.sample(image, features.keypoints));
+      DepthMap frame_depth;
+      if (depth_spec && !depth) {
+        const int rotation = decoder->display_rotation();
+        const bool sideways = rotation == 90 || rotation == 270;
+        const bool portrait = (sideways ? image.width : image.height) > (sideways ? image.height : image.width);
+        depth = std::make_unique<DepthEstimator>(
+            *depth_spec, depth_engine_path(std::filesystem::path(argv[2]).parent_path(), *depth_spec, portrait),
+            rotation);
+      }
+      if (depth) {
+        // Synchronous, so results never depend on GPU timing.
+        const auto d0 = std::chrono::steady_clock::now();
+        const float focal = static_cast<float>(vo_config.intrinsics ? vo_config.intrinsics->fx :
+            CameraIntrinsics::from_horizontal_fov(image.width, image.height, vo_config.horizontal_fov_degrees).fx);
+        if (!depth->submit(image, focal)) throw std::runtime_error("depth estimator busy in synchronous mode");
+        DepthMap& map = frame_depth;
+        while (!depth->poll(map)) std::this_thread::sleep_for(std::chrono::microseconds(100));
+        int edges = 0;
+        depth_valid += static_cast<std::size_t>(attach_depth(map, tracked, depth_sampling, &edges));
+        depth_edges += static_cast<std::size_t>(edges);
+        depth_samples += tracked.observations.size();
+        depth_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - d0).count();
+      }
       if (tracks_out) {
-        if (!tracks_header) { write_tracks_header(tracks_out, tracked.width, tracked.height, true); tracks_header = true; }
-        write_tracks(tracks_out, tracked);
+        const TrackColumns columns{true, true, depth != nullptr};
+        if (!tracks_header) { write_tracks_header(tracks_out, tracked.width, tracked.height, columns); tracks_header = true; }
+        write_tracks(tracks_out, tracked, columns);
       }
       const auto pose = odometry.process(tracked);
+      if (!export_keyframe_depth.empty() && pose.keyframe && pose.has_pose && !frame_depth.empty()) {
+        const std::filesystem::path dir(export_keyframe_depth);
+        std::filesystem::create_directories(dir);
+        std::ofstream raw(dir / ("kf_" + std::to_string(pose.frame_index) + ".f32"), std::ios::binary);
+        raw.write(reinterpret_cast<const char*>(frame_depth.metres.data()),
+                  static_cast<std::streamsize>(frame_depth.metres.size() * sizeof(float)));
+        const bool fresh = !std::filesystem::exists(dir / "keyframes.csv");
+        std::ofstream index(dir / "keyframes.csv", std::ios::app);
+        if (fresh)
+          index << "frame_index,segment,width,height,source_width,source_height,rotation,scale_x,scale_y,offset_x,"
+                   "offset_y,keyframe_log_scale,metric_scale\n";
+        index << std::setprecision(9) << pose.frame_index << ',' << pose.segment << ',' << frame_depth.width << ','
+              << frame_depth.height << ',' << frame_depth.source_width << ',' << frame_depth.source_height << ','
+              << frame_depth.rotation << ',' << frame_depth.scale_x << ',' << frame_depth.scale_y << ','
+              << frame_depth.offset_x << ',' << frame_depth.offset_y << ',' << pose.keyframe_log_scale << ','
+              << pose.metric_scale << '\n';
+      }
       vo_posed += pose.has_pose;
       vo_keyframes += pose.keyframe;
       vo_losses += pose.state == OdometryState::lost;
       vo_relocalized += pose.relocalized;
       untracked_in_view += pose.untracked_landmarks.size();
+      merged_total += static_cast<std::size_t>(pose.merged);
+      if (pose.keyframe && std::isfinite(pose.keyframe_log_scale))
+        keyframe_scales[pose.segment].push_back(
+            {pose.frame_index, pose.keyframe_log_scale, pose.keyframe_scale_spread, pose.keyframe_scale_samples});
+      if (index % 10 == 0 && !raw.empty()) {
+        std::uniform_real_distribution<float> ux(0, float(image.width)), uy(0, float(image.height));
+        for (const auto& p : pose.untracked_landmarks) {
+          if (!p.reassociated) untracked_nearest.push_back(nearest(raw, p.x, p.y));
+          random_nearest.push_back(nearest(raw, ux(untracked_rng), uy(untracked_rng)));
+        }
+      }
+      for (const auto& p : pose.untracked_landmarks) {
+        if (p.reassociated) continue;
+        float best = 3.0F;
+        int kind = 0;
+        for (const auto& o : tracked.observations) {
+          const float d = std::hypot(o.x - p.x, o.y - p.y);
+          if (d < best) { best = d; kind = odometry.has_landmark(o.track_id) ? 3 : 2; }
+        }
+        if (kind == 0)
+          for (const auto& k : raw)
+            if (std::hypot(k.x - p.x, k.y - p.y) < 3.0F) { kind = 1; break; }
+        ++untracked_class[kind];
+      }
       for (auto it = reassoc_pending.begin(); it != reassoc_pending.end();) {
         const bool in = std::binary_search(pose.pose_inliers.begin(), pose.pose_inliers.end(), it->first);
         const bool out = std::binary_search(pose.pose_outliers.begin(), pose.pose_outliers.end(), it->first);
@@ -281,11 +385,56 @@ int main(int argc, char** argv) {
                 "median reprojection %.2f px, %.2f ms/frame (max %.1f)\n", vo_posed, processed + 1, vo_keyframes,
                 vo_losses, vo_relocalized, segment_poses.size(), largest, percentile(vo_inlier_ratio, 0.5),
                 percentile(vo_reprojection, 0.5), vo_ms / (processed + 1), vo_max_ms);
+    std::printf("merged duplicate landmarks: %zu\n", merged_total);
+    if (depth) {
+      // Per segment: fused scale, the network's relative error on reference landmarks (keyframe spreads),
+      // scale drift (log-scale slope), and the implied camera speed (walking ~1.2-1.5 m/s).
+      const auto trajectory = odometry.trajectory();
+      for (const auto& [seg, list] : keyframe_scales) {
+        std::vector<float> logs, spreads;
+        double sx = 0, sy = 0, sxx = 0, sxy = 0;
+        for (const auto& k : list) {
+          logs.push_back(float(k.log_scale));
+          spreads.push_back(float(k.spread));
+          const double x = double(k.frame) / 100.0;
+          sx += x; sy += k.log_scale; sxx += x * x; sxy += x * k.log_scale;
+        }
+        const double n = double(list.size());
+        const double slope = n > 1 ? (n * sxy - sx * sy) / std::max(1e-12, n * sxx - sx * sx) : 0.0;
+        const double scale = odometry.segment_scale(seg);
+        std::vector<float> speeds;
+        for (std::size_t i = 1; i < trajectory.size(); ++i) {
+          const auto& a = trajectory[i - 1];
+          const auto& b = trajectory[i];
+          if (a.segment != seg || b.segment != seg || b.frame_index != a.frame_index + 1) continue;
+          const auto ca = a.pose.center(), cb = b.pose.center();
+          const double dt = double(b.timestamp_ns - a.timestamp_ns) * 1e-9;
+          if (dt > 0) speeds.push_back(float(std::hypot(cb[0] - ca[0], cb[1] - ca[1], cb[2] - ca[2]) * scale / dt));
+        }
+        std::printf("depth scale segment %d: %zu keyframes, %.4f m/unit (keyframe log-scale p10/p50/p90 %.3f/%.3f/%.3f, "
+                    "drift %+.3f per 100 frames), network error on reference landmarks p50 %.3f p90 %.3f (log), "
+                    "camera speed median %.2f m/s\n", seg, list.size(), scale, percentile(logs, .1), percentile(logs, .5),
+                    percentile(logs, .9), slope, percentile(spreads, .5), percentile(spreads, .9), percentile(speeds, .5));
+      }
+      std::printf("depth: %s, %.2f ms/frame (synchronous), samples valid %.3f, edges %.3f of valid\n",
+                  depth->spec().name.c_str(), depth_ms / (processed + 1),
+                  double(depth_valid) / std::max<std::size_t>(1, depth_samples),
+                  double(depth_edges) / std::max<std::size_t>(1, depth_valid));
+    }
     std::printf("landmarks: %zu (%zu retired), re-associated %zu: next pose fit inlier %zu / outlier %zu / "
                 "unresolved %zu; untracked landmarks in view %.1f per frame\n",
                 odometry.retired_count() + odometry.active_map().size(), odometry.retired_count(), reassoc_total,
                 reassoc_inlier, reassoc_outlier, reassoc_total - reassoc_inlier - reassoc_outlier - reassoc_pending.size(),
                 double(untracked_in_view) / (processed + 1));
+    {
+      const double n = std::max<std::size_t>(1, untracked_class[0] + untracked_class[1] + untracked_class[2] + untracked_class[3]);
+      std::printf("nearest raw detection (px) p25/p50/p75: untracked landmarks %.1f/%.1f/%.1f, random points %.1f/%.1f/%.1f\n",
+                  percentile(untracked_nearest, .25), percentile(untracked_nearest, .5), percentile(untracked_nearest, .75),
+                  percentile(random_nearest, .25), percentile(random_nearest, .5), percentile(random_nearest, .75));
+      std::printf("untracked in view, what is within 3 px: nothing %.2f, raw detection only %.2f, "
+                  "track without landmark %.2f, track with another landmark %.2f\n",
+                  untracked_class[0] / n, untracked_class[1] / n, untracked_class[2] / n, untracked_class[3] / n);
+    }
     for (const auto& [bin, n] : reassoc_bins) {
       static const char* names[] = {"0-1", "1-2", "2-3", "3-5", "5+"};
       std::printf("  re-associated %s, projection %s px: inlier %d outlier %d unresolved %d\n",

@@ -79,8 +79,13 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
   ImGui::Text("Inliers %d / %d  |  keyframes %zu", last.inliers, last.correspondences, last.keyframes);
   // Active: the odometry's live landmarks (still refined); retired: final
   // positions kept for display. Their sum is what the view can draw.
-  ImGui::Text("Map points %zu  (%zu active + %zu retired)", last.map_points + retired_.size(), last.map_points,
-              retired_.size());
+  // Live: refined by the odometry now. Held: kept for re-association or
+  // relocalization (dormant, lost segment). Retired: final. All are drawn.
+  const std::size_t live = std::min(last.map_points, active_.size());
+  ImGui::Text("Map: %zu live, %zu held, %zu retired", live, active_.size() - live, retired_.size());
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("Live: refined by the odometry. Held: track ended or segment lost; kept for\n"
+                      "re-association / relocalization. Retired: final positions.");
   if (last.has_pose) ImGui::Text("Median reprojection %.2f px", last.median_reprojection_px);
   ImGui::PushTextWrapPos(0);
   if (!last.event.empty()) ImGui::TextDisabled("%s", last.event.c_str());
@@ -101,8 +106,6 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
   if (ImGui::IsItemHovered())
     ImGui::SetTooltip("Landmarks whose tracks ended; no longer refined. Active points are brighter.");
   ImGui::SameLine();
-  ImGui::Checkbox("Colour", &image_colors_);
-  ImGui::SameLine();
   ImGui::Checkbox("Follow", &follow_);
   ImGui::SameLine();
   ImGui::Checkbox("All segments", &all_segments_);
@@ -111,6 +114,13 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
     ImGui::Checkbox("Perspective", &perspective_);
   }
   if (show_points_) {
+    const char* colors[] = {"Plain", "Image colour", "Confidence"};
+    ImGui::SetNextItemWidth(110);
+    ImGui::Combo("##colour", &color_mode_, colors, IM_ARRAYSIZE(colors));
+    if (ImGui::IsItemHovered() && color_mode_ == 2)
+      ImGui::SetTooltip("Depth confidence: red = depth poorly constrained (low parallax), green = well\n"
+                        "triangulated, grey = not computed yet. Geometry only; see CONFIDENCE_DESIGN.md.");
+    ImGui::SameLine();
     ImGui::SetNextItemWidth(110);
     ImGui::SliderFloat("Point size", &point_size_, 0.001F, 0.2F, "%.3f", ImGuiSliderFlags_Logarithmic);
     if (ImGui::IsItemHovered())
@@ -118,6 +128,23 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
     if (show_retired_) {
       ImGui::SameLine();
       ImGui::Checkbox("Dim retired", &dim_retired_);
+    }
+    ImGui::SetNextItemWidth(110);
+    ImGui::SliderFloat("Min confidence", &min_confidence_, 0.0F, 1.0F, "%.2f");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hide points below this depth confidence (0 shows all).");
+  }
+  if (depth_store_ && !depth_store_->clouds().empty()) {
+    ImGui::Checkbox("Dense depth", &show_dense_);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Each keyframe's network depth, back-projected and coloured, drawn at the keyframe's\n"
+                        "current pose with its local metric scale (DEPTH_INTEGRATION.md Phase 2).\n"
+                        "Doubled surfaces = inconsistent scale, pose or depth.");
+    if (show_dense_) {
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(90);
+      ImGui::SliderFloat("Dense size", &dense_point_pixels_, 1.0F, 6.0F, "%.1f px");
+      ImGui::SameLine();
+      ImGui::TextDisabled("%zu keyframes", depth_store_->clouds().size());
     }
   }
 
@@ -268,7 +295,30 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
     line({0, 0, 0}, {0, 0, axis}, IM_COL32(60, 100, 235, 255), 2.0F);
   }
 
-  if (show_points_) {
+  // Keyframe depth clouds at their keyframes' current poses.
+  std::vector<DenseCloudDraw> clouds;
+  if (depth_store_ && show_dense_) {
+    for (const auto& cloud : depth_store_->clouds()) {
+      if (!all_segments_ && cloud.segment != segment) continue;
+      const auto it = std::lower_bound(samples_.begin(), samples_.end(), cloud.frame_index,
+                                       [](const TrajectorySample& s, std::uint64_t f) { return s.frame_index < f; });
+      if (it == samples_.end() || it->frame_index != cloud.frame_index) continue;
+      const double scale = cloud.metres_per_unit > 0 ? cloud.metres_per_unit : odometry.segment_scale(cloud.segment);
+      if (!(scale > 0)) continue;
+      DenseCloudDraw d;
+      d.key = cloud.frame_index;
+      d.points = &cloud.points;
+      d.colors = &cloud.colors;
+      const auto& R = it->pose.rotation;  // world -> camera; cloud (camera) -> world is R^T
+      for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) d.rotation[r * 3 + c] = static_cast<float>(R[c * 3 + r]);
+      const auto o = it->pose.center();
+      d.origin = {static_cast<float>(o[0]), static_cast<float>(o[1]), static_cast<float>(o[2])};
+      d.units_per_point_unit = static_cast<float>(1.0 / scale);
+      clouds.push_back(d);
+    }
+  }
+  if (show_points_ || !clouds.empty()) {
     // Solid icosahedrons on the GPU, depth-tested among themselves and drawn
     // over the grid, under the trajectory and frustum overlays.
     PointCloudCamera camera;
@@ -283,11 +333,14 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
     camera.near_plane = near_plane;
     camera.rotation = rotation_;
     const int only = all_segments_ ? -1 : segment;
-    const PointCloudStyle retired{point_size_, dim_retired_ ? 0.6F : 1.0F, image_colors_, only};
-    const PointCloudStyle active{point_size_, 1.0F, image_colors_, only};
+    const auto color = static_cast<PointColor>(color_mode_);
+    const PointCloudStyle retired{point_size_, dim_retired_ ? 0.6F : 1.0F, color, only, min_confidence_};
+    const PointCloudStyle active{point_size_, 1.0F, color, only, min_confidence_};
     points_renderer_.render(draw, {origin.x, origin.y}, {origin.x + size.x, origin.y + size.y},
-                            io.DisplayFramebufferScale.x, camera, show_retired_ ? &retired_ : nullptr, retired,
-                            &active_, active);
+                            io.DisplayFramebufferScale.x, camera,
+                            show_points_ && show_retired_ ? &retired_ : nullptr, retired,
+                            show_points_ ? &active_ : nullptr, active, &clouds, dense_point_pixels_,
+                            depth_store_ ? depth_store_->generation() : 0);
   }
   const TrajectorySample* previous = nullptr;
   for (const auto& s : samples_) {

@@ -11,6 +11,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -24,6 +25,13 @@ struct TrackObservation {
   float y{};
   bool has_color{};
   std::array<std::uint8_t, 3> color{};  // RGB of the image at (x, y), when has_color
+  // 1-sigma localisation noise per axis (pixels); <= 0: unknown. Weights the
+  // solvers with VisualOdometryConfig::use_observation_sigma.
+  float sigma_px{};
+  // Network depth at (x, y): z-depth in metres, and its 1-sigma; <= 0:
+  // unknown. Optional, like colour and descriptors (DEPTH_INTEGRATION.md).
+  float depth_m{};
+  float depth_sigma_m{};
 };
 
 struct TrackedFrame {
@@ -130,8 +138,67 @@ struct VisualOdometryConfig {
   // Measured on dreamworks.MOV: re-associations within 2 px of the projection
   // fit the next pose 92% of the time, 2-3 px 72%, beyond 3 px under 20%.
   double reassociation_radius_px{2.0};
+  // Let re-association merge a landmark into the one a matching track
+  // already observes (that track must be a pose inlier): the same point
+  // triangulated twice under two tracks.
+  bool merge_landmarks{true};
+  // Cull also re-checks observations from keyframes outside the BA window
+  // (dropping those that no longer reproject within 2x the threshold). Off:
+  // only windowed observations are checked, as before.
+  bool cull_stale_observations{false};
+
+  // Metric scale from network depth (DEPTH_INTEGRATION.md Phases 0-1; output
+  // only, the solver is unchanged). At each keyframe, landmarks with
+  // >= depth_scale_min_keyframes observations and >= depth_scale_min_parallax_
+  // degrees whose track has a depth sample with sigma / depth <=
+  // depth_scale_max_relative_sigma (edge samples are excluded) give
+  // r = log(depth) - log(z in the segment's units). The keyframe's median r
+  // updates a per-segment log-scale Kalman filter (drift per keyframe, error
+  // floor: network errors are correlated, so many samples don't average out).
+  bool use_depth{true};
+  double depth_relative_sigma{0.15};    // when an observation has depth but no depth_sigma_m
+  int depth_scale_min_samples{20};
+  int depth_scale_min_keyframes{3};
+  double depth_scale_min_parallax_degrees{2.0};
+  double depth_scale_max_relative_sigma{0.2};
+  double depth_scale_drift_sigma{0.02};  // log scale, per keyframe
+  double depth_scale_floor_sigma{0.05};  // log scale, per keyframe measurement
   int dormant_max_frames{900};
   int max_dormant_landmarks{20000};
+
+  // Observation noise (CONFIDENCE_DESIGN.md). Pose optimization and BA weight
+  // each residual by 1 / sigma^2; thresholds stay in pixels. Without
+  // use_observation_sigma (or for observations without sigma_px) every
+  // observation gets observation_sigma_px, which at 1 reproduces the
+  // unweighted solver exactly. The tracker's sigma is floored at
+  // min_observation_sigma_px: its Kalman posterior ignores temporally
+  // correlated errors, so it is optimistic for long tracks.
+  bool use_observation_sigma{true};
+  // Pose tracking: add each landmark's projected (geometry-only) covariance
+  // to its observation's noise, anisotropically (Mahalanobis residual), so a
+  // poorly triangulated landmark stops pulling the pose along its uncertain
+  // direction but still constrains it across (CONFIDENCE_DESIGN.md, phase 2).
+  bool pose_landmark_uncertainty{false};
+  // With it: still reject outliers by plain pixel error (the covariance only
+  // shapes the weights). A wrongly matched young landmark is uncertain along
+  // its epipolar line, so a Mahalanobis gate would let it slide there.
+  bool pose_landmark_pixel_gate{true};
+  // Multiplies the landmark covariance used for those weights. The
+  // geometry-only covariance holds the keyframes fixed and so is optimistic:
+  // actual / predicted error ~1.4 on synthetic data (variance ~2).
+  double pose_landmark_covariance_scale{1.0};
+  double observation_sigma_px{1.0};
+  double min_observation_sigma_px{0.5};
+  // MapPoint::confidence (diagnostic) = precision x verification. Precision
+  // is 0.5 at a relative depth sigma of confidence_depth_ratio. Verification
+  // is confidence_two_view for a landmark seen by 2 keyframes (two rays always
+  // fit, so a wrong match is invisible); each further keyframe halves the
+  // remaining doubt (3: 0.63, 4: 0.81 at the default).
+  double confidence_depth_ratio{0.05};
+  double confidence_two_view{0.25};
+  // Consistency, for landmarks with 3+ views: q = windowed reprojection RMS /
+  // the map's median, factor 1 / (1 + (max(0, q - 1) / scale)^2).
+  double confidence_consistency_scale{0.75};
 
   void validate() const;
 };
@@ -155,10 +222,12 @@ struct OdometryFrameResult {
   std::string event;         // human-readable note (why waiting, lost, ...)
   bool relocalized{};        // this frame resumed a lost segment
   // Landmarks that project into this frame but have no observation in it,
-  // in the input frame's (distorted) pixels. track_id: the landmark's own
-  // (ended or missing) track. `reassociated`: it took over new_track_id this
-  // frame (and is known by that ID from now on).
+  // in the input frame's (distorted) pixels. track_id: the landmark's latest
+  // (ended or missing) track. `reassociated`: new_track_id now observes it
+  // (an untracked track was attached, or that track's own, younger landmark
+  // was merged into this one).
   struct ProjectedLandmark {
+    std::uint64_t landmark_id{};
     std::uint64_t track_id{};
     float x{}, y{};
     bool dormant{};
@@ -167,16 +236,36 @@ struct OdometryFrameResult {
   };
   std::vector<ProjectedLandmark> untracked_landmarks;
   int reassociated{};
+  int merged{};              // duplicate landmarks folded into an older one this frame
+  // Metric scale of this frame's segment: metres per segment unit (0 =
+  // unknown) and its relative 1-sigma. On keyframes, also this keyframe's own
+  // estimate (log scale, NaN without enough samples), its sample count and the
+  // robust spread of log(depth / z) around it: the network's relative error
+  // on reference landmarks.
+  double metric_scale{};
+  double metric_scale_sigma{};
+  double keyframe_log_scale{std::numeric_limits<double>::quiet_NaN()};
+  int keyframe_scale_samples{};
+  double keyframe_scale_spread{std::numeric_limits<double>::quiet_NaN()};
   int relocalization_candidates{};  // descriptor matches tried this frame (0 if no attempt)
   // Track IDs with a landmark this frame, split by the pose fit (sorted; for
   // display). Inliers reproject within reprojection_threshold_px.
   std::vector<std::uint64_t> pose_inliers, pose_outliers;
+  // Pose uncertainty from the inliers (observation_sigma_px noise, landmarks
+  // taken as exact, so optimistic). Scale-free: the camera centre's largest
+  // sigma over the inliers' median depth. NaN without a tracked pose.
+  double rotation_sigma_degrees{std::numeric_limits<double>::quiet_NaN()};
+  double translation_sigma_ratio{std::numeric_limits<double>::quiet_NaN()};
 };
 
-// A triangulated landmark. The ID is the track ID that produced it; with the
-// frame range and a track export, its observations (and, through the feature
-// cache, the SuperPoint descriptors at those pixels) can be recovered later.
+// A triangulated landmark. Landmarks have their own IDs (unique per run, never
+// reused): tracks come and go, and several tracks (a re-found point, merged
+// duplicates) can observe one landmark. track_id is the latest track that
+// observed it; with the frame range and a track export, its observations (and,
+// through the feature cache, the SuperPoint descriptors at those pixels) can
+// be recovered later.
 struct MapPoint {
+  std::uint64_t landmark_id{};
   std::uint64_t track_id{};
   std::array<float, 3> position{};      // world, segment's arbitrary scale
   std::array<std::uint8_t, 3> color{};  // mean RGB over its keyframe observations
@@ -186,6 +275,20 @@ struct MapPoint {
   std::uint64_t first_frame{};  // first keyframe that observed it
   std::uint64_t last_frame{};   // last frame it was an inlier (or keyframe observation)
   bool dormant{};               // track ended; kept for re-association (active_map only)
+  // Uncertainty from the keyframe observations with the keyframes held fixed
+  // (geometry only; optimistic, but ranks points correctly), refreshed after
+  // each keyframe and frozen at retirement. NaN: not computed yet.
+  // depth_sigma_ratio: sigma along the viewing ray of the last keyframe that
+  // saw it, over that distance (scale-free); confidence = verification(views)
+  // x consistency(reprojection_rms) / (1 + (ratio / confidence_depth_ratio)^2),
+  // see VisualOdometryConfig. reprojection_rms: whitened, each observation
+  // measured while its keyframe was in the BA window (NaN until measured).
+  // covariance: xx xy xz yy yz zz, world units^2.
+  float depth_sigma_ratio{std::numeric_limits<float>::quiet_NaN()};
+  float max_parallax_degrees{};
+  float reprojection_rms{std::numeric_limits<float>::quiet_NaN()};
+  float confidence{std::numeric_limits<float>::quiet_NaN()};
+  std::array<float, 6> covariance{};
 };
 
 struct TrajectorySample {
@@ -225,6 +328,10 @@ class VisualOdometry {
   [[nodiscard]] std::vector<MapPoint> retired_map(std::size_t first = 0) const;
   // Track IDs that currently have a 3D landmark (for display).
   [[nodiscard]] bool has_landmark(std::uint64_t track_id) const;
+  // Metres per unit of this segment from network depth; 0 = unknown.
+  [[nodiscard]] double segment_scale(int segment) const;
+  // The landmark a live track currently observes, if any.
+  [[nodiscard]] std::optional<std::uint64_t> landmark_id(std::uint64_t track_id) const;
   [[nodiscard]] std::optional<std::array<double, 3>> landmark(std::uint64_t track_id) const;
   [[nodiscard]] const OdometryFrameResult& last() const;
   [[nodiscard]] const VisualOdometryConfig& config() const;

@@ -14,7 +14,7 @@ namespace slam_native {
 namespace {
 
 namespace fs = std::filesystem;
-constexpr std::size_t kMaxRecentVideos = 10;
+constexpr std::size_t kMaxRecentVideos = RecentSessions::kCapacity;
 
 fs::path normalized(const fs::path& path) {
   if (path.empty()) return {};

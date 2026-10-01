@@ -39,6 +39,13 @@ int main(int argc, char** argv) {
         else if (key == "keyframe_track_ratio") config.keyframe_track_ratio = v;
         else if (key == "bundle_iterations") config.bundle_iterations = static_cast<int>(v);
         else if (key == "min_tracked_points") config.min_tracked_points = static_cast<int>(v);
+        else if (key == "use_observation_sigma") config.use_observation_sigma = v != 0;
+        else if (key == "pose_landmark_uncertainty") config.pose_landmark_uncertainty = v != 0;
+        else if (key == "pose_landmark_pixel_gate") config.pose_landmark_pixel_gate = v != 0;
+        else if (key == "cull_stale_observations") config.cull_stale_observations = v != 0;
+        else if (key == "pose_landmark_covariance_scale") config.pose_landmark_covariance_scale = v;
+        else if (key == "observation_sigma_px") config.observation_sigma_px = v;
+        else if (key == "min_observation_sigma_px") config.min_observation_sigma_px = v;
         else throw std::invalid_argument("Unknown --set key: " + key);
       }
       else if (option == "--hfov") config.horizontal_fov_degrees = std::stod(value());

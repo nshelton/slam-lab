@@ -1,6 +1,6 @@
 // Headless screenshot of the real workbench UI after processing some frames
 // (visual check of the panels). Not part of CTest.
-// usage: slam-native-snapshot VIDEO ENGINE START_SECONDS FRAMES OUT.ppm
+// usage: [SLAM_DEPTH_MODEL=NAME] slam-native-snapshot VIDEO ENGINE START_SECONDS FRAMES OUT.ppm
 #include "../src/app.cpp"
 #include <fstream>
 #include <iostream>
@@ -25,6 +25,7 @@ int main(int argc, char** argv) {
     config.engine = argv[2];
     config.database = root / "features.db";
     config.models_dir = std::filesystem::path(argv[2]).parent_path();
+    if (const char* model = std::getenv("SLAM_DEPTH_MODEL")) config.depth_model = model;  // preset name, "" = off
     Session session(config);
     session.runtime.realtime_pacing = false;
     if (std::stod(argv[3]) > 0) {
