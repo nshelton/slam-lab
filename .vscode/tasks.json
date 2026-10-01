@@ -84,6 +84,15 @@
       "options": { "cwd": "${workspaceFolder}" },
       "dependsOn": "Native: export SuperPoint ONNX",
       "problemMatcher": []
+    },
+    {
+      "label": "Native: build depth engines",
+      "type": "process",
+      "command": "bash",
+      "args": ["${workspaceFolder}/native_workbench/tools/build_depth_engines.sh"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "dedicated" },
+      "problemMatcher": []
     }
   ]
 }

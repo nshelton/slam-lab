@@ -7,6 +7,11 @@
 #include "slam_native/flow_tracker.hpp"
 #include "slam_native/launcher.hpp"
 #include "slam_native/optical_flow.hpp"
+#include "slam_native/color_sampler.hpp"
+#include "slam_native/depth_estimator.hpp"
+#include "slam_native/focal_estimation.hpp"
+#include "slam_native/fov_view.hpp"
+#include "slam_native/track_io.hpp"
 #include "slam_native/trajectory_view.hpp"
 #include "slam_native/visual_odometry.hpp"
 #include "slam_native/video_decoder.hpp"
@@ -18,13 +23,16 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -95,13 +103,33 @@ struct Runtime {
   bool close_requested{};
   bool restart_requested{};
   bool show_features{true};
-  int point_display_mode{}; // 0: tracked points, 1: all raw SuperPoint detections
+  int point_display_mode{}; // 0: tracked points, 1: all raw SuperPoint detections, 2: pose inliers
+  float flow_sigma{};       // tracker position fusion; <= 0 snaps to detections
+  int display_rotation{};   // clockwise degrees; display only (processing uses native frames)
+  int metadata_rotation{};
+  float detection_sigma{1.0F};
   float association_radius{6.0F};
   bool show_trails{true};
+  bool show_untracked_landmarks{true};
   bool show_flow_vectors{};
   bool show_diagnostics{true};
   bool show_trajectory{true};
+  bool show_fov{true};
+  bool show_depth{true};
+  int depth_model{-1};          // index into depth_model_presets(); -1: off
+  std::string depth_error;      // last engine load/run failure
+  DepthMap depth;               // latest finished depth (lags the video by a frame or so)
+  bool depth_dirty{};           // depth changed since the texture was uploaded
+  unsigned int depth_texture{};
+  int depth_texture_width{};
+  int depth_texture_height{};
+  float depth_near{}, depth_far{};  // colour range (2nd / 98th percentile)
   OdometryFrameResult odometry;
+  int relocalizations{};             // since the odometry was (re)created
+  std::size_t reassociations{};      // landmarks re-found by new tracks, same span
+  std::string last_relocalization;   // its event text
+  bool export_requested{};
+  std::string export_status;         // last export's folder, or its error
   bool scrub_active{};
   bool seek_requested{};
   double scrub_seconds{};
@@ -213,6 +241,17 @@ void draw_sidebar(Runtime& runtime,
   ImGui::SameLine();
   if (ImGui::Button("Restart")) runtime.restart_requested = true;
   if (ImGui::Button("Choose another video")) runtime.close_requested = true;
+  ImGui::SameLine();
+  if (ImGui::Button("Rotate")) runtime.display_rotation = (runtime.display_rotation + 90) % 360;
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("Rotate the view 90 deg clockwise (now %d deg; video metadata says %d deg).\n"
+                      "Display only: tracking and pose run on the native frames, whose\n"
+                      "landscape layout matches the SuperPoint engine's input.",
+                      runtime.display_rotation, runtime.metadata_rotation);
+  if (ImGui::Button("Export trajectory")) runtime.export_requested = true;
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("Write the camera trajectory, map and camera settings (CSV) to out/<video>/.");
+  if (!runtime.export_status.empty()) ImGui::TextWrapped("%s", runtime.export_status.c_str());
   ImGui::Checkbox("Realtime pacing", &runtime.realtime_pacing);
   ImGui::SetNextItemWidth(110);
   ImGui::DragFloat("Association radius", &runtime.association_radius, 0.5F,
@@ -223,15 +262,39 @@ void draw_sidebar(Runtime& runtime,
                       "Each previous track still accepts only one detection.");
   }
   ImGui::Combo("Point view", &runtime.point_display_mode,
-               "Tracked points\0SuperPoint detections (red)\0");
+               "Tracked points\0SuperPoint detections (red)\0Pose inliers (green) / outliers (red)\0");
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("Pose inliers: tracks with a 3D landmark whose reprojection under the\n"
+                      "current camera pose is within the threshold (green), beyond it (red).\n"
+                      "Grey: tracked, no landmark yet (hollow: flow-only this frame).");
+  ImGui::SetNextItemWidth(110);
+  ImGui::DragFloat("Flow sigma", &runtime.flow_sigma, 0.02F, 0.0F, 10.0F,
+                   runtime.flow_sigma > 0 ? "%.2f px" : "off", ImGuiSliderFlags_AlwaysClamp);
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("Track position fusion (Kalman filter). Flow predicts, the matched SuperPoint\n"
+                      "detection corrects. Per-frame flow error: smaller trusts flow more (smoother).\n"
+                      "0 = off: tracks snap exactly onto SuperPoint detections. Next frame.");
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(70);
+  ImGui::DragFloat("Det. sigma", &runtime.detection_sigma, 0.02F, 0.1F, 10.0F, "%.2f px",
+                   ImGuiSliderFlags_AlwaysClamp);
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("SuperPoint localisation noise used by the fusion (source pixels).");
   ImGui::Checkbox("Show points", &runtime.show_features);
   ImGui::BeginDisabled(runtime.point_display_mode == 1);
   ImGui::Checkbox("Show tracks", &runtime.show_trails);
   if (optical_flow) ImGui::Checkbox("Show flow vectors", &runtime.show_flow_vectors);
+  ImGui::Checkbox("Untracked landmarks", &runtime.show_untracked_landmarks);
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("3D landmarks that project into this frame under the current pose but have no\n"
+                      "track observing them (magenta ring; faint: dormant, its track ended earlier).\n"
+                      "Filled magenta with a white ring: re-found this frame by a new track.");
   ImGui::EndDisabled();
   ImGui::Checkbox("Diagnostics", &runtime.show_diagnostics);
   ImGui::SameLine();
   ImGui::Checkbox("Trajectory", &runtime.show_trajectory);
+  ImGui::SameLine();
+  ImGui::Checkbox("Lens", &runtime.show_fov);
   ImGui::Separator();
   ImGui::Text("Codec: %s", decoder.codec_name().c_str());
   ImGui::Text("Nominal FPS: %.2f", decoder.nominal_fps());
@@ -262,18 +325,20 @@ void draw_sidebar(Runtime& runtime,
   if (runtime.odometry.has_pose) {
     ImGui::Text("Pose inliers: %d / %d", runtime.odometry.inliers, runtime.odometry.correspondences);
   }
+  ImGui::Text("Relocalized: %d", runtime.relocalizations);
+  ImGui::Text("Untracked in view: %zu, re-found %d (%zu)",
+              runtime.odometry.untracked_landmarks.size(), runtime.odometry.reassociated,
+              runtime.reassociations);
+  if (!runtime.last_relocalization.empty() && ImGui::IsItemHovered())
+    ImGui::SetTooltip("%s", runtime.last_relocalization.c_str());
   const double elapsed = std::chrono::duration<double>(Clock::now() - runtime.started).count();
   ImGui::Text("Throughput: %.1f frames/s", elapsed > 0 ? runtime.stats.inferred_frames / elapsed : 0);
   ImGui::Separator();
-  ImGui::Text("DB queue: %zu", store.queued());
-  ImGui::Text("DB committed: %llu", static_cast<unsigned long long>(store.persisted()));
-  ImGui::Text("DB size: %s",
+  ImGui::Text("Point cache: %llu frames (%s)", static_cast<unsigned long long>(database_stats.frame_rows),
               format_bytes(database_stats.main_bytes + database_stats.wal_bytes).c_str());
-  ImGui::Text("Cached frames: %llu", static_cast<unsigned long long>(database_stats.frame_rows));
-  ImGui::TextDisabled("Tracks and diagnostics live in memory.");
-  ImGui::Text("Saved observations: %llu",
-              static_cast<unsigned long long>(database_stats.observations));
-  ImGui::TextWrapped("%s", database_path.string().c_str());
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("SuperPoint detections, reused when this video is replayed.\n%s\nWaiting to be written: %zu frames",
+                      database_path.c_str(), store.queued());
   if (runtime.stopped) ImGui::TextColored({1.0F, 0.65F, 0.4F, 1.0F}, "Stopped and flushed");
   if (runtime.eof) ImGui::TextColored({0.45F, 0.8F, 1.0F, 1.0F}, "End of video");
   ImGui::Separator();
@@ -316,18 +381,38 @@ void draw_video(Runtime& runtime, bool optical_flow, std::int64_t duration_ns,
     return;
   }
   const ImVec2 available = ImGui::GetContentRegionAvail();
-  const float scale = std::min(available.x / runtime.frame_width,
-                               std::max(1.0F, available.y - 85.0F) / runtime.frame_height);
-  const ImVec2 size(runtime.frame_width * scale, runtime.frame_height * scale);
+  const int rotation = runtime.display_rotation;
+  const bool sideways = rotation == 90 || rotation == 270;
+  const float width = static_cast<float>(runtime.frame_width), height = static_cast<float>(runtime.frame_height);
+  const float shown_width = sideways ? height : width, shown_height = sideways ? width : height;
+  const float scale = std::min(available.x / shown_width, std::max(1.0F, available.y - 85.0F) / shown_height);
+  const ImVec2 size(shown_width * scale, shown_height * scale);
   const ImVec2 origin = ImGui::GetCursorScreenPos();
-  ImGui::Image(static_cast<ImTextureID>(runtime.texture), size, {0, 0}, {1, 1});
-  if (runtime.point_display_mode == 0 &&
+  // Source pixel -> screen, through the clockwise display rotation.
+  const auto screen = [&](float x, float y) {
+    float u = x, v = y;
+    if (rotation == 90) { u = height - y; v = x; }
+    else if (rotation == 180) { u = width - x; v = height - y; }
+    else if (rotation == 270) { u = y; v = width - x; }
+    return ImVec2(origin.x + u * scale, origin.y + v * scale);
+  };
+  ImGui::InvisibleButton("##video-image", size);
+  {
+    // Displayed corners (TL, TR, BR, BL) sample these source corners.
+    const ImVec2 corners[4] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+    const int first = (4 - rotation / 90) % 4;
+    ImGui::GetWindowDrawList()->AddImageQuad(static_cast<ImTextureID>(runtime.texture), origin,
+        {origin.x + size.x, origin.y}, {origin.x + size.x, origin.y + size.y}, {origin.x, origin.y + size.y},
+        corners[first], corners[(first + 1) % 4], corners[(first + 2) % 4], corners[(first + 3) % 4]);
+  }
+  if (runtime.point_display_mode != 1 &&
       ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
     const ImVec2 mouse = ImGui::GetMousePos();
     float nearest = 100.0F;
     for (std::size_t index = 0; index < runtime.points.size(); ++index) {
-      const float dx = mouse.x - (origin.x + runtime.points[index].x * scale);
-      const float dy = mouse.y - (origin.y + runtime.points[index].y * scale);
+      const ImVec2 at = screen(runtime.points[index].x, runtime.points[index].y);
+      const float dx = mouse.x - at.x;
+      const float dy = mouse.y - at.y;
       const float squared = dx * dx + dy * dy;
       if (squared < nearest) {
         nearest = squared;
@@ -336,7 +421,7 @@ void draw_video(Runtime& runtime, bool optical_flow, std::int64_t duration_ns,
     }
   }
   ImDrawList* draw = ImGui::GetWindowDrawList();
-  if (runtime.point_display_mode == 0 && runtime.show_trails) {
+  if (runtime.point_display_mode != 1 && runtime.show_trails) {
     for (const auto& [id, trail] : runtime.trails) {
       if (trail.positions.size() < 2) continue;
       if (runtime.selected_landmark != std::numeric_limits<std::uint64_t>::max() &&
@@ -344,21 +429,38 @@ void draw_video(Runtime& runtime, bool optical_flow, std::int64_t duration_ns,
       for (std::size_t index = 1; index < trail.positions.size(); ++index) {
         const auto& previous = trail.positions[index - 1];
         const auto& current = trail.positions[index];
-        draw->AddLine({origin.x + previous.x * scale, origin.y + previous.y * scale},
-                      {origin.x + current.x * scale, origin.y + current.y * scale},
+        draw->AddLine(screen(previous.x, previous.y), screen(current.x, current.y),
                       landmark_color(id, 130), 1.5F);
       }
     }
   }
   if (runtime.show_features && runtime.point_display_mode == 1) {
     for (const auto& point : runtime.detections) {
-      draw->AddCircleFilled({origin.x + point.x * scale, origin.y + point.y * scale},
-                            2.3F, IM_COL32(255, 0, 0, 255));
+      draw->AddCircleFilled(screen(point.x, point.y), 2.3F, IM_COL32(255, 0, 0, 255));
+    }
+  } else if (runtime.show_features && runtime.point_display_mode == 2) {
+    const auto& inliers = runtime.odometry.pose_inliers;
+    const auto& outliers = runtime.odometry.pose_outliers;
+    for (std::size_t index = 0; index < runtime.points.size(); ++index) {
+      const auto& point = runtime.points[index];
+      const ImVec2 center = screen(point.x, point.y);
+      const std::uint64_t id = runtime.landmark_ids[index];
+      const bool supported = index >= runtime.supported.size() || runtime.supported[index];
+      if (std::binary_search(inliers.begin(), inliers.end(), id)) {
+        draw->AddCircleFilled(center, 3.0F, IM_COL32(60, 235, 90, 255));
+      } else if (std::binary_search(outliers.begin(), outliers.end(), id)) {
+        draw->AddCircleFilled(center, 3.0F, IM_COL32(255, 60, 50, 255));
+      } else if (supported) {
+        draw->AddCircleFilled(center, 1.8F, IM_COL32(170, 170, 170, 170));
+      } else {
+        draw->AddCircle(center, 2.5F, IM_COL32(170, 170, 170, 170), 0, 1.0F);
+      }
+      if (id == runtime.selected_landmark) draw->AddCircle(center, 7.0F, IM_COL32_WHITE, 0, 2.0F);
     }
   } else if (runtime.show_features) {
     for (std::size_t index = 0; index < runtime.points.size(); ++index) {
       const auto& point = runtime.points[index];
-      const ImVec2 center(origin.x + point.x * scale, origin.y + point.y * scale);
+      const ImVec2 center = screen(point.x, point.y);
       const std::uint64_t id = runtime.landmark_ids[index];
       const bool selected = id == runtime.selected_landmark;
       const auto color = landmark_color(id);
@@ -366,6 +468,18 @@ void draw_video(Runtime& runtime, bool optical_flow, std::int64_t duration_ns,
       if (supported) draw->AddCircleFilled(center, selected ? 5.0F : 2.3F, color);
       else draw->AddCircle(center, selected ? 5.0F : 3.0F, color, 0, 1.2F);  // flow-only frame
       if (selected) draw->AddCircle(center, 7.0F, IM_COL32_WHITE, 0, 2.0F);
+    }
+  }
+  if (runtime.show_untracked_landmarks && runtime.point_display_mode != 1) {
+    for (const auto& landmark : runtime.odometry.untracked_landmarks) {
+      const ImVec2 center = screen(landmark.x, landmark.y);
+      if (landmark.reassociated) {
+        draw->AddCircleFilled(center, 4.0F, IM_COL32(255, 0, 255, 255));
+        draw->AddCircle(center, 6.5F, IM_COL32_WHITE, 0, 1.5F);
+      } else {
+        draw->AddCircle(center, 5.0F, landmark.dormant ? IM_COL32(255, 0, 255, 110) : IM_COL32(255, 0, 255, 230),
+                        0, 1.5F);
+      }
     }
   }
   if (runtime.point_display_mode == 0 &&
@@ -377,9 +491,8 @@ void draw_video(Runtime& runtime, bool optical_flow, std::int64_t duration_ns,
                                                               static_cast<float>(y));
         if (!std::isfinite(vector.dx) || !std::isfinite(vector.dy) ||
             vector.dx * vector.dx + vector.dy * vector.dy < 0.25F) continue;
-        const ImVec2 from(origin.x + x * scale, origin.y + y * scale);
-        const ImVec2 to(origin.x + (x + vector.dx) * scale,
-                        origin.y + (y + vector.dy) * scale);
+        const ImVec2 from = screen(static_cast<float>(x), static_cast<float>(y));
+        const ImVec2 to = screen(x + vector.dx, y + vector.dy);
         draw->AddLine(from, to, IM_COL32(80, 230, 255, 210), 1.5F);
         draw->AddCircleFilled(to, 2.0F, IM_COL32(80, 230, 255, 220));
       }
@@ -573,6 +686,130 @@ void draw_flow_diagnostics(Runtime& runtime, const FlowTracker& tracker) {
   ImGui::End();
 }
 
+// Turbo colormap (Mikhailov, 2019), polynomial approximation; t in [0, 1].
+std::array<std::uint8_t, 3> turbo(float t) {
+  t = std::clamp(t, 0.0F, 1.0F);
+  const float t2 = t * t, t3 = t2 * t, t4 = t3 * t, t5 = t4 * t;
+  const float r = 0.13572138F + 4.61539260F * t - 42.66032258F * t2 + 132.13108234F * t3 -
+                  152.94239396F * t4 + 59.28637943F * t5;
+  const float g = 0.09140261F + 2.19418839F * t + 4.84296658F * t2 - 14.18503333F * t3 +
+                  4.27729857F * t4 + 2.82956604F * t5;
+  const float b = 0.10667330F + 12.64194608F * t - 60.58204836F * t2 + 110.36276771F * t3 -
+                  89.90310912F * t4 + 27.34824973F * t5;
+  const auto byte = [](float v) { return static_cast<std::uint8_t>(std::clamp(v, 0.0F, 1.0F) * 255.0F + 0.5F); };
+  return {byte(r), byte(g), byte(b)};
+}
+
+// Colours the latest depth map (log depth, near = red) into runtime.depth_texture.
+void upload_depth_texture(Runtime& runtime) {
+  const DepthMap& depth = runtime.depth;
+  std::vector<float> valid;
+  valid.reserve(depth.metres.size() / 7 + 1);
+  for (std::size_t index = 0; index < depth.metres.size(); index += 7)
+    if (depth.metres[index] > 0) valid.push_back(depth.metres[index]);
+  if (valid.empty()) return;
+  const auto percentile = [&](double q) {
+    auto at = valid.begin() + static_cast<std::ptrdiff_t>(q * (valid.size() - 1));
+    std::nth_element(valid.begin(), at, valid.end());
+    return *at;
+  };
+  runtime.depth_near = std::max(0.05F, percentile(0.02));
+  runtime.depth_far = std::max(runtime.depth_near * 1.01F, percentile(0.98));
+  const float log_near = std::log(runtime.depth_near);
+  const float inv_range = 1.0F / (std::log(runtime.depth_far) - log_near);
+  std::vector<std::uint8_t> rgba(depth.metres.size() * 4);
+  for (std::size_t index = 0; index < depth.metres.size(); ++index) {
+    const float metres = depth.metres[index];
+    const auto rgb = metres > 0 ? turbo(1.0F - (std::log(metres) - log_near) * inv_range)
+                                : std::array<std::uint8_t, 3>{0, 0, 0};
+    std::copy(rgb.begin(), rgb.end(), rgba.begin() + static_cast<std::ptrdiff_t>(index * 4));
+    rgba[index * 4 + 3] = 255;
+  }
+  if (!runtime.depth_texture) {
+    glGenTextures(1, &runtime.depth_texture);
+    glBindTexture(GL_TEXTURE_2D, runtime.depth_texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  }
+  glBindTexture(GL_TEXTURE_2D, runtime.depth_texture);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  if (runtime.depth_texture_width != depth.width || runtime.depth_texture_height != depth.height) {
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, depth.width, depth.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    runtime.depth_texture_width = depth.width;
+    runtime.depth_texture_height = depth.height;
+  } else {
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, depth.width, depth.height, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+  }
+}
+
+void draw_depth(Runtime& runtime) {
+  if (!runtime.show_depth) return;
+  ImGui::SetNextWindowPos({1440, 8}, ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize({360, 640}, ImGuiCond_FirstUseEver);
+  if (!ImGui::Begin("Depth", &runtime.show_depth)) {
+    ImGui::End();
+    return;
+  }
+  const auto& presets = depth_model_presets();
+  const char* current = runtime.depth_model >= 0 ? presets[runtime.depth_model].name.c_str() : "Off";
+  ImGui::SetNextItemWidth(-1);
+  if (ImGui::BeginCombo("##depth-model", current)) {
+    if (ImGui::Selectable("Off", runtime.depth_model < 0)) runtime.depth_model = -1;
+    for (int index = 0; index < static_cast<int>(presets.size()); ++index) {
+      if (ImGui::Selectable(presets[index].name.c_str(), runtime.depth_model == index)) {
+        runtime.depth_model = index;
+        runtime.depth_error.clear();
+      }
+    }
+    ImGui::EndCombo();
+  }
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("Monocular metric depth (TensorRT), on its own CUDA stream; a frame is\n"
+                      "submitted whenever the previous one has finished. Next frame.");
+  if (!runtime.depth_error.empty()) ImGui::TextColored({1, 0.5F, 0.4F, 1}, "%s", runtime.depth_error.c_str());
+  const DepthMap& depth = runtime.depth;
+  if (runtime.depth_model < 0 || depth.empty()) {
+    if (runtime.depth_model >= 0) ImGui::TextDisabled("Waiting for the first depth map...");
+    ImGui::End();
+    return;
+  }
+  if (runtime.depth_dirty) {
+    upload_depth_texture(runtime);
+    runtime.depth_dirty = false;
+  }
+  ImGui::Text("GPU: %.2f ms   frame %llu (%lld behind)", depth.gpu_ms,
+              static_cast<unsigned long long>(depth.frame_index),
+              static_cast<long long>(runtime.frame_index) - static_cast<long long>(depth.frame_index));
+  ImGui::Text("Range: %.2f - %.2f m (2nd-98th pct, log)", runtime.depth_near, runtime.depth_far);
+  if (!runtime.depth_texture) {
+    ImGui::End();
+    return;
+  }
+  // Crop the letterbox: the content is the upright frame, scaled.
+  const bool sideways = depth.rotation == 90 || depth.rotation == 270;
+  const float upright_width = static_cast<float>(sideways ? depth.source_height : depth.source_width);
+  const float upright_height = static_cast<float>(sideways ? depth.source_width : depth.source_height);
+  const ImVec2 uv0(depth.offset_x / depth.width, depth.offset_y / depth.height);
+  const ImVec2 uv1((depth.offset_x + upright_width * depth.scale_x) / depth.width,
+                   (depth.offset_y + upright_height * depth.scale_y) / depth.height);
+  const ImVec2 available = ImGui::GetContentRegionAvail();
+  const float scale = std::max(0.01F, std::min(available.x / upright_width, available.y / upright_height));
+  const ImVec2 size(upright_width * scale, upright_height * scale);
+  const ImVec2 origin = ImGui::GetCursorScreenPos();
+  ImGui::Image(static_cast<ImTextureID>(runtime.depth_texture), size, uv0, uv1);
+  if (ImGui::IsItemHovered()) {
+    const ImVec2 mouse = ImGui::GetMousePos();
+    const float u = uv0.x + (uv1.x - uv0.x) * (mouse.x - origin.x) / size.x;
+    const float v = uv0.y + (uv1.y - uv0.y) * (mouse.y - origin.y) / size.y;
+    const int x = std::clamp(static_cast<int>(u * depth.width), 0, depth.width - 1);
+    const int y = std::clamp(static_cast<int>(v * depth.height), 0, depth.height - 1);
+    ImGui::SetTooltip("%.2f m", depth.metres[static_cast<std::size_t>(y) * depth.width + x]);
+  }
+  ImGui::End();
+}
+
 struct Session {
   explicit Session(AppConfig settings) : config(std::move(settings)) {
     decoder = make_ffmpeg_cuda_decoder();
@@ -588,6 +825,16 @@ struct Session {
     odometry = std::make_unique<VisualOdometry>(config.odometry);
     next_cache_index = static_cast<std::uint64_t>(store->last_frame_index() + 1);
     runtime.association_radius = config.flow_tracker.association_radius;
+    runtime.metadata_rotation = decoder->display_rotation();
+    runtime.display_rotation = config.display_rotation.value_or(runtime.metadata_rotation);
+    runtime.flow_sigma = config.flow_tracker.flow_sigma_px;
+    runtime.detection_sigma = config.flow_tracker.detection_sigma_px;
+    if (!config.depth_model.empty()) {
+      const auto& presets = depth_model_presets();
+      const auto* spec = find_depth_model(config.depth_model);
+      if (spec) runtime.depth_model = static_cast<int>(spec - presets.data());
+      else runtime.depth_error = "Unknown depth model: " + config.depth_model;
+    }
   }
 
   void seek(double seconds) {
@@ -633,7 +880,11 @@ struct Session {
     // Track IDs restart with the tracker, so the camera trajectory does too.
     odometry = std::make_unique<VisualOdometry>(config.odometry);
     trajectory_view.reset();
+    focal.restart_tracks();
     runtime.odometry = {};
+    runtime.relocalizations = 0;
+    runtime.reassociations = 0;
+    runtime.last_relocalization.clear();
     runtime.trails.clear();
     runtime.projected.clear();
     runtime.selected_landmark = std::numeric_limits<std::uint64_t>::max();
@@ -650,6 +901,7 @@ struct Session {
   }
 
   void advance() {
+    poll_depth();
     if (runtime.seek_requested || runtime.restart_requested) {
       const bool restart = runtime.restart_requested;
       runtime.restart_requested = false;
@@ -702,6 +954,7 @@ struct Session {
       cache_features.frame_index = next_cache_index++;
       store->enqueue(std::move(cache_features));
     }
+    submit_depth(frame);
     runtime.detections = features.keypoints; // Preserve all detections before the tracking cap.
     // GPU hot path: flow fields, detections and track state stay on the device.
     std::optional<DeviceFlowField> field;
@@ -709,6 +962,8 @@ struct Session {
     else optical_flow->remember(frame);
     const DeviceDetections device = cached ? DeviceDetections{} : superpoint->device_detections();
     flow_tracker->set_association_radius(runtime.association_radius);
+    flow_tracker->set_flow_sigma(runtime.flow_sigma);
+    flow_tracker->set_detection_sigma(runtime.detection_sigma);
     flow_tracker->associate(features, field ? &*field : nullptr, cached ? nullptr : &device);
     runtime.flow_ms = field ? optical_flow->gpu_ms() : 0.0;
     // Host flow copy only for the optional overlay.
@@ -716,8 +971,16 @@ struct Session {
     if (field && runtime.show_flow_vectors) runtime.flow_field = optical_flow->download();
     // Camera pose from the observed (non-coasted) tracks; any tracker's output
     // converted to a TrackedFrame could drive this instead.
-    runtime.odometry = odometry->process(tracked_frame_from(features));
+    const TrackedFrame tracked = tracked_frame_from(features, color_sampler.sample(frame, features.keypoints));
+    runtime.odometry = odometry->process(tracked);
+    runtime.reassociations += static_cast<std::size_t>(runtime.odometry.reassociated);
+    if (runtime.odometry.relocalized) {
+      ++runtime.relocalizations;
+      runtime.last_relocalization = "frame " + std::to_string(runtime.odometry.frame_index) + ": " +
+                                    runtime.odometry.event;
+    }
     trajectory_view.update(*odometry);
+    focal.add(tracked);  // background thread
     runtime.points = features.keypoints;
     runtime.supported = features.superpoint_supported;
     runtime.landmark_ids = features.landmark_ids;
@@ -739,6 +1002,90 @@ struct Session {
                                    std::chrono::duration<double>(fps > 0 ? 1.0 / fps : 0.0));
   }
 
+  // (Re)creates the depth engine for the selected model and display
+  // orientation, then queues this frame unless the last one is still running.
+  void submit_depth(const GpuFrame& frame) {
+    poll_depth();
+    if (runtime.depth_model < 0) {
+      depth.reset();
+      runtime.depth = {};
+      return;
+    }
+    const auto& spec = depth_model_presets()[runtime.depth_model];
+    const int rotation = runtime.display_rotation;
+    if (!depth || depth->spec().name != spec.name || depth->rotation() != rotation) {
+      depth.reset();
+      runtime.depth = {};
+      const bool sideways = rotation == 90 || rotation == 270;
+      const bool portrait = (sideways ? frame.width : frame.height) > (sideways ? frame.height : frame.width);
+      try {
+        depth = std::make_unique<DepthEstimator>(spec, depth_engine_path(config.models_dir, spec, portrait), rotation);
+      } catch (const std::exception& error) {
+        runtime.depth_error = error.what();
+        runtime.depth_model = -1;
+        return;
+      }
+    }
+    // The pose's lens, so canonical-camera models agree with the VO.
+    const float focal = static_cast<float>(config.odometry.intrinsics ? config.odometry.intrinsics->fx :
+        CameraIntrinsics::from_horizontal_fov(frame.width, frame.height, config.odometry.horizontal_fov_degrees).fx);
+    try {
+      depth->submit(frame, focal);
+    } catch (const std::exception& error) {
+      runtime.depth_error = error.what();
+      runtime.depth_model = -1;
+      depth.reset();
+    }
+  }
+
+  void poll_depth() {
+    if (depth && depth->poll(runtime.depth)) runtime.depth_dirty = true;
+  }
+
+  // Restart the camera pose from the current frame with a new lens model.
+  void apply_lens(const LensChoice& lens) {
+    config.odometry.intrinsics.reset();
+    config.odometry.horizontal_fov_degrees = lens.hfov_degrees;
+    config.odometry.distortion_k1 = lens.k1;
+    odometry = std::make_unique<VisualOdometry>(config.odometry);
+    trajectory_view.reset();
+    runtime.odometry = {};
+    runtime.relocalizations = 0;
+    runtime.reassociations = 0;
+    runtime.last_relocalization.clear();
+  }
+
+  // trajectory.csv, map.csv and camera.txt (the intrinsics they were solved
+  // with) in <out_root>/<video stem>/<local time>/. Formats: track_io.hpp.
+  void export_results(const std::filesystem::path& out_root) {
+    try {
+      if (!odometry) throw std::runtime_error("no camera pose yet");
+      char stamp[32];
+      const std::time_t now = std::time(nullptr);
+      std::strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", std::localtime(&now));
+      const auto folder = out_root / config.video.stem() / stamp;
+      std::filesystem::create_directories(folder);
+      const auto samples = odometry->trajectory();
+      std::ofstream trajectory(folder / "trajectory.csv");
+      write_trajectory_csv(trajectory, samples);
+      std::ofstream map(folder / "map.csv");
+      write_map_csv(map, *odometry);
+      std::ofstream camera(folder / "camera.txt");
+      camera << "video " << config.video.string() << "\nsize " << runtime.frame_width << ' '
+             << runtime.frame_height << '\n';
+      if (const auto& K = config.odometry.intrinsics)
+        camera << "intrinsics " << K->fx << ' ' << K->fy << ' ' << K->cx << ' ' << K->cy << '\n';
+      else
+        camera << "hfov_degrees " << config.odometry.horizontal_fov_degrees << '\n';
+      camera << "k1 " << config.odometry.distortion_k1 << '\n';
+      if (!trajectory || !map || !camera) throw std::runtime_error("write failed in " + folder.string());
+      runtime.export_status = "Exported " + std::to_string(samples.size()) + " poses to " +
+                              folder.string();
+    } catch (const std::exception& error) {
+      runtime.export_status = std::string("Export failed: ") + error.what();
+    }
+  }
+
   std::uint64_t next_cache_index{};
   AppConfig config;
   std::unique_ptr<VideoDecoder> decoder;
@@ -750,7 +1097,13 @@ struct Session {
   std::unique_ptr<OnlineTracker> tracker;
   std::unique_ptr<FlowTracker> flow_tracker;
   std::unique_ptr<VisualOdometry> odometry;
+  std::unique_ptr<DepthEstimator> depth;
   TrajectoryView trajectory_view;
+  ColorSampler color_sampler;
+  BackgroundFocalEstimator focal;
+  FocalEstimate focal_estimate;  // latest copy from the worker
+  std::uint64_t focal_version{};
+  FovView fov_view;
   DescriptorProjection projection;
   Runtime runtime;
 };
@@ -770,6 +1123,12 @@ int run_app(const AppConfig& config) {
   AppConfig initial = config;
   if (initial.engine.empty()) {
     initial.engine = native_root / "models/superpoint-1024x576-k2048.engine";
+  }
+  if (initial.models_dir.empty()) initial.models_dir = native_root / "models";
+  if (initial.start_immediately && initial.database.empty()) {
+    initial.video = std::filesystem::absolute(initial.video);
+    initial.engine = std::filesystem::absolute(initial.engine);
+    initial.database = default_point_cache(native_root.parent_path(), initial);
   }
   Launcher launcher(initial, native_root.parent_path());
   DatabaseSummary database_summary;
@@ -802,13 +1161,28 @@ int run_app(const AppConfig& config) {
         session->store->flush();
         session->runtime.stop_requested = false;
       }
+      if (session->runtime.export_requested) {
+        session->export_results(native_root.parent_path() / "out");
+        session->runtime.export_requested = false;
+      }
       draw_video(session->runtime, session->optical_flow != nullptr,
                  session->decoder->duration_ns(),
                  session->decoder->start_time_ns());
       if (session->flow_tracker) draw_flow_diagnostics(session->runtime, *session->flow_tracker);
+      draw_depth(session->runtime);
       if (session->odometry) {
+        session->trajectory_view.set_display_rotation(session->runtime.display_rotation);
         session->trajectory_view.draw(*session->odometry, &session->runtime.show_trajectory,
                                       session->runtime.frame_width, session->runtime.frame_height);
+        const auto& pose_config = session->config.odometry;
+        session->focal.latest(session->focal_estimate, session->focal_version);
+        bool reset_estimate = false;
+        const LensChoice applied{pose_config.intrinsics ? 0.0 : pose_config.horizontal_fov_degrees,
+                                 pose_config.distortion_k1};
+        const auto lens = session->fov_view.draw(session->focal_estimate, applied, &session->runtime.show_fov,
+                                                 reset_estimate);
+        if (lens) session->apply_lens(*lens);
+        if (reset_estimate) session->focal.reset();
       }
       else draw_diagnostics(session->runtime, *session->tracker, session->projection);
     } else {

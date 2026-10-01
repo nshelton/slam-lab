@@ -30,8 +30,11 @@ add_library(slam-native-vo STATIC
   src/visual_odometry.cpp
   src/vo_geometry.cpp
   src/track_io.cpp
+  src/focal_estimation.cpp
 )
+find_package(Threads REQUIRED)
 target_include_directories(slam-native-vo PUBLIC include PRIVATE src)
+target_link_libraries(slam-native-vo PUBLIC Threads::Threads)
 target_include_directories(slam-native-vo SYSTEM PRIVATE ${eigen_SOURCE_DIR})
 target_compile_options(slam-native-vo PRIVATE -Wall -Wextra -Wpedantic)
 # Eigen at -O0 is ~20x slower; keep the solver usable in Debug builds.
@@ -41,6 +44,14 @@ endif()
 add_executable(slam-native-vo-tracks src/vo_tracks_main.cpp)
 target_link_libraries(slam-native-vo-tracks PRIVATE slam-native-vo)
 target_compile_options(slam-native-vo-tracks PRIVATE -Wall -Wextra -Wpedantic)
+add_executable(slam-native-focal src/focal_main.cpp)
+target_link_libraries(slam-native-focal PRIVATE slam-native-vo)
+target_compile_options(slam-native-focal PRIVATE -Wall -Wextra -Wpedantic)
+add_executable(slam-native-two-view src/two_view_main.cpp)
+target_link_libraries(slam-native-two-view PRIVATE slam-native-vo)
+target_include_directories(slam-native-two-view PRIVATE src)
+target_include_directories(slam-native-two-view SYSTEM PRIVATE ${eigen_SOURCE_DIR})
+target_compile_options(slam-native-two-view PRIVATE -Wall -Wextra -Wpedantic -O2)
 
 add_library(slam-native-recents STATIC src/recent_sessions.cpp)
 target_include_directories(slam-native-recents PUBLIC include)
@@ -60,6 +71,11 @@ if(BUILD_TESTING)
     target_compile_options(slam-native-vo-test PRIVATE -O2)
   endif()
   add_test(NAME native_visual_odometry COMMAND slam-native-vo-test)
+  add_executable(slam-native-focal-test tests/test_focal_estimation.cpp)
+  target_link_libraries(slam-native-focal-test PRIVATE slam-native-vo)
+  target_include_directories(slam-native-focal-test SYSTEM PRIVATE ${eigen_SOURCE_DIR})
+  target_compile_options(slam-native-focal-test PRIVATE -Wall -Wextra -Wpedantic -O2)
+  add_test(NAME native_focal_estimation COMMAND slam-native-focal-test)
   add_executable(slam-native-recents-test tests/test_recent_sessions.cpp)
   target_link_libraries(slam-native-recents-test PRIVATE slam-native-recents)
   target_compile_options(slam-native-recents-test PRIVATE -Wall -Wextra -Wpedantic)
@@ -120,6 +136,10 @@ if(SLAM_NATIVE_BUILD_APP)
     src/flow_association.cu
     src/cuda_frame_presenter.cu
     src/trajectory_view.cpp
+    src/point_cloud_renderer.cpp
+    src/fov_view.cpp
+    src/color_sampler.cu
+    src/depth_estimator.cu
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
@@ -198,6 +218,7 @@ if(SLAM_NATIVE_BUILD_APP)
       src/tensorrt_superpoint.cu
       src/optical_flow.cu
       src/flow_association.cu
+      src/color_sampler.cu
     )
     target_include_directories(slam-native-tracking-bench PRIVATE include third_party/nvof ${TENSORRT_INCLUDE_DIR})
     target_link_libraries(slam-native-tracking-bench PRIVATE slam-native-store slam-native-vo PkgConfig::FFMPEG

@@ -75,6 +75,10 @@ struct FrameFeatures {
   std::vector<bool> superpoint_supported;
   std::vector<Keypoint> flow_predictions;
   std::vector<float> correction_distances;
+  // After tracking, when the detections' descriptors were on the host: the
+  // descriptor of the detection each track matched this frame (keypoints.size()
+  // x 256, aligned with keypoints; zero rows for coasted tracks). Empty otherwise.
+  std::vector<float> track_descriptors;
   std::uint32_t new_landmarks{};
   std::uint32_t matched_landmarks{};
   std::uint32_t coasted_landmarks{};  // live tracks carried by flow without a detection

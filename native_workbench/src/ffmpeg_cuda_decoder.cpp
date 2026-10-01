@@ -5,12 +5,14 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/display.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_cuda.h>
 #include <libavutil/pixdesc.h>
 }
 
 #include <cerrno>
+#include <cmath>
 #include <algorithm>
 #include <filesystem>
 #include <memory>
@@ -120,6 +122,18 @@ class FfmpegCudaDecoder final : public VideoDecoder {
       duration_ns_ = 0;
     }
     codec_name_ = codec->name;
+    display_rotation_ = 0;
+    if (const AVPacketSideData* side = av_packet_side_data_get(stream_->codecpar->coded_side_data,
+                                                               stream_->codecpar->nb_coded_side_data,
+                                                               AV_PKT_DATA_DISPLAYMATRIX);
+        side && side->size >= static_cast<int>(9 * sizeof(std::int32_t))) {
+      // av_display_rotation_get is counter-clockwise; display needs the inverse.
+      const double counter_clockwise = av_display_rotation_get(reinterpret_cast<const std::int32_t*>(side->data));
+      if (std::isfinite(counter_clockwise)) {
+        const int quarter = static_cast<int>(std::lround(-counter_clockwise / 90.0));
+        display_rotation_ = ((quarter % 4) + 4) % 4 * 90;
+      }
+    }
     frame_index_ = 0;
     draining_ = false;
   }
@@ -217,6 +231,7 @@ class FfmpegCudaDecoder final : public VideoDecoder {
   [[nodiscard]] std::int64_t duration_ns() const override { return duration_ns_; }
   [[nodiscard]] std::int64_t start_time_ns() const override { return start_time_ns_; }
   [[nodiscard]] std::string codec_name() const override { return codec_name_; }
+  [[nodiscard]] int display_rotation() const override { return display_rotation_; }
 
  private:
   static AVPixelFormat select_cuda_format(AVCodecContext*, const AVPixelFormat* formats) {
@@ -268,6 +283,7 @@ class FfmpegCudaDecoder final : public VideoDecoder {
   std::int64_t start_time_ns_{};
   double nominal_fps_{};
   std::string codec_name_;
+  int display_rotation_{};
   bool draining_{};
 };
 

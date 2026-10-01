@@ -19,6 +19,10 @@ class VideoDecoder {
   [[nodiscard]] virtual std::int64_t start_time_ns() const = 0;
   [[nodiscard]] virtual double nominal_fps() const = 0;
   [[nodiscard]] virtual std::string codec_name() const = 0;
+  // Clockwise rotation (0, 90, 180 or 270 degrees) that displays the video
+  // upright, from the container's display matrix (phones record portrait
+  // video as rotated landscape frames). Decoded frames are not rotated.
+  [[nodiscard]] virtual int display_rotation() const { return 0; }
 };
 
 std::unique_ptr<VideoDecoder> make_ffmpeg_cuda_decoder();

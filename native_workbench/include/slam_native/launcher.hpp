@@ -39,6 +39,12 @@ class DatabaseSummary {
 
 std::string format_bytes(std::uintmax_t bytes);
 
+// Where a session's SuperPoint detections are cached:
+// <repository>/pointcache/<video stem>-<hash>.sqlite3. The hash covers everything
+// that changes the cached detections (video path and size, engine, SuperPoint
+// settings, schema), so a cache always matches the session that opens it.
+std::filesystem::path default_point_cache(const std::filesystem::path& repository_root, const AppConfig& config);
+
 class Launcher {
  public:
   Launcher(AppConfig initial, std::filesystem::path repository_root);
@@ -47,10 +53,9 @@ class Launcher {
   void record_recent(const AppConfig& config);
 
  private:
-  enum class Target { video, engine, database };
+  enum class Target { video, engine };
   void open_browser(Target target);
   void draw_browser();
-  void set_video(std::string value);
   void refresh_entries();
   void change_directory(const std::filesystem::path& directory);
   [[nodiscard]] std::string& target_path();
@@ -60,9 +65,7 @@ class Launcher {
   std::filesystem::path repository_root_;
   std::string video_;
   std::string engine_;
-  std::string database_;
   std::string error_;
-  bool database_custom_{};
   bool browser_open_{};
   bool browser_popup_pending_{};
   bool show_all_files_{};

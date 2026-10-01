@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <iomanip>
 #include <iterator>
@@ -75,6 +76,14 @@ std::uint64_t sqlite_count_or_metadata(sqlite3* db, const char* key,
   return sqlite_count(db, fallback_sql);
 }
 
+// Absolute path of a text field; empty stays empty (fs::absolute throws on it).
+fs::path absolute_path(const std::string& value) {
+  if (value.empty()) return {};
+  std::error_code error;
+  const fs::path path = fs::absolute(expand_home(value), error);
+  return error ? expand_home(value) : path;
+}
+
 DatabaseStats inspect_database(const fs::path& path, bool inspect_rows) {
   DatabaseStats stats;
   if (path.empty()) return stats;
@@ -117,14 +126,14 @@ DatabaseStats inspect_database(const fs::path& path, bool inspect_rows) {
   return stats;
 }
 
-std::string video_database_name(const fs::path& video) {
-  std::string stem = video.stem().string();
-  if (stem.empty()) stem = "video";
-  for (char& character : stem) {
-    if (!std::isalnum(static_cast<unsigned char>(character)) &&
-        character != '-' && character != '_') character = '-';
+// FNV-1a: stable across runs and builds, unlike std::hash.
+std::uint64_t fnv1a(const std::string& text) {
+  std::uint64_t hash = 14695981039346656037ULL;
+  for (unsigned char character : text) {
+    hash ^= character;
+    hash *= 1099511628211ULL;
   }
-  return "native-" + stem + "-superpoint-cache";
+  return hash;
 }
 
 bool is_expected_file(const fs::path& path, int target) {
@@ -137,8 +146,7 @@ bool is_expected_file(const fs::path& path, int target) {
            extension == ".mpg" || extension == ".mpeg" || extension == ".mts" ||
            extension == ".m2ts" || extension == ".ts";
   }
-  if (target == 1) return extension == ".engine" || extension == ".plan";
-  return extension == ".sqlite3" || extension == ".db" || extension == ".sqlite";
+  return extension == ".engine" || extension == ".plan";
 }
 
 }  // namespace
@@ -153,6 +161,37 @@ const DatabaseStats& DatabaseSummary::get(const fs::path& path, bool inspect_row
     refreshed_ = now;
   }
   return stats_;
+}
+
+// Size and modification time, as FeatureStore's source/engine identity (minus
+// the engine content hash, which is too slow to recompute every UI frame).
+static std::string file_stamp(const fs::path& path) {
+  std::error_code size_error, time_error;
+  const auto size = fs::file_size(path, size_error);
+  const auto time = fs::last_write_time(path, time_error);
+  if (size_error || time_error) return "missing";
+  return std::to_string(size) + ':' + std::to_string(time.time_since_epoch().count());
+}
+
+fs::path default_point_cache(const fs::path& repository_root, const AppConfig& config) {
+  std::error_code video_error, engine_error;
+  const fs::path video = fs::weakly_canonical(config.video, video_error);
+  const fs::path engine = fs::weakly_canonical(config.engine, engine_error);
+  // Everything FeatureStore::set_session refuses to change in an existing cache.
+  std::ostringstream key;
+  key << video.string() << '\n' << file_stamp(video) << '\n' << engine.string() << '\n' << file_stamp(engine)
+      << "\ntensorrt-superpoint-letterbox-v1 schema 3 " << config.superpoint.input_width << 'x'
+      << config.superpoint.input_height << ' ' << config.superpoint.max_keypoints << ' ' << std::hexfloat
+      << config.superpoint.detection_threshold << ' ' << static_cast<int>(config.store.descriptor_encoding);
+  std::string stem = config.video.stem().string();
+  if (stem.empty()) stem = "video";
+  for (char& character : stem) {
+    if (!std::isalnum(static_cast<unsigned char>(character)) &&
+        character != '-' && character != '_') character = '-';
+  }
+  std::ostringstream name;
+  name << stem << '-' << std::hex << std::setw(12) << std::setfill('0') << (fnv1a(key.str()) >> 16) << ".sqlite3";
+  return repository_root / "pointcache" / name.str();
 }
 
 std::string format_bytes(std::uintmax_t bytes) {
@@ -172,10 +211,7 @@ Launcher::Launcher(AppConfig initial, fs::path repository_root)
     : initial_(std::move(initial)),
       recents_(RecentSessions::default_storage_path()),
       repository_root_(std::move(repository_root)),
-      video_(initial_.video.string()), engine_(initial_.engine.string()),
-      database_(initial_.database.string()), database_custom_(!database_.empty()) {
-  if (!video_.empty() && !database_custom_) set_video(video_);
-}
+      video_(initial_.video.string()), engine_(initial_.engine.string()) {}
 
 void Launcher::set_error(std::string error) { error_ = std::move(error); }
 
@@ -186,14 +222,6 @@ void Launcher::record_recent(const AppConfig& config) {
                      config.database});
   } catch (const std::exception& error) {
     error_ = std::string("Could not save recent videos: ") + error.what();
-  }
-}
-
-void Launcher::set_video(std::string value) {
-  video_ = std::move(value);
-  if (!database_custom_ && !video_.empty()) {
-    const std::string name = video_database_name(expand_home(video_));
-    database_ = (repository_root_ / "recordings" / name / "features.sqlite3").string();
   }
 }
 
@@ -229,9 +257,7 @@ void Launcher::refresh_entries() {
 }
 
 std::string& Launcher::target_path() {
-  if (browser_target_ == Target::video) return video_;
-  if (browser_target_ == Target::engine) return engine_;
-  return database_;
+  return browser_target_ == Target::video ? video_ : engine_;
 }
 
 void Launcher::open_browser(Target target) {
@@ -260,8 +286,7 @@ void Launcher::draw_browser() {
   }
   if (!ImGui::BeginPopupModal("Browse files", &browser_open_,
                              ImGuiWindowFlags_AlwaysAutoResize)) return;
-  const char* label = browser_target_ == Target::video ? "Video" :
-                      browser_target_ == Target::engine ? "TensorRT engine" : "Database";
+  const char* label = browser_target_ == Target::video ? "Video" : "TensorRT engine";
   ImGui::Text("Choose %s", label);
   ImGui::SetNextItemWidth(620);
   ImGui::InputText("Folder", &browser_folder_);
@@ -290,12 +315,7 @@ void Launcher::draw_browser() {
       if (directory) next_directory = entry.path();
       else browser_filename_ = entry.path().filename().string();
       if (!directory && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-        const std::string picked = (browser_directory_ / browser_filename_).string();
-        if (browser_target_ == Target::video) set_video(picked);
-        else {
-          target_path() = picked;
-          if (browser_target_ == Target::database) database_custom_ = true;
-        }
+        target_path() = (browser_directory_ / browser_filename_).string();
         browser_open_ = false;
         ImGui::CloseCurrentPopup();
       }
@@ -305,18 +325,13 @@ void Launcher::draw_browser() {
   if (!next_directory.empty()) change_directory(next_directory);
   ImGui::SetNextItemWidth(620);
   ImGui::InputText("File name", &browser_filename_);
-  if (ImGui::Button(browser_target_ == Target::database ? "Use database path" : "Open file")) {
+  if (ImGui::Button("Open file")) {
     const fs::path picked = browser_directory_ / browser_filename_;
     std::error_code error;
-    if (browser_filename_.empty() ||
-        (browser_target_ != Target::database && !fs::is_regular_file(picked, error))) {
+    if (browser_filename_.empty() || !fs::is_regular_file(picked, error)) {
       browser_error_ = "Select an existing file";
     } else {
-      if (browser_target_ == Target::video) set_video(picked.string());
-      else {
-        target_path() = picked.string();
-        if (browser_target_ == Target::database) database_custom_ = true;
-      }
+      target_path() = picked.string();
       browser_open_ = false;
       ImGui::CloseCurrentPopup();
     }
@@ -346,10 +361,6 @@ bool Launcher::draw(AppConfig& selected, DatabaseSummary& database_summary) {
       if (ImGui::Selectable(label.c_str())) {
         video_ = recent.video.string();
         if (!recent.engine.empty()) engine_ = recent.engine.string();
-        const auto& recent_stats = database_summary.get(recent.database);
-        database_custom_ = recent_stats.schema_version == "3";
-        if (database_custom_) database_ = recent.database.string();
-        else set_video(video_);
         error_.clear();
       }
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", recent.video.c_str());
@@ -359,8 +370,7 @@ bool Launcher::draw(AppConfig& selected, DatabaseSummary& database_summary) {
   ImGui::EndDisabled();
   ImGui::TextUnformatted("Video");
   ImGui::SetNextItemWidth(-95);
-  std::string video = video_;
-  if (ImGui::InputText("##video", &video)) set_video(std::move(video));
+  ImGui::InputText("##video", &video_);
   ImGui::SameLine();
   if (ImGui::Button("Browse##video")) open_browser(Target::video);
   ImGui::TextUnformatted("TensorRT engine");
@@ -368,75 +378,34 @@ bool Launcher::draw(AppConfig& selected, DatabaseSummary& database_summary) {
   ImGui::InputText("##engine", &engine_);
   ImGui::SameLine();
   if (ImGui::Button("Browse##engine")) open_browser(Target::engine);
-  ImGui::TextUnformatted("SuperPoint cache");
-  ImGui::SetNextItemWidth(-95);
-  if (ImGui::InputText("##database", &database_)) database_custom_ = true;
-  ImGui::SameLine();
-  if (ImGui::Button("Browse##database")) open_browser(Target::database);
-  if (ImGui::SmallButton("Use default database path")) {
-    database_custom_ = false;
-    set_video(video_);
-  }
+  AppConfig session = initial_;
+  session.video = absolute_path(video_);
+  session.engine = absolute_path(engine_);
+  session.database = video_.empty() ? fs::path{} : default_point_cache(repository_root_, session);
   ImGui::Separator();
-  const auto& stats = database_summary.get(expand_home(database_));
-  if (!stats.exists) {
-    ImGui::Text("Database: new (0 B; created when you start)");
-    ImGui::Text("Cached frames: 0");
+  const auto& stats = database_summary.get(session.database);
+  if (video_.empty()) {
+    ImGui::TextDisabled("Point cache: chosen automatically for the video");
+  } else if (!stats.exists) {
+    ImGui::TextUnformatted("Point cache: none yet (SuperPoint runs on every frame the first time)");
   } else {
-    ImGui::Text("Database: %s", format_bytes(stats.main_bytes + stats.wal_bytes).c_str());
-    ImGui::Text("Main file: %s | WAL: %s", format_bytes(stats.main_bytes).c_str(),
-                format_bytes(stats.wal_bytes).c_str());
-    ImGui::Text("Cached frames: %llu", static_cast<unsigned long long>(stats.frame_rows));
-    ImGui::Text("Saved feature observations: %llu",
-                static_cast<unsigned long long>(stats.observations));
-    if (!stats.source_video.empty()) {
-      ImGui::TextWrapped("Source: %s", stats.source_video.c_str());
-    }
-    if (!stats.engine_path.empty()) {
-      ImGui::TextWrapped("Engine: %s", stats.engine_path.c_str());
-    }
-    if (!stats.tracker_algorithm.empty()) {
-      ImGui::Text("Tracking: %s", stats.tracker_algorithm.c_str());
-    }
+    ImGui::Text("Point cache: %llu frames (%s), reused on replay",
+                static_cast<unsigned long long>(stats.frame_rows),
+                format_bytes(stats.main_bytes + stats.wal_bytes).c_str());
   }
+  if (!video_.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", session.database.c_str());
   if (!stats.error.empty()) ImGui::TextColored({1, 0.5F, 0.4F, 1}, "%s", stats.error.c_str());
   if (!error_.empty()) ImGui::TextColored({1, 0.5F, 0.4F, 1}, "%s", error_.c_str());
   ImGui::Spacing();
   std::error_code video_error, engine_error;
-  std::error_code source_error, selected_error, stored_engine_error, chosen_engine_error;
-  bool source_matches = true;
-  if (!stats.source_video.empty() && !video_.empty()) {
-    source_matches = fs::weakly_canonical(stats.source_video, source_error) ==
-                     fs::weakly_canonical(expand_home(video_), selected_error) &&
-                     !source_error && !selected_error;
-  }
-  bool engine_matches = true;
-  if (!stats.engine_path.empty() && !engine_.empty()) {
-    engine_matches = fs::weakly_canonical(stats.engine_path, stored_engine_error) ==
-                     fs::weakly_canonical(expand_home(engine_), chosen_engine_error) &&
-                     !stored_engine_error && !chosen_engine_error;
-  }
-  if (!source_matches) {
-    ImGui::TextColored({1, 0.5F, 0.4F, 1},
-                       "This database belongs to a different video.");
-  }
-  if (!engine_matches) {
-    ImGui::TextColored({1, 0.5F, 0.4F, 1},
-                       "This database was created with a different engine.");
-  }
-  const bool valid = fs::is_regular_file(expand_home(video_), video_error) &&
-                     fs::is_regular_file(expand_home(engine_), engine_error) &&
-                     !database_.empty() && stats.error.empty() &&
-                     source_matches && engine_matches;
+  const bool valid = fs::is_regular_file(session.video, video_error) &&
+                     fs::is_regular_file(session.engine, engine_error) && stats.error.empty();
   ImGui::BeginDisabled(!valid);
   const bool start = ImGui::Button(stats.exists ? "Replay with cache" : "Start session", {160, 34});
   ImGui::EndDisabled();
-  if (!valid) ImGui::TextDisabled("Select an existing video and engine, and a database path.");
+  if (!valid) ImGui::TextDisabled("Select an existing video and engine.");
   if (start) {
-    selected = initial_;
-    selected.video = fs::absolute(expand_home(video_));
-    selected.engine = fs::absolute(expand_home(engine_));
-    selected.database = fs::absolute(expand_home(database_));
+    selected = std::move(session);
     error_.clear();
   }
   ImGui::End();

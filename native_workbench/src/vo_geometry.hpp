@@ -3,6 +3,7 @@
 // Camera convention: x_camera = R * X_world + t (world -> camera).
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -48,6 +49,10 @@ struct TwoViewResult {
 // threshold is in normalized units (pixels / focal length).
 TwoViewResult ransac_essential(const std::vector<Vec2>& a, const std::vector<Vec2>& b, double threshold,
                                int iterations, std::uint32_t seed);
+// Uncalibrated: any rank-2 F. Inputs should be roughly unit-scaled (for
+// example pixels centred and divided by the image width).
+TwoViewResult ransac_fundamental(const std::vector<Vec2>& a, const std::vector<Vec2>& b, double threshold,
+                                 int iterations, std::uint32_t seed);
 TwoViewResult ransac_homography(const std::vector<Vec2>& a, const std::vector<Vec2>& b, double threshold,
                                 int iterations, std::uint32_t seed);
 // The four (R, t) candidates of an essential matrix (|t| = 1).
@@ -66,6 +71,16 @@ struct PoseObservation {
 };
 int optimize_pose(const Intrinsics& K, const std::vector<PoseObservation>& observations, SE3& pose,
                   double inlier_threshold, std::vector<char>& inliers, int iterations = 10);
+
+// Perspective-three-point (Grunert's quartic). `bearings` are unit rays in the
+// camera frame towards the world points X. Returns up to four candidate
+// world -> camera poses.
+std::vector<SE3> p3p(const std::array<Vec3, 3>& X, const std::array<Vec3, 3>& bearings);
+// P3P RANSAC over 2D-3D matches (u in pixels). Returns the inlier count
+// (reprojection error <= threshold_px) of the best hypothesis; `pose` and
+// `inliers` describe it. No refinement: follow with optimize_pose.
+int ransac_pnp(const Intrinsics& K, const std::vector<PoseObservation>& observations, double threshold_px,
+               int iterations, std::uint32_t seed, SE3& pose, std::vector<char>& inliers);
 
 // Sliding-window bundle adjustment with Schur complement Levenberg-Marquardt.
 struct BundleObservation {

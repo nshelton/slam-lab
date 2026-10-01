@@ -14,6 +14,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 using namespace slam_native;
 namespace {
@@ -25,6 +26,7 @@ struct Scene {
   std::vector<TrackedFrame> frames;
   std::vector<Eigen::Vector3d> centers;   // ground-truth camera centres
   std::vector<Eigen::Matrix3d> rotations; // ground-truth world->camera
+  std::vector<Eigen::Vector3d> points;    // ground-truth landmarks (index encoded in colour)
 };
 
 // Camera walks forward with lateral sway and yaw at 60 fps through a field of
@@ -61,7 +63,7 @@ Scene make_scene(bool translate, int frame_count = 240, std::uint32_t seed = 5, 
     const Eigen::Vector3d t = -R * c;
     scene.centers.push_back(c);
     scene.rotations.push_back(R);
-    TrackedFrame frame{static_cast<std::uint64_t>(f), f * 16'666'667LL, width, height, {}};
+    TrackedFrame frame{static_cast<std::uint64_t>(f), f * 16'666'667LL, width, height, {}, 0, {}};
     for (std::size_t p = 0; p < points.size(); ++p) {
       Eigen::Vector3d X = points[p];
       if (static_cast<int>(p) < movers) X += mover_velocity[p] * f;  // moving "people"
@@ -80,10 +82,13 @@ Scene make_scene(bool translate, int frame_count = 240, std::uint32_t seed = 5, 
       }
       seen[p] = 1;
       if (u(rng) < difficulty.outliers) { x += 40 * (u(rng) - 0.5); y += 40 * (u(rng) - 0.5); }  // gross outlier
-      frame.observations.push_back({id[p], static_cast<float>(x), static_cast<float>(y)});
+      // Colour encodes the point index, so map points can be checked against truth.
+      frame.observations.push_back({id[p], static_cast<float>(x), static_cast<float>(y), true,
+                                    {static_cast<std::uint8_t>(p % 256), static_cast<std::uint8_t>(p / 256), 77}});
     }
     scene.frames.push_back(std::move(frame));
   }
+  scene.points = points;
   return scene;
 }
 
@@ -149,6 +154,140 @@ std::vector<TrajectorySample> run(const std::vector<TrackedFrame>& frames, doubl
 }
 }  // namespace
 
+// Occlusion: frames [begin, end) see nothing, and every track afterwards gets
+// a new ID (as the tracker does). Each true point gets a random unit
+// descriptor, observed with noise (cosine ~0.95).
+std::vector<TrackedFrame> occluded(const Scene& scene, int begin, int end, int dimension = 32) {
+  std::mt19937 rng(11);
+  std::normal_distribution<float> n(0, 1);
+  std::vector<std::vector<float>> truth(scene.points.size(), std::vector<float>(dimension));
+  const auto normalize = [](std::vector<float>& v) {
+    float norm = 0;
+    for (float x : v) norm += x * x;
+    for (float& x : v) x /= std::sqrt(norm);
+  };
+  for (auto& d : truth) {
+    for (float& x : d) x = n(rng);
+    normalize(d);
+  }
+  std::vector<TrackedFrame> frames;
+  for (const auto& source : scene.frames) {
+    TrackedFrame frame = source;
+    frame.observations.clear();
+    frame.descriptor_dimension = dimension;
+    const int f = static_cast<int>(frame.frame_index);
+    if (f >= begin && f < end) {
+      frames.push_back(std::move(frame));
+      continue;
+    }
+    for (auto o : source.observations) {
+      if (f >= end) o.track_id += 1'000'000;
+      const std::size_t index = o.color[0] + 256U * o.color[1];
+      std::vector<float> d = truth[index];
+      for (float& x : d) x += 0.3F / std::sqrt(float(dimension)) * n(rng);
+      normalize(d);
+      frame.observations.push_back(o);
+      frame.descriptors.insert(frame.descriptors.end(), d.begin(), d.end());
+    }
+    frames.push_back(std::move(frame));
+  }
+  return frames;
+}
+
+// After a full occlusion the map is re-found by descriptor + P3P: tracking
+// resumes in the same segment (same frame and scale) instead of starting over.
+void relocalizes_after_occlusion() {
+  const auto scene = make_scene(true, 240, 5, {0.5, 0.03, 0.005, 0.005, 0});
+  const auto frames = occluded(scene, 120, 140);  // 1/3 s blind at 60 fps
+  for (const bool enabled : {false, true}) {
+    VisualOdometryConfig config;
+    config.relocalization = enabled;
+    VisualOdometry odometry(config);
+    int relocalized = -1;
+    std::string event;
+    for (const auto& frame : frames) {
+      const auto r = odometry.process(frame);
+      if (r.relocalized && relocalized < 0) {
+        relocalized = static_cast<int>(r.frame_index);
+        event = r.event;
+      }
+    }
+    const auto trajectory = odometry.trajectory();
+    const auto result = evaluate(scene, trajectory);
+    int after = 0, in_first = 0;
+    for (const auto& sample : trajectory) {
+      after += sample.frame_index >= 140;
+      in_first += sample.frame_index >= 140 && sample.segment == 0;
+    }
+    std::cout << "occlusion 120-140, relocalization " << (enabled ? "on" : "off") << ": " << result.segments
+              << " segment(s), " << in_first << "/" << after << " later poses in segment 0, ATE of largest "
+              << 100 * result.ate_fraction << "% of path";
+    if (enabled) std::cout << "; frame " << relocalized << ": " << event;
+    std::cout << '\n';
+    if (!enabled) {
+      require(in_first == 0, "without relocalization the old segment cannot continue");
+      continue;
+    }
+    require(relocalized >= 140 && relocalized <= 145, "did not relocalize promptly after the occlusion");
+    require(in_first >= after - 6, "tracking did not continue in the original segment");
+    require(result.ate_fraction < 0.01, "relocalized trajectory is inconsistent with the original segment");
+  }
+}
+
+// Tracks that break (every missed detection gives a new ID) re-find their
+// landmark instead of triangulating a duplicate, and only their own: both
+// tracks of every re-association must observe the same true point.
+void reassociates_broken_tracks() {
+  const auto scene = make_scene(true, 240, 5, {0.5, 0.05, 0.01, 0.005, 0});
+  const auto frames = occluded(scene, -1, -1);  // descriptors, no occlusion
+  std::unordered_map<std::uint64_t, std::size_t> truth;  // track -> true point (colour-encoded)
+  for (const auto& frame : frames)
+    for (const auto& o : frame.observations) truth[o.track_id] = o.color[0] + 256U * o.color[1];
+  int landmarks_off = 0;
+  for (const bool enabled : {false, true}) {
+    VisualOdometryConfig config;
+    config.reassociation = enabled;
+    VisualOdometry odometry(config);
+    int reassociated = 0, wrong = 0, reported = 0;
+    for (const auto& frame : frames) {
+      const auto r = odometry.process(frame);
+      reported += static_cast<int>(r.untracked_landmarks.size());
+      for (const auto& p : r.untracked_landmarks) {
+        require(p.x >= 0 && p.y >= 0 && p.x < 1920 && p.y < 1080, "untracked landmark reported outside the image");
+        if (!p.reassociated) continue;
+        ++reassociated;
+        wrong += truth.at(p.track_id) != truth.at(p.new_track_id);
+      }
+      require(r.reassociated == static_cast<int>(std::count_if(r.untracked_landmarks.begin(),
+          r.untracked_landmarks.end(), [](const auto& p) { return p.reassociated; })), "re-association count");
+    }
+    const int landmarks = static_cast<int>(odometry.retired_count() + odometry.active_map().size());
+    std::cout << "broken tracks, re-association " << (enabled ? "on" : "off") << ": " << landmarks
+              << " landmarks, " << reassociated << " re-associated (" << wrong << " wrong), "
+              << reported / static_cast<int>(frames.size()) << " untracked in view per frame\n";
+    if (!enabled) {
+      landmarks_off = landmarks;
+      require(reassociated == 0, "re-association while disabled");
+      continue;
+    }
+    require(reassociated > 300, "too few re-associations");
+    require(wrong * 100 <= reassociated, "more than 1% of re-associations joined different points");
+    require(landmarks * 10 < landmarks_off * 9, "re-association did not reduce duplicate landmarks");
+  }
+}
+
+// distort_point inverts undistort_point.
+void distortion_round_trip() {
+  for (const double k1 : {-0.3, -0.05, 0.05, 0.2})
+    for (const float x : {0.0F, 400.0F, 959.5F, 1919.0F})
+      for (const float y : {0.0F, 539.5F, 1079.0F}) {
+        float u = x, v = y;
+        undistort_point(u, v, 1920, 1080, k1);
+        distort_point(u, v, 1920, 1080, k1);
+        require(std::abs(u - x) < 1e-2F && std::abs(v - y) < 1e-2F, "distort_point does not invert undistort_point");
+      }
+}
+
 // Pose-only optimization must converge to the exact pose from a nearby start.
 void pose_optimizer_converges() {
   std::mt19937 rng(1);
@@ -174,9 +313,55 @@ void pose_optimizer_converges() {
   }
 }
 
+// P3P recovers random poses exactly, and P3P RANSAC tolerates 60% outliers.
+void p3p_recovers_pose() {
+  std::mt19937 rng(3);
+  std::uniform_real_distribution<double> u(-1, 1);
+  const vo::Intrinsics K{1447, 1447, 959.5, 539.5};
+  int solved = 0;
+  const int trials = 500;
+  for (int trial = 0; trial < trials; ++trial) {
+    const vo::SE3 truth{vo::exp_so3(vo::Vec3(0.5 * u(rng), 0.5 * u(rng), 0.5 * u(rng))),
+                        vo::Vec3(u(rng), u(rng), 2 * u(rng))};
+    std::array<vo::Vec3, 3> X, f;
+    for (int i = 0; i < 3; ++i) {
+      const vo::Vec3 xc(3 * u(rng), 2 * u(rng), 6 + 4 * u(rng));
+      X[i] = truth.inverse() * xc;
+      f[i] = xc.normalized();
+    }
+    double best = 1e9;
+    for (const auto& T : vo::p3p(X, f))
+      best = std::min(best, vo::log_so3(T.R * truth.R.transpose()).norm() + (T.t - truth.t).norm());
+    solved += best < 1e-6;
+  }
+  std::cout << "p3p: exact in " << solved << "/" << trials << " random trials\n";
+  require(solved >= trials * 98 / 100, "P3P failed to recover the pose");
+
+  const vo::SE3 truth{vo::exp_so3(vo::Vec3(0.05, -0.2, 0.02)), vo::Vec3(0.4, -0.1, 0.3)};
+  std::vector<vo::PoseObservation> observations;
+  std::normal_distribution<double> noise(0, 0.7);
+  for (int i = 0; i < 200; ++i) {
+    const vo::Vec3 X(4 * u(rng), 2 * u(rng), 8 + 4 * u(rng));
+    vo::Vec2 px = K.project(truth * X) + vo::Vec2(noise(rng), noise(rng));
+    if (i % 5 < 3) px = vo::Vec2(960 + 900 * u(rng), 540 + 500 * u(rng));  // 60% wrong matches
+    observations.push_back({X, px});
+  }
+  vo::SE3 pose;
+  std::vector<char> inliers;
+  const int count = vo::ransac_pnp(K, observations, 4.0, 300, 7, pose, inliers);
+  vo::optimize_pose(K, observations, pose, 3.0, inliers);
+  const double rotation = vo::log_so3(pose.R * truth.R.transpose()).norm() * 180 / M_PI;
+  std::cout << "p3p ransac: " << count << "/200 inliers (80 true), rotation error " << rotation << " deg\n";
+  require(count >= 70 && rotation < 0.2, "P3P RANSAC did not find the pose");
+}
+
 int main() {
   try {
     pose_optimizer_converges();
+    p3p_recovers_pose();
+    relocalizes_after_occlusion();
+    distortion_round_trip();
+    reassociates_broken_tracks();
     // Noise-free data must be reproduced essentially exactly (regression for
     // rotation drift off SO(3), which made poses diverge geometrically).
     const auto clean = make_scene(true, 240, 5, {0, 0, 0, 0, 0});
@@ -185,6 +370,34 @@ int main() {
               << "% of path, median rotation error " << exact.rotation_deg << " deg\n";
     require(exact.segments == 1 && exact.ate_fraction < 1e-5 && exact.rotation_deg < 1e-4,
             "Noise-free trajectory is not exact");
+    {
+      // Retired landmarks are kept, carry their observations' colour, and
+      // match the true points up to a similarity.
+      VisualOdometry odometry;
+      for (const auto& frame : clean.frames) odometry.process(frame);
+      auto map = odometry.retired_map();
+      const std::size_t retired = map.size();
+      const auto active = odometry.active_map();
+      map.insert(map.end(), active.begin(), active.end());
+      require(retired > 200, "too few retired landmarks");
+      Eigen::Matrix3Xd estimated(3, map.size()), truth(3, map.size());
+      for (std::size_t i = 0; i < map.size(); ++i) {
+        const auto& point = map[i];
+        const std::size_t index = point.color[0] + 256U * point.color[1];
+        require(point.has_color && point.color[2] == 77 && index < clean.points.size(), "landmark colour lost");
+        require(point.keyframe_observations >= 2 && point.first_frame <= point.last_frame, "landmark metadata");
+        estimated.col(i) = Eigen::Vector3d(point.position[0], point.position[1], point.position[2]);
+        truth.col(i) = clean.points[index];
+      }
+      const Eigen::Matrix4d S = Eigen::umeyama(estimated, truth, true);
+      double squared = 0;
+      for (std::size_t i = 0; i < map.size(); ++i)
+        squared += (S.topLeftCorner<3, 3>() * estimated.col(i) + S.topRightCorner<3, 1>() - truth.col(i)).squaredNorm();
+      const double rms = std::sqrt(squared / map.size());
+      std::cout << "noise-free map: " << retired << " retired + " << active.size() << " active points, RMS error "
+                << rms << " (scene units)\n";
+      require(rms < 1e-3, "retired map does not match the true points");
+    }
     const auto scene = make_scene(true);
     double ms = 0;
     const auto trajectory = run(scene.frames, &ms);

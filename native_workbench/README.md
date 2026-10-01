@@ -79,9 +79,69 @@ The output CSV has one row per posed frame: `frame_index`, `timestamp_ns`,
 camera-to-world quaternion (`qw,qx,qy,qz`). In C++, build `TrackedFrame`s
 and call `VisualOdometry::process()` directly. To export the native tracks,
 use `slam-native-tracking-bench VIDEO ENGINE START FRAMES export-tracks
-tracks.csv export-trajectory trajectory.csv`. See
+tracks.csv export-trajectory trajectory.csv [export-map map.csv]
+[hfov DEG] [k1 K1]`. See
 [ARCHITECTURE.md](ARCHITECTURE.md#camera-pose-live-monocular-visual-odometry--2026-09-24)
 for the algorithm, measurements and limitations.
+
+The map keeps every landmark. When a landmark's track ends and it leaves the
+bundle-adjustment window, it is **retired**: its position is final and it
+stays in the map, instead of being deleted as before. A segment's landmarks
+are retired when tracking is lost. Each landmark stores the mean image colour
+of its keyframe observations (sampled on the GPU with a 3×3 mean), its track
+ID, and its first and last frames. The trajectory view draws retired points
+dimmer than active ones, optionally in their image colour.
+`slam-native-vo-tracks --map map.csv` and the bench's `export-map` write the
+map as CSV (format in `track_io.hpp`). Track exports now carry optional
+`r,g,b` columns.
+
+SuperPoint descriptors are not stored per landmark. The feature cache keeps
+every raw detection and its descriptor per frame. A supported track point
+sits exactly on the detection it snapped to, so a landmark's descriptors can
+be recovered from its track ID, the track export (frame and pixel of each
+observation) and the cache.
+
+To debug the geometry on a single frame pair, run the VO's own two-view
+code (essential matrix, decomposition, triangulation) on exported tracks.
+The tool prints every intermediate result, and `--sweep-hfov` repeats the
+fit for a range of focal-length guesses:
+
+```text
+native_workbench/build/app-debug/slam-native-two-view --tracks tracks.csv \
+  --a 1200 --b 1230 [--hfov 60] [--sweep-hfov] [--points pair.csv]
+.venv-cuda/bin/python native_workbench/tools/plot_two_view.py pair.csv VIDEO pair.png
+```
+
+### Lens: field of view and distortion
+
+Pose accuracy depends on the lens model, and video downloads rarely carry
+lens metadata. The **Camera lens** window estimates the horizontal FOV and a
+radial distortion coefficient k1 live from the tracks, on a background
+thread. Each frame pair with enough motion gives a fundamental matrix F:
+
+- **k1** (division model, `p_u = c + (p - c) / (1 + k1 r²)` with r normalised
+  by the half-diagonal; negative = barrel). Distortion bends epipolar lines,
+  so for each candidate k1 the tracks are undistorted, F is refitted, and the
+  epipolar residual (in image pixels) is recorded. Lowest mean residual wins
+  (Fitzgibbon). Pure translation still informs k1.
+- **FOV**: at that k1, the focal length at which KᵀFK is closest to a valid
+  essential matrix, one with two equal singular values (Mendonça & Cipolla).
+  Pure translation carries no focal information, so the camera also has to
+  rotate.
+
+Plots: green = estimate, yellow = slider, grey = what the pose uses; ticks
+are individual pairs' FOV minima. **Apply to pose** restarts the pose from
+the current frame with the undistorted tracks; **Restart** replays the clip.
+Evidence survives seeks. Square pixels and a centred principal point are
+assumed. The FOV is defined by the central focal length.
+
+The pose also takes `--hfov` and `--k1` on the command line (the workbench,
+`slam-native-vo-tracks` and `slam-native-two-view`). Headless estimate on
+exported tracks: `slam-native-focal tracks.csv [FIRST] [LAST]`. On
+`disney_04`: 87.9° with k1 = −0.054 (84.5° if k1 is forced to 0); the k1
+curve is shallow, so the lens is close to undistorted. Synthetic checks
+recover FOV within 1° and k1 within 0.006 for 55–110° and k1 from −0.4 to
++0.1.
 
 ## ORB-SLAM3 baseline (separate program)
 
@@ -144,13 +204,18 @@ reusing detections and recomputing flow and tracks with current settings.
 Cache identity includes the canonical source path, source size and modification
 time, engine path/size/modification time/content fingerprint, extraction version,
 input dimensions, keypoint limit, score threshold, and descriptor encoding.
-Changing these rejects reuse; choose a fresh cache path. The source identity is
-not a full video content hash. Tracking settings are deliberately excluded.
+The source identity is not a full video content hash. Tracking settings are
+deliberately excluded.
 
-Default caches live at
-`recordings/native-<video-name>-superpoint-cache/features.sqlite3`.
-Legacy databases are rejected before modification. Selecting an old recent
-session automatically proposes the new default path; existing data is retained.
+The cache is chosen automatically: `pointcache/<video-name>-<hash>.sqlite3` at
+the repository root, where the hash covers the same identity (video path, size
+and modification time, engine path, size and modification time, extractor,
+input dimensions, keypoint limit, threshold, descriptor encoding, schema). Any
+change gives a new cache file instead of a rejected one, and two videos with
+the same name (every TUM sequence is `rgb.mp4`) never share one. `--db PATH`
+overrides it. Caches from before 2026-09-30
+(`recordings/native-<video-name>-superpoint-cache/`) are not reused; delete
+them when no longer needed. Deleting `pointcache/` is always safe.
 
 Descriptors can still be large: 2,048 points at 30 FPS uses about 30 MiB/s for
 float16 descriptors alone. This cache is reusable feature data, not a recording
@@ -179,6 +244,24 @@ raw detections before the 1,000-track cap. Every detection is red; track trails
 and flow arrows are hidden in this view. Tracking continues in the background,
 and the view can be switched while paused.
 
+**Point view → Pose inliers** colours tracks by the camera-pose fit. Green
+tracks have a 3D landmark that reprojects within the pose threshold
+(`reprojection_threshold_px`, 3 px). Red tracks have a landmark but miss the
+threshold. Grey tracks have no landmark yet (hollow: flow-only this frame).
+
+**Flow sigma / Det. sigma** control track position fusion, a per-track Kalman
+filter. Optical flow predicts each track's position, and the matched
+SuperPoint detection corrects it, weighted by their noise levels. Detections
+are integer pixels of the 1024×576 score map, so on 1920-wide video they sit
+on a 1.875 px grid. Flow is smooth but drifts when followed alone. Fusion
+keeps flow's smoothness and SuperPoint's drift-free anchoring. The default
+flow sigma is 0.3 px (det. sigma 1 px). On `disney_04` it lowers the epipolar
+RMS from 1.215 to 1.082 px, raises the VO inlier ratio from 0.84 to 0.90 and
+leaves track continuation unchanged; below ~0.2 continuation drops. Flow
+sigma 0 turns fusion off, and tracks snap exactly onto detections.
+Command line: `--flow-sigma PX --det-sigma PX`; the tracking bench takes
+`flow-sigma` and `det-sigma`.
+
 Dragging the scrubber seeks playback and pauses at the selected frame. Tracking,
 flow history, trails and selection reset there; that frame seeds new tracks.
 Play continues from that position, and Step advances one frame. Restart returns
@@ -202,6 +285,13 @@ trtexec --onnx=native_workbench/models/superpoint-1024x576-k2048.onnx \
   --saveEngine=native_workbench/models/superpoint-1024x576-k2048.engine --skipInference
 ```
 
+Live depth (the **Depth** window; `--depth-model NAME|off`) needs its own
+engines. `tools/build_depth_engines.sh` (VS Code task **Native: build depth
+engines**) downloads the Depth Anything V2-S metric checkpoints and the
+Metric3D v2 ViT-S ONNX, then exports and builds landscape and portrait
+engines into `models/`. Its design is described in ARCHITECTURE.md, "Live
+metric depth".
+
 Development dependencies: CMake, C++20, CUDA, TensorRT, FFmpeg, SQLite, GLFW,
 and OpenGL. CMake fetches pinned Dear ImGui and Eigen 3.4 (header-only). The reviewed Ubuntu installer is
 `tools/install_ubuntu2604_system.sh`. Workspace VS Code tasks and CMake presets
@@ -219,9 +309,7 @@ For a direct launch from the repository root:
 
 ```bash
 native_workbench/build/app-debug/slam-native-workbench \
-  --video /path/to/video.mp4 \
-  --engine native_workbench/models/superpoint-1024x576-k2048.engine \
-  --db recordings/native-experiment-superpoint-cache/features.sqlite3
+  --video /path/to/video.mp4
 ```
 
 Optional GPU integration test (90 frames, then replay with cached detections):

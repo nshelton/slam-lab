@@ -23,6 +23,19 @@ struct FlowTrackerConfig {
   // Propose/accept rounds of the one-to-one assignment. 1 reproduces the old
   // single-pass behaviour (no second choices).
   int assignment_rounds{4};
+  // Position fusion (per-track Kalman filter, isotropic, per axis). Flow is
+  // the motion model and the matched SuperPoint detection the measurement:
+  //   predict  x = x + flow,             P += flow_sigma^2
+  //   update   K = P / (P + det_sigma^2), x += K (detection - x), P *= 1 - K
+  // detection_sigma_px: SuperPoint localisation noise (detections sit on a
+  // 1.875 px grid at 1024-wide inference on 1920 video: ~0.54 px from
+  // quantisation alone). flow_sigma_px: per-frame flow error; smaller trusts
+  // flow more (smoother, slower to correct drift). <= 0 disables the filter:
+  // tracks snap exactly onto detections. Default from a sweep on disney_04
+  // (1920x1080, 60 fps): epipolar RMS 1.215 px snapped -> 1.082 px at 0.3
+  // with unchanged track continuation; below ~0.2 continuation drops.
+  float detection_sigma_px{1.0F};
+  float flow_sigma_px{0.3F};
 
   void validate() const;
 };
@@ -48,6 +61,8 @@ class FlowTracker {
   void associate(FrameFeatures& frame, const std::optional<FlowField>& flow);
 
   void set_association_radius(float radius);
+  void set_flow_sigma(float sigma_px) { config_.flow_sigma_px = sigma_px; }
+  void set_detection_sigma(float sigma_px) { config_.detection_sigma_px = sigma_px; }
   [[nodiscard]] const FlowTrackerConfig& config() const { return config_; }
   [[nodiscard]] std::size_t active_count() const { return active_.size(); }
   [[nodiscard]] std::uint64_t landmark_count() const { return next_id_; }

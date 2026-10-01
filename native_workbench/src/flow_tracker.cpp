@@ -37,7 +37,8 @@ void FlowTrackerConfig::validate() const {
       max_tracks == 0 || max_tracks > 100000 || !std::isfinite(min_descriptor_similarity) ||
       !std::isfinite(descriptor_weight) || descriptor_weight < 0 || max_coast_frames < 0 ||
       max_coast_frames > 1000 || !std::isfinite(forward_backward_threshold) ||
-      assignment_rounds < 1 || assignment_rounds > 64) {
+      assignment_rounds < 1 || assignment_rounds > 64 || !std::isfinite(detection_sigma_px) ||
+      detection_sigma_px <= 0 || !std::isfinite(flow_sigma_px)) {
     throw std::invalid_argument("Invalid flow tracker settings");
   }
 }

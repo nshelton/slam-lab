@@ -1,6 +1,7 @@
 #include "slam_native/track_io.hpp"
 
 #include <Eigen/Geometry>
+#include <algorithm>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -8,14 +9,18 @@
 #include <string>
 
 namespace slam_native {
-void write_tracks_header(std::ostream& out, int width, int height) {
-  out << "# size " << width << ' ' << height << "\nframe_index,timestamp_ns,track_id,x,y\n";
+void write_tracks_header(std::ostream& out, int width, int height, bool colors) {
+  out << "# size " << width << ' ' << height << "\nframe_index,timestamp_ns,track_id,x,y" << (colors ? ",r,g,b" : "")
+      << '\n';
 }
 
 void write_tracks(std::ostream& out, const TrackedFrame& frame) {
   out << std::setprecision(9);
-  for (const auto& o : frame.observations)
-    out << frame.frame_index << ',' << frame.timestamp_ns << ',' << o.track_id << ',' << o.x << ',' << o.y << '\n';
+  for (const auto& o : frame.observations) {
+    out << frame.frame_index << ',' << frame.timestamp_ns << ',' << o.track_id << ',' << o.x << ',' << o.y;
+    if (o.has_color) out << ',' << int(o.color[0]) << ',' << int(o.color[1]) << ',' << int(o.color[2]);
+    out << '\n';
+  }
 }
 
 std::vector<TrackedFrame> read_tracks_csv(const std::filesystem::path& path, int width, int height) {
@@ -47,9 +52,18 @@ std::vector<TrackedFrame> read_tracks_csv(const std::filesystem::path& path, int
     if (frames.empty() || frames.back().frame_index != frame_index) {
       if (!frames.empty() && frame_index < frames.back().frame_index)
         throw std::runtime_error("Tracks rows must be ordered by frame (row " + std::to_string(number) + ")");
-      frames.push_back({frame_index, timestamp, 0, 0, {}});
+      frames.push_back({frame_index, timestamp, 0, 0, {}, 0, {}});
     }
-    frames.back().observations.push_back({track_id, x, y});
+    TrackObservation observation{track_id, x, y};
+    int r{}, g{}, b{};
+    char c5{}, c6{}, c7{};
+    if (row >> c5 >> r >> c6 >> g >> c7 >> b && c5 == ',' && c6 == ',' && c7 == ',') {
+      observation.has_color = true;
+      observation.color = {static_cast<std::uint8_t>(std::clamp(r, 0, 255)),
+                           static_cast<std::uint8_t>(std::clamp(g, 0, 255)),
+                           static_cast<std::uint8_t>(std::clamp(b, 0, 255))};
+    }
+    frames.back().observations.push_back(observation);
   }
   const int w = width > 0 ? width : file_width, h = height > 0 ? height : file_height;
   if (w <= 0 || h <= 0) throw std::runtime_error("Image size unknown: pass width/height or a '# size' line");
@@ -72,5 +86,18 @@ void write_trajectory_csv(std::ostream& out, const std::vector<TrajectorySample>
         << (sample.keyframe ? 1 : 0) << ',' << center[0] << ',' << center[1] << ',' << center[2] << ','
         << q.w() << ',' << q.x() << ',' << q.y() << ',' << q.z() << '\n';
   }
+}
+
+void write_map_csv(std::ostream& out, const VisualOdometry& odometry) {
+  out << "track_id,segment,x,y,z,r,g,b,has_color,keyframe_observations,first_frame,last_frame,retired\n"
+      << std::setprecision(9);
+  const auto write = [&](const std::vector<MapPoint>& points, int retired) {
+    for (const auto& p : points)
+      out << p.track_id << ',' << p.segment << ',' << p.position[0] << ',' << p.position[1] << ',' << p.position[2]
+          << ',' << int(p.color[0]) << ',' << int(p.color[1]) << ',' << int(p.color[2]) << ',' << int(p.has_color)
+          << ',' << p.keyframe_observations << ',' << p.first_frame << ',' << p.last_frame << ',' << retired << '\n';
+  };
+  write(odometry.retired_map(), 1);
+  write(odometry.active_map(), 0);
 }
 }  // namespace slam_native

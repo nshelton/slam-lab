@@ -7,7 +7,7 @@
 
 int main(int argc, char** argv) {
   using namespace slam_native;
-  std::string tracks, output;
+  std::string tracks, output, map_output;
   int width = 0, height = 0;
   bool verbose = false;
   VisualOdometryConfig config;
@@ -20,6 +20,7 @@ int main(int argc, char** argv) {
       };
       if (option == "--tracks") tracks = value();
       else if (option == "--output") output = value();
+      else if (option == "--map") map_output = value();
       else if (option == "--width") width = std::stoi(value());
       else if (option == "--height") height = std::stoi(value());
       else if (option == "--verbose") verbose = true;
@@ -41,13 +42,14 @@ int main(int argc, char** argv) {
         else throw std::invalid_argument("Unknown --set key: " + key);
       }
       else if (option == "--hfov") config.horizontal_fov_degrees = std::stod(value());
+      else if (option == "--k1") config.distortion_k1 = std::stod(value());
       else if (option == "--intrinsics") {
         CameraIntrinsics k;
         k.fx = std::stod(value()); k.fy = std::stod(value()); k.cx = std::stod(value()); k.cy = std::stod(value());
         config.intrinsics = k;
       } else {
-        std::cerr << "usage: slam-native-vo-tracks --tracks TRACKS.csv [--output TRAJECTORY.csv]\n"
-                     "       [--width W --height H] [--hfov DEG | --intrinsics FX FY CX CY] [--verbose]\n"
+        std::cerr << "usage: slam-native-vo-tracks --tracks TRACKS.csv [--output TRAJECTORY.csv] [--map MAP.csv]\n"
+                     "       [--width W --height H] [--hfov DEG | --intrinsics FX FY CX CY] [--k1 K1] [--verbose]\n"
                      "       [--set KEY=VALUE]... (VisualOdometryConfig field, e.g. window_keyframes=10)\n"
                      "Tracks CSV: frame_index,timestamp_ns,track_id,x,y (see include/slam_native/track_io.hpp)\n";
         return option == "--help" ? 0 : 2;
@@ -80,6 +82,12 @@ int main(int argc, char** argv) {
       std::ofstream out(output);
       write_trajectory_csv(out, odometry.trajectory());
       std::cout << "trajectory: " << output << '\n';
+    }
+    if (!map_output.empty()) {
+      std::ofstream out(map_output);
+      write_map_csv(out, odometry);
+      std::cout << "map: " << map_output << " (" << odometry.retired_count() << " retired + "
+                << odometry.active_map().size() << " active points)\n";
     }
   } catch (const std::exception& error) {
     std::cerr << "slam-native-vo-tracks: " << error.what() << '\n';

@@ -51,6 +51,7 @@ FlowTrackerConfig settings(int coast = 3, int rounds = 4) {
   FlowTrackerConfig config;
   config.max_coast_frames = coast;
   config.assignment_rounds = rounds;
+  config.flow_sigma_px = 0;  // snap to detections: exact positions in the rule checks
   return config;
 }
 int index_of(const FrameFeatures& f, std::uint64_t id) {
@@ -72,6 +73,9 @@ void basic_rules() {
           std::abs(second.correction_distances[0] - std::sqrt(2.0F)) < 1e-5F &&
           std::abs(second.landmark_similarities[0] - 1.0F) < 1e-3F,
           "Must retain prediction, correction and descriptor similarity");
+  require(second.track_descriptors.size() == 2 * 256 && second.track_descriptors[0] == 1.0F &&
+          second.track_descriptors[256 + 1] == 1.0F && second.track_descriptors[1] == 0.0F,
+          "Each track must carry the descriptor of the detection it matched this frame");
   require(second.keypoints.size() == 2 && second.new_landmarks == 1 && second.matched_landmarks == 1 &&
           !tracker.find(first.landmark_ids[1]), "With coasting disabled, unmatched tracks die");
   auto empty = frame(2, {});
@@ -354,6 +358,62 @@ SyntheticResult synthetic(int coast) {
 }
 }  // namespace
 
+// Kalman position fusion: one point moving with exact flow, noisy detections.
+// Fusion must follow the motion without lag and average out detection noise.
+double fusion_rms(float flow_sigma, double* bias = nullptr) {
+  std::mt19937 rng(11);
+  std::normal_distribution<float> noise(0, 1);
+  const float vx = 0.25F, vy = 0.1F;
+  const auto flow = uniform(96, vx, vy);
+  auto config = settings(0);
+  config.flow_sigma_px = flow_sigma;
+  config.detection_sigma_px = 1.0F;
+  FlowTracker tracker(config);
+  double squared = 0, sum_x = 0;
+  int count = 0;
+  std::uint64_t id = 0;
+  for (int f = 0; f < 280; ++f) {
+    const float tx = 10 + vx * f, ty = 30 + vy * f;
+    auto current = frame(static_cast<std::uint64_t>(f), {{tx + noise(rng), ty + noise(rng), 1}}, {0});
+    tracker.associate(current, f == 0 ? std::optional<FlowField>{} : std::optional<FlowField>{flow});
+    require(current.keypoints.size() == 1, "fusion test lost its track");
+    if (f == 0) id = current.landmark_ids[0];
+    require(current.landmark_ids[0] == id, "fusion test switched track");
+    if (f >= 40) {  // after the filter settles
+      const double ex = current.keypoints[0].x - tx, ey = current.keypoints[0].y - ty;
+      squared += ex * ex + ey * ey;
+      sum_x += ex;
+      ++count;
+    }
+  }
+  if (bias) *bias = sum_x / count;
+  return std::sqrt(squared / (2 * count));  // per axis
+}
+
+void position_fusion() {
+  // Exact first update: seed P = det^2 = 1; predict P = 1 + q; K = P / (P + 1).
+  {
+    auto config = settings(0);
+    config.flow_sigma_px = 0.5F;
+    FlowTracker tracker(config);
+    auto seed = frame(0, {{10, 10, 1}});
+    tracker.associate(seed, std::nullopt);
+    auto next = frame(1, {{14, 11, 1}}, {0});
+    tracker.associate(next, uniform(96, 2, 1));  // prediction (12, 11)
+    const float gain = 1.25F / 2.25F;
+    require(std::abs(next.keypoints[0].x - (12 + gain * 2)) < 1e-4F && std::abs(next.keypoints[0].y - 11) < 1e-4F,
+            "Kalman update must blend prediction and detection");
+    require(std::abs(next.correction_distances[0] - 2.0F) < 1e-5F, "Correction stays |detection - prediction|");
+  }
+  double bias = 0;
+  const double off = fusion_rms(0.0F), fused = fusion_rms(0.1F, &bias);
+  std::cout << "position fusion: per-axis error " << off << " px snapped -> " << fused << " px fused (bias "
+            << bias << " px)\n";
+  require(off > 0.8 && off < 1.2, "Snapped tracks must carry the detection noise");
+  require(fused < 0.5 * off, "Fusion must reduce position noise");
+  require(std::abs(bias) < 0.15, "Fusion with exact flow must not lag");
+}
+
 int main() {
   try {
     basic_rules();
@@ -361,6 +421,7 @@ int main() {
     descriptor_gate_and_rounds();
     cap_priority();
     matches_reference();
+    position_fusion();
     const auto without = synthetic(0), with = synthetic(3);
     std::cout << "synthetic translation: mean true-track length " << without.mean_length
               << " (no coasting, " << without.switches << " ID switches) -> " << with.mean_length

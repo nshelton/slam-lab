@@ -47,6 +47,7 @@ template <class T> struct Buffer {
 
 struct DeviceTrack {
   float x, y, score;
+  float variance;    // position variance per axis (px^2), see FlowTrackerConfig
   unsigned length;   // SuperPoint observations
   unsigned misses;   // consecutive frames carried by flow only
   unsigned long long id;
@@ -61,7 +62,8 @@ struct TrackRecord {
   float correction;   // matched: |detection - prediction|
   float similarity;   // matched: descriptor cosine
   float fb_error;     // forward-backward residual of the prediction
-  unsigned length, misses, kind, pad;
+  unsigned length, misses, kind;
+  int detection;      // index of the supporting detection this frame; -1 when coasted
   unsigned long long id, first_frame, last_frame;
 };
 struct Counts {
@@ -325,7 +327,8 @@ __global__ void build(const Counts* counts, const int* slot_detection, const int
                       const DeviceTrack* tracks, const float2* predictions, const float* fb_errors,
                       const Keypoint* detections, const int* candidates, const float* similarities,
                       const int* candidate_counts, int capacity, unsigned long long first_id,
-                      unsigned long long frame, DeviceTrack* next, TrackRecord* records) {
+                      unsigned long long frame, float detection_variance, float flow_variance,
+                      DeviceTrack* next, TrackRecord* records) {
   const int slot = blockIdx.x * blockDim.x + threadIdx.x;
   if (slot >= capacity || slot >= counts->total) return;
   const int j = slot_detection[slot], i = slot_track[slot];
@@ -339,10 +342,21 @@ __global__ void build(const Counts* counts, const int* slot_detection, const int
     record.prediction_y = predictions[i].y;
     record.fb_error = fb_errors[i];
   }
+  record.detection = j;
   if (j >= 0) {
     const Keypoint point = detections[j];
-    track.x = point.x;
-    track.y = point.y;
+    if (i >= 0 && flow_variance > 0) {
+      // Kalman update of the flow prediction with the detection.
+      const float predicted = track.variance + flow_variance;
+      const float gain = predicted / (predicted + detection_variance);
+      track.x = record.prediction_x + gain * (point.x - record.prediction_x);
+      track.y = record.prediction_y + gain * (point.y - record.prediction_y);
+      track.variance = (1 - gain) * predicted;
+    } else {
+      track.x = point.x;
+      track.y = point.y;
+      track.variance = detection_variance;
+    }
     track.score = point.score;
     track.misses = 0;
     track.last_frame = frame;
@@ -363,6 +377,7 @@ __global__ void build(const Counts* counts, const int* slot_detection, const int
   } else {
     track.x = record.prediction_x;
     track.y = record.prediction_y;
+    if (flow_variance > 0) track.variance += flow_variance;
     ++track.misses;
     record.kind = kCoasted;
   }
@@ -588,7 +603,9 @@ void FlowTracker::associate(FrameFeatures& frame, const DeviceFlowField* flow,
   build<<<blocks(capacity, 128), 128, 0, stream>>>(d.counts.data, d.slot_detection.data,
       d.slot_track.data, d.tracks[current].data, d.predictions.data, d.fb_errors.data, points,
       d.candidates.data, d.similarities.data, d.candidate_counts.data, capacity, next_id_,
-      frame.frame_index, d.tracks[next].data, d.records.data);
+      frame.frame_index, config_.detection_sigma_px * config_.detection_sigma_px,
+      config_.flow_sigma_px > 0 ? config_.flow_sigma_px * config_.flow_sigma_px : 0.0F,
+      d.tracks[next].data, d.records.data);
   copy_descriptors<<<blocks(static_cast<std::size_t>(capacity) * 32, 128), 128, 0, stream>>>(
       d.counts.data, d.slot_detection.data, d.slot_track.data, d.descriptors[current].data,
       d.detection_descriptors.data, capacity, d.descriptors[next].data);
@@ -607,8 +624,12 @@ void FlowTracker::associate(FrameFeatures& frame, const DeviceFlowField* flow,
 
   const Counts counts = *d.host_counts;
   const float nan = std::numeric_limits<float>::quiet_NaN();
+  const std::vector<float> detection_descriptors = std::move(frame.descriptors);
+  const bool have_descriptors = !detection_descriptors.empty() &&
+      detection_descriptors.size() == frame.keypoints.size() * kDimension;
   frame.keypoints.clear();
   frame.descriptors.clear();
+  frame.track_descriptors.clear();
   frame.landmark_ids.clear();
   frame.landmark_similarities.clear();
   frame.landmark_updates.clear();
@@ -630,6 +651,14 @@ void FlowTracker::associate(FrameFeatures& frame, const DeviceFlowField* flow,
     frame.flow_predictions.push_back(record.kind == kNew ? Keypoint{nan, nan, 0} :
         Keypoint{record.prediction_x, record.prediction_y, 0});
     frame.correction_distances.push_back(record.correction);
+    if (have_descriptors) {
+      if (record.detection >= 0) {
+        const auto row = detection_descriptors.begin() + static_cast<std::ptrdiff_t>(record.detection) * kDimension;
+        frame.track_descriptors.insert(frame.track_descriptors.end(), row, row + kDimension);
+      } else {
+        frame.track_descriptors.resize(frame.track_descriptors.size() + kDimension, 0.0F);
+      }
+    }
     if (record.kind == kNew) {
       ++histogram_[track_length_bin(1)];
     } else if (record.kind == kMatched) {

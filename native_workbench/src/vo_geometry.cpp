@@ -46,6 +46,30 @@ bool fit_essential(const std::vector<Vec2>& a, const std::vector<Vec2>& b, const
   return E.allFinite();
 }
 
+// Eight-point fundamental matrix: like fit_essential but only rank 2 is
+// enforced (the two non-zero singular values stay free).
+bool fit_fundamental(const std::vector<Vec2>& a, const std::vector<Vec2>& b, const std::vector<int>& indices,
+                     Mat3& F) {
+  Eigen::Matrix<double, 9, 9> AtA = Eigen::Matrix<double, 9, 9>::Zero();
+  for (int i : indices) {
+    const Vec3 x1 = homogeneous(a[i]), x2 = homogeneous(b[i]);
+    Eigen::Matrix<double, 9, 1> row;
+    for (int r = 0; r < 3; ++r)
+      for (int c = 0; c < 3; ++c) row(r * 3 + c) = x2(r) * x1(c);
+    AtA += row * row.transpose();
+  }
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 9, 9>> solver(AtA);
+  if (solver.info() != Eigen::Success) return false;
+  const Eigen::Matrix<double, 9, 1> f = solver.eigenvectors().col(0);
+  Mat3 raw;
+  raw << f(0), f(1), f(2), f(3), f(4), f(5), f(6), f(7), f(8);
+  Eigen::JacobiSVD<Mat3> svd(raw, Eigen::ComputeFullU | Eigen::ComputeFullV);
+  Eigen::Vector3d sigma = svd.singularValues();
+  sigma(2) = 0;
+  F = svd.matrixU() * sigma.asDiagonal() * svd.matrixV().transpose();
+  return F.allFinite() && sigma(0) > 0;
+}
+
 double sampson(const Mat3& E, const Vec2& a, const Vec2& b) {
   const Vec3 x1 = homogeneous(a), x2 = homogeneous(b);
   const Vec3 Ex1 = E * x1, Etx2 = E.transpose() * x2;
@@ -160,6 +184,10 @@ TwoViewResult ransac_essential(const std::vector<Vec2>& a, const std::vector<Vec
                                int iterations, std::uint32_t seed) {
   return ransac(a, b, 8, threshold, iterations, seed, fit_essential, sampson);
 }
+TwoViewResult ransac_fundamental(const std::vector<Vec2>& a, const std::vector<Vec2>& b, double threshold,
+                                 int iterations, std::uint32_t seed) {
+  return ransac(a, b, 8, threshold, iterations, seed, fit_fundamental, sampson);
+}
 TwoViewResult ransac_homography(const std::vector<Vec2>& a, const std::vector<Vec2>& b, double threshold,
                                 int iterations, std::uint32_t seed) {
   return ransac(a, b, 4, threshold, iterations, seed, fit_homography,
@@ -201,6 +229,98 @@ double parallax(const SE3& T1, const SE3& T2, const Vec3& X) {
   const Vec3 r1 = X - T1.center(), r2 = X - T2.center();
   const double c = r1.dot(r2) / (r1.norm() * r2.norm());
   return std::acos(std::clamp(c, -1.0, 1.0));
+}
+
+std::vector<SE3> p3p(const std::array<Vec3, 3>& X, const std::array<Vec3, 3>& f) {
+  // Distances along the rays s_i; s2 = u s1, s3 = v s1 (Haralick et al. 1994, Grunert).
+  const double a2 = (X[1] - X[2]).squaredNorm(), b2 = (X[0] - X[2]).squaredNorm(), c2 = (X[0] - X[1]).squaredNorm();
+  if (a2 < 1e-18 || b2 < 1e-18 || c2 < 1e-18) return {};
+  const double ca = f[1].dot(f[2]), cb = f[0].dot(f[2]), cg = f[0].dot(f[1]);
+  const double p = (a2 - c2) / b2, q = (a2 + c2) / b2, ab = a2 / b2, cbb = c2 / b2, bc = (b2 - c2) / b2,
+               ba = (b2 - a2) / b2;
+  Eigen::Matrix<double, 5, 1> A;  // A(k) multiplies v^k
+  A(4) = (p - 1) * (p - 1) - 4 * cbb * ca * ca;
+  A(3) = 4 * (p * (1 - p) * cb - (1 - q) * ca * cg + 2 * cbb * ca * ca * cb);
+  A(2) = 2 * (p * p - 1 + 2 * p * p * cb * cb + 2 * bc * ca * ca - 4 * q * ca * cb * cg + 2 * ba * cg * cg);
+  A(1) = 4 * (-p * (1 + p) * cb + 2 * ab * cg * cg * cb - (1 - q) * ca * cg);
+  A(0) = (1 + p) * (1 + p) - 4 * ab * cg * cg;
+  if (std::abs(A(4)) < 1e-12) return {};
+  Eigen::Matrix4d companion = Eigen::Matrix4d::Zero();
+  for (int k = 0; k < 4; ++k) companion(0, k) = -A(3 - k) / A(4);
+  for (int k = 1; k < 4; ++k) companion(k, k - 1) = 1;
+  const Eigen::EigenSolver<Eigen::Matrix4d> roots(companion, false);
+  std::vector<SE3> poses;
+  for (int r = 0; r < 4; ++r) {
+    if (std::abs(roots.eigenvalues()(r).imag()) > 1e-6 * (1 + std::abs(roots.eigenvalues()(r).real()))) continue;
+    double v = roots.eigenvalues()(r).real();
+    for (int it = 0; it < 3; ++it) {  // Newton polish
+      double value = 0, slope = 0;
+      for (int k = 4; k >= 0; --k) {
+        slope = slope * v + value;
+        value = value * v + A(k);
+      }
+      if (std::abs(slope) > 1e-15) v -= value / slope;
+    }
+    if (v <= 0) continue;
+    const double d1 = 1 + v * v - 2 * v * cb;
+    if (d1 <= 1e-12) continue;
+    const double s1 = std::sqrt(b2 / d1), s3 = v * s1;
+    // s2 from the c-equation (two roots); keep the one satisfying the a-equation.
+    const double disc = cg * cg - 1 + c2 / (s1 * s1);
+    if (disc < -1e-9) continue;
+    double best_error = 1e300, s2 = 0;
+    for (const double sign : {-1.0, 1.0}) {
+      const double u = cg + sign * std::sqrt(std::max(disc, 0.0));
+      if (u <= 0) continue;
+      const double candidate = u * s1;
+      const double error = std::abs(candidate * candidate + s3 * s3 - 2 * candidate * s3 * ca - a2);
+      if (error < best_error) { best_error = error; s2 = candidate; }
+    }
+    if (s2 <= 0 || best_error > 1e-3 * a2) continue;
+    // Absolute orientation: camera points Q_i = s_i f_i = R X_i + t (Kabsch).
+    const std::array<Vec3, 3> Q{s1 * f[0], s2 * f[1], s3 * f[2]};
+    const Vec3 mx = (X[0] + X[1] + X[2]) / 3, mq = (Q[0] + Q[1] + Q[2]) / 3;
+    Mat3 H = Mat3::Zero();
+    for (int i = 0; i < 3; ++i) H += (X[i] - mx) * (Q[i] - mq).transpose();
+    const Eigen::JacobiSVD<Mat3> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Mat3 D = Mat3::Identity();
+    D(2, 2) = (svd.matrixV() * svd.matrixU().transpose()).determinant() < 0 ? -1 : 1;
+    const Mat3 R = svd.matrixV() * D * svd.matrixU().transpose();
+    poses.push_back({R, mq - R * mx});
+  }
+  return poses;
+}
+
+int ransac_pnp(const Intrinsics& K, const std::vector<PoseObservation>& observations, double threshold_px,
+               int iterations, std::uint32_t seed, SE3& pose, std::vector<char>& inliers) {
+  const int count = static_cast<int>(observations.size());
+  inliers.assign(count, 0);
+  if (count < 4) return 0;
+  std::vector<Vec3> bearings(count);
+  for (int i = 0; i < count; ++i) bearings[i] = K.unproject(observations[i].u).normalized();
+  std::mt19937 rng(seed);
+  const double t2 = threshold_px * threshold_px;
+  int best = 0;
+  std::vector<char> current(count);
+  for (int it = 0; it < iterations; ++it) {
+    const auto picked = sample(rng, count, 3);
+    const std::array<Vec3, 3> X{observations[picked[0]].X, observations[picked[1]].X, observations[picked[2]].X};
+    const std::array<Vec3, 3> f{bearings[picked[0]], bearings[picked[1]], bearings[picked[2]]};
+    for (const auto& T : p3p(X, f)) {
+      int n = 0;
+      for (int i = 0; i < count; ++i) {
+        const Vec3 xc = T * observations[i].X;
+        current[i] = xc.z() > 1e-9 && (K.project(xc) - observations[i].u).squaredNorm() <= t2;
+        n += current[i];
+      }
+      if (n > best) {
+        best = n;
+        pose = T;
+        inliers = current;
+      }
+    }
+  }
+  return best;
 }
 
 int optimize_pose(const Intrinsics& K, const std::vector<PoseObservation>& observations, SE3& pose,

@@ -23,13 +23,15 @@ void usage() {
   std::cout
       << "usage: slam-native-workbench [options]\n"
          "\n"
-         "Launch without options to choose a video and database in the GUI.\n"
-         "Supplying video, engine, and database paths starts directly.\n"
+         "Launch without options to choose a video in the GUI; --video starts directly.\n"
+         "SuperPoint detections are cached automatically in pointcache/ at the repository root.\n"
          "\n"
          "options:\n"
          "  --video PATH              source video\n"
-         "  --engine PATH             TensorRT SuperPoint engine\n"
-         "  --db PATH                 feature database\n"
+         "  --engine PATH             TensorRT SuperPoint engine (default: models/superpoint-1024x576-k2048.engine)\n"
+         "  --db PATH                 use this point cache instead of the automatic one\n"
+         "  --depth-model NAME        live depth: 'Depth Anything V2-S (indoor)' (default),\n"
+         "                            'Depth Anything V2-S (outdoor)', 'Metric3D v2 ViT-S' or off\n"
          "  --input-width N           TensorRT input width (default: 1024)\n"
          "  --input-height N          TensorRT input height (default: 576)\n"
          "  --max-keypoints N         fixed engine output count (default: 2048)\n"
@@ -43,6 +45,10 @@ void usage() {
          "                            for coasting (default: off; costs one more NVOF pass)\n"
          "  --hfov DEG                camera horizontal field of view for pose (default: 60)\n"
          "  --intrinsics FX FY CX CY  camera intrinsics in source-video pixels (overrides --hfov)\n"
+         "  --k1 K1                   radial distortion, division model (< 0 barrel; default: 0)\n"
+         "  --rotate DEG              display rotation, clockwise (default: from video metadata)\n"
+         "  --flow-sigma PX           track fusion: per-frame flow error (default: 0.3; 0 = snap to detections)\n"
+         "  --det-sigma PX            track fusion: SuperPoint localisation error (default: 1)\n"
          "  --descriptor-storage TYPE f16 (default) or f32\n";
 }
 
@@ -51,8 +57,6 @@ void usage() {
 int main(int argc, char** argv) {
   slam_native::AppConfig config;
   bool has_video = false;
-  bool has_engine = false;
-  bool has_database = false;
   try {
     for (int index = 1; index < argc; ++index) {
       const std::string_view option = argv[index];
@@ -65,10 +69,11 @@ int main(int argc, char** argv) {
         has_video = true;
       } else if (option == "--engine") {
         config.engine = value();
-        has_engine = true;
+      } else if (option == "--depth-model") {
+        config.depth_model = value();
+        if (config.depth_model == "off") config.depth_model.clear();
       } else if (option == "--db") {
         config.database = value();
-        has_database = true;
       } else if (option == "--input-width") {
         config.superpoint.input_width = integer(value(), "--input-width");
       } else if (option == "--input-height") {
@@ -96,6 +101,16 @@ int main(int argc, char** argv) {
         config.flow_tracker.forward_backward_threshold = std::stof(value());
       } else if (option == "--hfov") {
         config.odometry.horizontal_fov_degrees = std::stod(value());
+      } else if (option == "--rotate") {
+        const int degrees = std::stoi(value());
+        if (degrees % 90 != 0) throw std::invalid_argument("--rotate expects 0, 90, 180 or 270");
+        config.display_rotation = ((degrees / 90) % 4 + 4) % 4 * 90;
+      } else if (option == "--flow-sigma") {
+        config.flow_tracker.flow_sigma_px = std::stof(value());
+      } else if (option == "--det-sigma") {
+        config.flow_tracker.detection_sigma_px = std::stof(value());
+      } else if (option == "--k1") {
+        config.odometry.distortion_k1 = std::stod(value());
       } else if (option == "--intrinsics") {
         slam_native::CameraIntrinsics k;
         k.fx = std::stod(value());
@@ -121,7 +136,7 @@ int main(int argc, char** argv) {
     }
     config.flow_tracker.validate();
     config.odometry.validate();
-    config.start_immediately = has_video && has_database && has_engine;
+    config.start_immediately = has_video;
     return slam_native::run_app(config);
   } catch (const std::exception& error) {
     std::cerr << "slam-native-workbench: " << error.what() << '\n';
