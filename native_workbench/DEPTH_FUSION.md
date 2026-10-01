@@ -26,6 +26,65 @@ So:
 
 ## 1. Depth filter: per-pixel Kalman in log depth
 
+**Built (2026-09-30), host version:** `depth_filter.hpp` / `src/depth_filter.cpp`,
+`tests/test_depth_filter.cpp`, bench `fuse-depth 1` (with `dense 1` the keyframe
+clouds are snapshots of the fused map). Changes from the plan below, all from
+the synthetic test:
+
+- **Two states per pixel, z and the network bias b** (2×2 covariance). The
+  network measures z + b. A scalar filter treats the shared 15–20 % error as
+  independent and becomes overconfident: on the synthetic scene (bias 0.15
+  fixed to the surface, 3 % independent noise) its normalised error RMS is 4.9.
+  The 2-state filter scores 0.97. b is an Ornstein–Uhlenbeck process
+  (`bias_sigma`, `bias_correlation_frames`). Measurement noise is the
+  independent part (`independent_fraction` of the network σ), and the rest is
+  b's prior.
+- **b is warped with the same Jacobian as z** (d log z′ / d log z = 1 − t_z/z′).
+  If b is held fixed in log depth while z scales, the depth ratios between
+  frames triangulate absolute depth from network maps alone, and z's gain stays
+  near 0.5 (flicker drops only 45 %). Real networks don't support that; only a
+  geometric measurement (step 3) should separate z and b.
+- **Resampling noise floor:** the gradient × resampling-distance term uses
+  (|∇ log z| − 0.03)₊. Otherwise the state's own pixel noise reads as slope and
+  feeds back as process noise.
+- **Splat:** to the 4 nearest pixels (closes the cracks of a magnifying warp).
+  Nearest surface wins; among candidates within 2 % of it, the closest
+  sub-pixel position wins (order-independent, so it ports to CUDA).
+- **CPU first:** about 80 ms/frame in the debug build, fine for the bench. The
+  CUDA port comes after the numbers.
+
+**Result: per-frame warping hurts accuracy (2026-09-30).** Flicker drops 5–8×,
+but against TUM ground-truth depth (`dense_vs_gt.py`, median error of shown
+points / share more than 10 % off), fused is worse than raw everywhere:
+
+| Sequence | Raw | Fused |
+|---|---|---|
+| fr1_xyz | 0.034 / 15 % | 0.041 / 20 % |
+| fr1_desk | 0.045 / 22 % | 0.065 / 32 % |
+| fr1_room | 0.057 / 29 % | 0.069 / 36 % |
+| fr2_desk | 0.049 / 26 % | 0.114 / 55 % |
+| fr3_long_office | 0.054 / 28 % | 0.098 / 49 % |
+
+- It isn't the VO: with TUM ground-truth poses (`fuse-gt SEQDIR`), fr1_desk
+  is still 0.076 vs 0.046.
+- It isn't the scale grid (`fuse-grid 0`: same) or the bias model (a
+  near-scalar filter: same).
+- Shorter memory helps (`fuse-drift 0.03`: 0.055 with ground-truth poses).
+
+The cause is resampling the whole state every frame. A pixel snaps to the
+nearest centre after each warp and is back-projected from there next frame, so
+the surface random-walks sideways (up to ~0.7 px per frame). The 4-neighbour,
+nearest-wins splat also grows the foreground. The slow, long sequences (fr2,
+fr3), where under 1 % of pixels are ever re-initialised, suffer most.
+
+**Next:** anchor the state to the keyframe, as LSD-SLAM does (Engel et al.
+2014; semi-dense VO, ICCV 2013). Each new map is read by projecting keyframe
+pixels into the frame and sampling the measurement there (bilinear). The state
+is splatted into a new keyframe only at keyframe creation. Duplicates are
+fused when consistent, nearest otherwise. Add inverse-variance neighbour
+regularisation. CNN-SLAM (Tateno et al. 2017) is the closest prior work, with
+network depth per keyframe refined by small-baseline stereo.
+
 **State** per pixel of the depth-map grid (518×294 for DA-V2-S): log depth
 (VO units) and σ (log). VO units, so the warp uses VO poses directly. The network is
 converted with the keyframe scale grid on the way in. Plus an age/observation count.

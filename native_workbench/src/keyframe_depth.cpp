@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <unordered_map>
 
 namespace slam_native {
 namespace {
@@ -64,24 +65,51 @@ float nearest_reference(const std::vector<DepthReference>& references, float x, 
 }
 }  // namespace
 
-void KeyframeDepthStore::learn(const KeyframeDepthInput& input, const DepthMap& depth) {
-  if (input.references.empty() || !std::isfinite(input.log_scale)) return;
+std::vector<DepthReference> depth_references(const VisualOdometry& odometry, const TrackedFrame& frame,
+                                             const Pose& pose) {
+  const auto points = odometry.active_map();
+  std::unordered_map<std::uint64_t, const MapPoint*> by_landmark;
+  for (const auto& p : points) by_landmark.emplace(p.landmark_id, &p);
+  const auto& R = pose.rotation;
+  const auto& t = pose.translation;
+  std::vector<DepthReference> references;
+  for (const auto& o : frame.observations) {
+    const auto id = odometry.landmark_id(o.track_id);
+    if (!id) continue;
+    const auto it = by_landmark.find(*id);
+    if (it == by_landmark.end()) continue;
+    const MapPoint& p = *it->second;
+    if (p.max_parallax_degrees < 2 || p.keyframe_observations < 3 || !std::isfinite(p.depth_sigma_ratio)) continue;
+    const double z = R[6] * p.position[0] + R[7] * p.position[1] + R[8] * p.position[2] + t[2];
+    if (z > 0) references.push_back({o.x, o.y, z, p.depth_sigma_ratio});
+  }
+  return references;
+}
+
+void add_depth_references(DepthConfidenceModel& model, const DepthMap& depth,
+                          const std::vector<DepthReference>& references, double log_scale, const ScaleGrid* grid) {
+  if (references.empty() || !std::isfinite(log_scale)) return;
   const int w = depth.source_width, h = depth.source_height;
-  for (std::size_t k = 0; k < input.references.size(); ++k) {
-    const auto& reference = input.references[k];
+  for (std::size_t k = 0; k < references.size(); ++k) {
+    const auto& reference = references[k];
     if (!(reference.depth > 0)) continue;
     const float metres = depth.at_source(reference.x, reference.y);
     if (!(metres > 0)) continue;
     // Same alignment as the clouds and the multi-view check: the keyframe's grid.
-    const double L = input.grid ? scale_grid_at(*input.grid, w, h, reference.x, reference.y) : input.log_scale;
+    const double L = grid ? scale_grid_at(*grid, w, h, reference.x, reference.y) : log_scale;
     const double residual = std::log(metres) - L - std::log(reference.depth);
     float u = 0, v = 0;
     depth.to_output(reference.x, reference.y, u, v);
     const DepthCues cues{edge_strength(depth, static_cast<int>(std::lround(u)), static_cast<int>(std::lround(v))),
                          std::log(metres), image_radius(depth, reference.x, reference.y),
-                         nearest_reference(input.references, reference.x, reference.y, w, k)};
-    confidence_.add_reference(cues, residual, reference.geometric_sigma);
+                         nearest_reference(references, reference.x, reference.y, w, k)};
+    model.add_reference(cues, residual, reference.geometric_sigma);
   }
+}
+
+void KeyframeDepthStore::learn(const KeyframeDepthInput& input, const DepthMap& depth) {
+  if (input.references.empty() || !std::isfinite(input.log_scale)) return;
+  add_depth_references(confidence_, depth, input.references, input.log_scale, input.grid);
   confidence_.fit(4);
 }
 

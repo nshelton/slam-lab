@@ -366,6 +366,36 @@ Candidate default: `pose_landmark_uncertainty = cull_stale_observations =
 true, pose_landmark_covariance_scale = 2`, not yet switched on (other
 sessions are running comparisons against the current defaults).
 
+### Defaults switched on, with global bundle adjustment (2026-09-30)
+
+Now default: `pose_landmark_uncertainty`, `cull_stale_observations`,
+`pose_landmark_covariance_scale = 2`, plus `final_bundle_iterations = 20`:
+`VisualOdometry::global_bundle_adjust()` runs before every export
+(`slam-native-vo-tracks`, the bench's export-*, the app's *Export
+trajectory*). It covers all keyframes of each segment and every landmark (active,
+dormant, archived: the archive now keeps all retired landmarks' sightings when
+it is enabled), with the first two keyframes fixed. It refreshes uncertainty and
+the retired map, keeps tracking continuous, and bumps `map_generation()`.
+
+Evaluation (TUM suite, mean over start offsets; the four bundle-adjustment
+variants were first compared on a private build, see "Global BA experiment"):
+
+| variant | fr1_desk | fr1_room | fr1_xyz | fr2_desk | fr3_long | mean ATE | mean RPE | RPE° |
+|---|---|---|---|---|---|---|---|---|
+| old default | 2.42 | 26.2 | 3.94 | 12.34 | 5.19 | 10.02 | 4.55 | 1.60 |
+| local BA + fixed outer keyframes | 2.45 | 30.9 | 4.98 | 6.47 | 4.50 | 9.86 | 5.35 | 1.96 |
+| + 1 global BA iteration per keyframe | 2.49 | 32.7 | 4.77 | 7.02 | 3.91 | 10.17 | 5.03 | 1.74 |
+| + 20 global BA iterations at the end | 2.23 | 26.1 | 3.27 | **6.42** | **3.86** | **8.38** | 4.33 | 1.61 |
+| **Phase 2 + final global BA (default)** | 2.30 | 24.3 | **2.33** | 12.19 | 4.21 | 9.07 | **4.06** | **1.40** |
+
+No sequence is worse than the old default. Open: with Phase 2 on, global BA
+no longer fixes fr2_desk (12.2 vs 6.4 cm), so the mean ATE is above
+"global BA only". Something in Phase 2's fr2_desk tracking leaves a map that
+global BA cannot repair. Online variants (outer keyframes fixed, per-keyframe
+global iteration) help the slow sequences but hurt the fast, distorted fr1 ones,
+probably because they treat drifted old keyframes as exact. Next for those: weight
+older sightings by age, or marginalise them.
+
 ### Uncertainty ellipsoids (2026-09-30)
 
 Trajectory view, map-points row: *Uncertainty* draws every point as its

@@ -85,6 +85,10 @@ if(BUILD_TESTING)
   target_include_directories(slam-native-depth-confidence-test PRIVATE include)
   target_compile_options(slam-native-depth-confidence-test PRIVATE -Wall -Wextra -Wpedantic)
   add_test(NAME native_depth_confidence COMMAND slam-native-depth-confidence-test)
+  add_executable(slam-native-depth-filter-test tests/test_depth_filter.cpp src/depth_filter.cpp src/depth_confidence.cpp)
+  target_link_libraries(slam-native-depth-filter-test PRIVATE slam-native-vo)
+  target_compile_options(slam-native-depth-filter-test PRIVATE -Wall -Wextra -Wpedantic -O2)
+  add_test(NAME native_depth_filter COMMAND slam-native-depth-filter-test)
   add_executable(slam-native-diagnostics-test
     tests/test_descriptor_projection.cpp
     src/descriptor_projection.cpp
@@ -242,6 +246,7 @@ if(SLAM_NATIVE_BUILD_APP)
       src/depth_sampling.cpp
       src/keyframe_depth.cpp
       src/depth_confidence.cpp
+      src/depth_filter.cpp
     )
     target_include_directories(slam-native-tracking-bench PRIVATE include third_party/nvof ${TENSORRT_INCLUDE_DIR})
     target_link_libraries(slam-native-tracking-bench PRIVATE slam-native-store slam-native-vo PkgConfig::FFMPEG

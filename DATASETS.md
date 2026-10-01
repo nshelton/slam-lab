@@ -78,3 +78,50 @@ The recordings `recordings/tum-fr1-xyz-rgb.rrd` and
 `recordings/tum-fr1-desk-rgb.rrd` show each RGB frame with its SuperPoint keypoints,
 confidence values, feature counts, and inference times. No camera trajectory or
 3D map is estimated by this stage.
+
+## KITTI Odometry: large-scale driving with loops
+
+Added 2026-09-30. Source: [KITTI Odometry](https://www.cvlibs.net/datasets/kitti/eval_odometry.php)
+(CC BY-NC-SA 3.0). Car-mounted stereo at 10 Hz over urban and rural routes,
+with GPS/INS ground-truth poses for 00–10, in metres. Only the left colour
+camera (`image_2`, rectified, hfov ≈ 82°) is fetched. Two calibrations
+(after cropping to even size):
+
+| Sequences | Size | `--intrinsics` (fx fy cx cy) |
+| --- | --- | --- |
+| 00, 02 | 1240×376 | `718.856 718.856 607.193 185.216` |
+| 05, 06, 07, 08, 09 | 1226×370 | `707.091 707.091 601.887 183.110` |
+
+The official colour archive is a single 69 GB zip of all 22 sequences.
+`native_workbench/tools/fetch_kitti_odometry.py` reads the zip's central
+directory over HTTP range requests and pulls only the chosen sequences'
+`image_2` and `times.txt`, plus `calib.txt` and `poses/NN.txt`. Interrupted runs resume.
+
+| Sequence | Frames | Size | Length | Loops |
+| --- | ---: | ---: | ---: | --- |
+| `00` | 4,541 | 3.63 GB | 3.7 km | many; the standard loop-closure test |
+| `02` | 4,661 | 3.98 GB | 5.1 km | one late loop, long open stretches |
+| `05` | 2,761 | 2.21 GB | 2.2 km | several |
+| `06` | 1,101 | 0.89 GB | 1.2 km | one loop, traversed twice (same direction) |
+| `07` | 1,101 | 0.87 GB | 0.7 km | one loop closing at the end |
+| `08` | 4,071 | 3.34 GB | 3.2 km | revisits in the *opposite* direction (hard for appearance-based closure) |
+| `09` | 1,591 | 1.30 GB | 1.7 km | one loop at the very end |
+
+```bash
+.venv-cuda/bin/python native_workbench/tools/fetch_kitti_odometry.py data/datasets/kitti \
+  --sequences 07 06 09 05 00 08 02     # --list prints every sequence's size
+.venv-cuda/bin/python native_workbench/tools/kitti_to_video.py data/datasets/kitti 07 06 09 05 00 08 02
+```
+
+`kitti_to_video.py` writes, into `data/datasets/kitti/sequences/NN/`:
+`rgb.mp4` (10 fps, cropped to even size), `frames.csv`, `calibration.json`
+(P2 intrinsics plus the equivalent hfov) and `groundtruth.txt` in TUM format, so
+TUM evaluation tools apply unchanged. GT is the grey left camera (cam0); the
+colour camera is ~6 cm to its side, which is negligible at this scale. Pass the
+printed `--intrinsics` to the workbench: the principal point is off-centre.
+
+Caveats for this pipeline: 10 Hz at driving speed gives large inter-frame
+motion (tens of px on the sides; mostly forward motion, so the epipole sits
+near the image centre), and the frame rate is three times lower than in the
+phone clips. Expect the flow tracker's association radius and coasting
+defaults to need tuning.

@@ -654,10 +654,29 @@ void confidence_flags_unverified_points() {
           "verification and consistency do not flag wrong landmarks");
 }
 
+// Global bundle adjustment (all keyframes, every sighting) on the noisy walk:
+// it must run, keep the trajectory length, and not make it worse.
+void global_bundle_adjustment_improves() {
+  const auto scene = make_scene(true);
+  VisualOdometry odometry;
+  for (const auto& frame : scene.frames) odometry.process(frame);
+  const auto before = evaluate(scene, odometry.trajectory());
+  const auto generation = odometry.map_generation();
+  require(odometry.global_bundle_adjust(), "global bundle adjustment did not run");
+  const auto trajectory = odometry.trajectory();
+  const auto after = evaluate(scene, trajectory);
+  std::cout << "global bundle adjustment: ATE " << 100 * before.ate_fraction << "% -> " << 100 * after.ate_fraction
+            << "% of path, rotation " << before.rotation_deg << " -> " << after.rotation_deg << " deg\n";
+  require(odometry.map_generation() != generation, "map_generation unchanged after global BA");
+  require(after.posed == before.posed, "global BA changed the trajectory length");
+  require(after.ate_fraction <= before.ate_fraction * 1.02, "global BA made the trajectory worse");
+}
+
 int main() {
   try {
     reports_uncertainty();
     confidence_flags_unverified_points();
+    global_bundle_adjustment_improves();
     pose_optimizer_converges();
     p3p_recovers_pose();
     loop_closure_maths();

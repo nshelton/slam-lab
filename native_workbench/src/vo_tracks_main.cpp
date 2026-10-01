@@ -1,6 +1,7 @@
 // Run the visual odometry on tracks from any source (CSV), headless.
 #include "slam_native/track_io.hpp"
 
+#include <chrono>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -43,6 +44,7 @@ int main(int argc, char** argv) {
         else if (key == "pose_landmark_uncertainty") config.pose_landmark_uncertainty = v != 0;
         else if (key == "pose_landmark_pixel_gate") config.pose_landmark_pixel_gate = v != 0;
         else if (key == "cull_stale_observations") config.cull_stale_observations = v != 0;
+        else if (key == "final_bundle_iterations") config.final_bundle_iterations = static_cast<int>(v);
         else if (key == "pose_landmark_covariance_scale") config.pose_landmark_covariance_scale = v;
         else if (key == "observation_sigma_px") config.observation_sigma_px = v;
         else if (key == "min_observation_sigma_px") config.min_observation_sigma_px = v;
@@ -85,6 +87,12 @@ int main(int argc, char** argv) {
     std::cout << frames.size() << " frames, " << posed << " posed, " << keyframes << " keyframes, " << losses
               << " losses, " << odometry.last().segment + 1 << " segments, "
               << (frames.empty() ? 0 : ms / frames.size()) << " ms/frame\n";
+    if (config.final_bundle_iterations > 0) {  // before exporting: every sighting, all keyframes
+      const auto started = std::chrono::steady_clock::now();
+      if (odometry.global_bundle_adjust())
+        std::cout << "global bundle adjustment: "
+                  << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() << " s\n";
+    }
     if (!output.empty()) {
       std::ofstream out(output);
       write_trajectory_csv(out, odometry.trajectory());

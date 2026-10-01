@@ -61,6 +61,21 @@ struct DepthReference {
   double geometric_sigma{};  // MapPoint::depth_sigma_ratio (log depth)
 };
 
+// The frame's observations of well-triangulated landmarks (>= 2 deg parallax,
+// >= 3 keyframes, finite geometry-only sigma), with their depth under `pose`
+// (world -> camera, VO units): KeyframeDepthInput::references for a keyframe.
+std::vector<DepthReference> depth_references(const VisualOdometry& odometry, const TrackedFrame& frame,
+                                             const Pose& pose);
+
+// Adds `references` to `model` as training samples against `depth` (pass the
+// *raw* network map to model the network as a measurement, e.g. for a depth
+// filter): residual = log depth(pixel) - L(pixel) - log reference depth, with
+// L the scale grid (or log_scale), and the store's cues (edge, log depth,
+// radius, nearest reference). Does not refit: call model.fit(). No-op when
+// log_scale is not finite. KeyframeDepthStore uses the same function.
+void add_depth_references(DepthConfidenceModel& model, const DepthMap& depth,
+                          const std::vector<DepthReference>& references, double log_scale, const ScaleGrid* grid);
+
 struct KeyframeDepthConfig {
   int stride{4};            // every stride-th output pixel in each direction
   float edge_ratio{0.10F};  // drop pixels whose 3x3 max/min exceeds 1 + this ("flying pixels")

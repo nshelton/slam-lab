@@ -3,6 +3,7 @@
 #include "slam_native/color_sampler.hpp"
 #include "slam_native/depth_estimator.hpp"
 #include "slam_native/depth_sampling.hpp"
+#include "slam_native/depth_filter.hpp"
 #include "slam_native/keyframe_depth.hpp"
 #include "slam_native/feature_store.hpp"
 #include "slam_native/flow_tracker.hpp"
@@ -22,6 +23,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <sstream>
 #include <optional>
 #include <random>
 #include <string>
@@ -61,6 +63,10 @@ int main(int argc, char** argv) {
     std::string export_clouds;
     DepthSamplingConfig depth_sampling;
     bool dense_clouds = false;
+    bool fuse_depth = false;
+    std::string fuse_gt;    // TUM sequence dir: the filter uses ground-truth poses (metric) instead of the VO's
+    bool fuse_grid = true;  // convert network maps with the keyframe's scale grid (else its single scale)
+    DepthFilterConfig filter_config;
     KeyframeDepthStore keyframe_depth;
     VisualOdometryConfig vo_config;
     for (int a = 5; a + 1 < argc; a += 2) {
@@ -83,6 +89,15 @@ int main(int argc, char** argv) {
       // With dense 1: each cloud's points at the end, DIR/clouds.csv
       // (frame_index,x,y,depth_m,shown,agree,disagree,sigma), x/y native source pixels.
       if (key == "export-clouds") { export_clouds = argv[a + 1]; continue; }
+      // Temporal depth fusion (DEPTH_FUSION.md): a per-pixel filter carried with the VO pose;
+      // with dense 1 the keyframe clouds are snapshots of the fused map instead of the raw network.
+      if (key == "fuse-depth") { fuse_depth = std::stof(argv[a + 1]) != 0; continue; }
+      if (key == "fuse-drift") { filter_config.drift_sigma = std::stod(argv[a + 1]); continue; }
+      if (key == "fuse-bias-frames") { filter_config.bias_correlation_frames = std::stod(argv[a + 1]); continue; }
+      if (key == "fuse-independent") { filter_config.independent_fraction = std::stod(argv[a + 1]); continue; }
+      if (key == "fuse-gt") { fuse_gt = argv[a + 1]; continue; }
+      if (key == "fuse-grid") { fuse_grid = std::stof(argv[a + 1]) != 0; continue; }
+      if (key == "fuse-gate") { filter_config.gate_sigmas = std::stod(argv[a + 1]); continue; }
       // Multi-view check tolerance: 0 fixed 6 % (default), 1 adaptive (between-view model).
       // dense-adaptive 2: adaptive but never looser than the fixed tolerance (tightening only).
       if (key == "dense-adaptive") {
@@ -110,6 +125,7 @@ int main(int argc, char** argv) {
       if (key == "reassoc-radius") { vo_config.reassociation_radius_px = value; continue; }
       if (key == "merge") { vo_config.merge_landmarks = value != 0; continue; }
       if (key == "dormant") { vo_config.dormant_max_frames = static_cast<int>(value); continue; }
+      if (key == "kf-min") { vo_config.keyframe_min_interval = static_cast<int>(value); continue; }
       if (key == "radius") config.association_radius = value;
       else if (key == "min-sim") config.min_descriptor_similarity = value;
       else if (key == "weight") config.descriptor_weight = value;
@@ -128,6 +144,61 @@ int main(int argc, char** argv) {
     std::unique_ptr<DepthEstimator> depth;  // created on the first frame (needs its size)
     const DepthModelSpec* depth_spec = nullptr;
     double depth_ms = 0;
+    DepthFilter depth_filter(filter_config);
+    // The filter's measurement sigma: the *raw* network's error after grid alignment, trained at
+    // keyframes on well-triangulated landmarks (the store's own model sees the fused map instead).
+    DepthConfidenceModel filter_sigma_model;
+    // The latest keyframe's scale (log metres per VO unit, grid): converts network maps to VO units.
+    double filter_log_scale = std::numeric_limits<double>::quiet_NaN();
+    bool filter_has_grid = false;
+    ScaleGrid filter_grid{};
+    int filter_scale_segment = -1;
+    struct FilterTotals {
+      std::size_t frames{}, clears{}, valid{}, initialised{}, updated{}, gated{}, resets{};
+      double flicker_raw{}, flicker_fused{}, sigma{}, sum_sigma{}, ms{};
+      std::size_t flicker_frames{};
+    } filter_totals;
+    // fuse-gt: frame index -> world->camera pose (nearest ground truth within 20 ms).
+    std::map<std::uint64_t, Pose> truth_poses;
+    if (!fuse_gt.empty()) {
+      std::vector<std::pair<double, std::array<double, 7>>> truth;
+      std::ifstream gt(std::filesystem::path(fuse_gt) / "groundtruth.txt");
+      for (std::string line; std::getline(gt, line);) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream in(line);
+        double t = 0;
+        std::array<double, 7> v{};
+        in >> t;
+        for (auto& x : v) in >> x;
+        truth.push_back({t, v});
+      }
+      std::ifstream frames_csv(std::filesystem::path(fuse_gt) / "frames.csv");
+      std::string line;
+      std::getline(frames_csv, line);
+      while (std::getline(frames_csv, line)) {
+        const auto comma = line.find(',');
+        const std::uint64_t f = std::stoull(line.substr(0, comma));
+        const double t = std::stod(line.substr(comma + 1));
+        auto it = std::lower_bound(truth.begin(), truth.end(), t,
+                                   [](const auto& a, double x) { return a.first < x; });
+        if (it != truth.begin() && (it == truth.end() || t - std::prev(it)->first < it->first - t)) --it;
+        if (it == truth.end() || std::abs(it->first - t) > 0.02) continue;
+        const auto& v = it->second;  // tx ty tz qx qy qz qw: camera -> world
+        const double x = v[3], y = v[4], z = v[5], w = v[6];
+        const double Rcw[9] = {1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
+                               2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
+                               2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)};
+        Pose pose;
+        for (int r = 0; r < 3; ++r)
+          for (int c = 0; c < 3; ++c) pose.rotation[r * 3 + c] = Rcw[c * 3 + r];
+        for (int r = 0; r < 3; ++r)
+          pose.translation[r] = -(pose.rotation[r * 3] * v[0] + pose.rotation[r * 3 + 1] * v[1] +
+                                  pose.rotation[r * 3 + 2] * v[2]);
+        truth_poses[f] = pose;
+      }
+      std::printf("fuse-gt: %zu frames with ground-truth poses\n", truth_poses.size());
+    }
+    std::optional<DepthMap> fused_map;  // this frame's fused map in metres (for the keyframe clouds)
     std::size_t depth_samples = 0, depth_valid = 0, depth_edges = 0;
     if (!depth_model.empty()) {
       depth_spec = find_depth_model(depth_model);
@@ -223,6 +294,75 @@ int main(int argc, char** argv) {
         write_tracks(tracks_out, tracked, columns);
       }
       const auto pose = odometry.process(tracked);
+      fused_map.reset();
+      if (fuse_depth && !frame_depth.empty()) {
+        if (pose.segment != filter_scale_segment) {
+          filter_log_scale = std::numeric_limits<double>::quiet_NaN();
+          filter_has_grid = false;
+          filter_scale_segment = pose.segment;
+        }
+        if (pose.keyframe && std::isfinite(pose.keyframe_log_scale)) {
+          filter_log_scale = pose.keyframe_log_scale;
+          filter_has_grid = fuse_grid && pose.keyframe_scale_grid_valid;
+          if (filter_has_grid) filter_grid = pose.keyframe_scale_grid;
+        }
+        // Loop corrections move past poses and units: start over (rare).
+        const auto truth_pose = truth_poses.find(pose.frame_index);
+        if (!fuse_gt.empty()) {  // metric poses: the network map is used as is
+          filter_log_scale = 0;
+          filter_has_grid = false;
+        }
+        if (!fuse_gt.empty() ? truth_pose == truth_poses.end() :
+            (!pose.has_pose || pose.relocalized || pose.loop_closed || !std::isfinite(filter_log_scale))) {
+          if (!depth_filter.empty()) ++filter_totals.clears;
+          depth_filter.clear();
+        } else {
+          const auto f0 = std::chrono::steady_clock::now();
+          const auto K = vo_config.intrinsics ? *vo_config.intrinsics :
+              CameraIntrinsics::from_horizontal_fov(image.width, image.height, vo_config.horizontal_fov_degrees);
+          if (pose.keyframe && std::isfinite(pose.keyframe_log_scale)) {
+            // The references are in VO units: the VO keyframe's own scale, whatever poses the filter uses.
+            add_depth_references(filter_sigma_model, frame_depth, depth_references(odometry, tracked, pose.pose),
+                                 pose.keyframe_log_scale,
+                                 fuse_grid && pose.keyframe_scale_grid_valid ? &pose.keyframe_scale_grid : nullptr);
+            filter_sigma_model.fit(4);
+          }
+          std::vector<float> sigma_map;
+          if (filter_sigma_model.fitted()) {
+            std::vector<Keypoint> landmarks;  // the nearest_landmark cue
+            for (const auto& o : tracked.observations)
+              if (odometry.has_landmark(o.track_id)) landmarks.push_back({o.x, o.y, 0});
+            sigma_map = network_sigma_map(frame_depth, filter_sigma_model, landmarks);
+          }
+          DepthFilterFrame input;
+          input.depth = &frame_depth;
+          input.pose = fuse_gt.empty() ? pose.pose : truth_pose->second;
+          input.segment = fuse_gt.empty() ? pose.segment : 0;
+          input.K = K;
+          input.k1 = vo_config.distortion_k1;
+          input.log_scale = filter_log_scale;
+          input.grid = filter_has_grid ? &filter_grid : nullptr;
+          input.sigma = sigma_map.empty() ? nullptr : &sigma_map;
+          input.rotation_sigma_degrees = pose.rotation_sigma_degrees;
+          input.translation_sigma_ratio = pose.translation_sigma_ratio;
+          const auto stats = depth_filter.process(input);
+          fused_map = depth_filter.to_depth_map(filter_log_scale, input.grid);
+          filter_totals.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - f0).count();
+          ++filter_totals.frames;
+          filter_totals.valid += static_cast<std::size_t>(stats.valid);
+          filter_totals.initialised += static_cast<std::size_t>(stats.initialised);
+          filter_totals.updated += static_cast<std::size_t>(stats.updated);
+          filter_totals.gated += static_cast<std::size_t>(stats.gated);
+          filter_totals.resets += static_cast<std::size_t>(stats.resets);
+          filter_totals.sigma += stats.median_sigma;
+          filter_totals.sum_sigma += stats.median_sum_sigma;
+          if (stats.flicker_pixels > 100) {
+            filter_totals.flicker_raw += stats.flicker_raw;
+            filter_totals.flicker_fused += stats.flicker_fused;
+            ++filter_totals.flicker_frames;
+          }
+        }
+      }
       if (dense_clouds) {
         if (pose.settled_keyframe >= 0)
           keyframe_depth.settle(static_cast<std::uint64_t>(pose.settled_keyframe), pose.settled_log_scale,
@@ -235,10 +375,11 @@ int main(int argc, char** argv) {
               pose.metric_scale > 0 ? std::log(pose.metric_scale) : std::numeric_limits<double>::quiet_NaN();
           input.grid = pose.keyframe_scale_grid_valid ? &pose.keyframe_scale_grid : nullptr;
           input.pose = pose.pose;
+          input.references = depth_references(odometry, tracked, pose.pose);
           const auto K = vo_config.intrinsics ? *vo_config.intrinsics :
               CameraIntrinsics::from_horizontal_fov(image.width, image.height, vo_config.horizontal_fov_degrees);
           const auto samples = odometry.trajectory();
-          keyframe_depth.add(input, frame_depth, {}, K, vo_config.distortion_k1,
+          keyframe_depth.add(input, fused_map ? *fused_map : frame_depth, {}, K, vo_config.distortion_k1,
                              [&](std::uint64_t f) -> std::optional<Pose> {
                                auto it = std::lower_bound(samples.begin(), samples.end(), f,
                                    [](const TrajectorySample& s, std::uint64_t x) { return s.frame_index < x; });
@@ -449,6 +590,18 @@ int main(int argc, char** argv) {
                 vo_losses, vo_relocalized, segment_poses.size(), largest, percentile(vo_inlier_ratio, 0.5),
                 percentile(vo_reprojection, 0.5), vo_ms / (processed + 1), vo_max_ms);
     std::printf("merged duplicate landmarks: %zu\n", merged_total);
+    if (filter_totals.frames > 0) {
+      const double n = static_cast<double>(filter_totals.frames), f = std::max<double>(1, filter_totals.flicker_frames);
+      const double updates = std::max<double>(1, filter_totals.updated + filter_totals.gated);
+      std::printf("depth fusion: %zu frames (%zu clears), %.0f px valid/frame, %.1f%% initialised, %.2f%% gated, "
+                  "%.3f%% reset; flicker raw %.4f fused %.4f (x%.2f); median sigma z %.3f, z+b %.3f; %.2f ms/frame\n",
+                  filter_totals.frames, filter_totals.clears, filter_totals.valid / n,
+                  100.0 * filter_totals.initialised / std::max<double>(1, filter_totals.valid),
+                  100.0 * filter_totals.gated / updates, 100.0 * filter_totals.resets / updates,
+                  filter_totals.flicker_raw / f, filter_totals.flicker_fused / f,
+                  filter_totals.flicker_fused / std::max(1e-12, filter_totals.flicker_raw), filter_totals.sigma / n,
+                  filter_totals.sum_sigma / n, filter_totals.ms / n);
+    }
     if (dense_clouds) {
       std::size_t points = 0, hidden = 0, confirmed = 0, unchecked = 0, settled = 0;
       for (const auto& c : keyframe_depth.clouds()) {
@@ -534,6 +687,9 @@ int main(int argc, char** argv) {
       std::printf("  re-associated %s, projection %s px: inlier %d outlier %d unresolved %d\n",
                   bin >= 10 ? "dormant" : "active ", names[bin % 10], n[0], n[1], n[2]);
     }
+    // Exports: after a global bundle adjustment (VisualOdometryConfig::final_bundle_iterations).
+    if ((!export_map.empty() || !export_trajectory.empty()) && odometry.global_bundle_adjust())
+      std::printf("global bundle adjustment before export\n");
     if (!export_map.empty()) {
       std::ofstream out(export_map);
       write_map_csv(out, odometry);

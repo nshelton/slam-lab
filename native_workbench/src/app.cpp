@@ -1052,26 +1052,8 @@ struct Session {
                         r.metric_scale > 0 ? std::log(r.metric_scale) : std::numeric_limits<double>::quiet_NaN();
       input.grid = r.keyframe_scale_grid_valid ? &r.keyframe_scale_grid : nullptr;
       input.pose = r.pose;
-      {
-        // References for the depth confidence model: this frame's observations
-        // of well-triangulated landmarks (geometry-only: >= 2 deg parallax,
-        // >= 3 keyframes; the circularity rule of DEPTH_INTEGRATION.md 0b).
-        const auto points = odometry->active_map();
-        std::unordered_map<std::uint64_t, const MapPoint*> by_landmark;
-        for (const auto& p : points) by_landmark.emplace(p.landmark_id, &p);
-        const auto& R = r.pose.rotation;
-        const auto& t = r.pose.translation;
-        for (const auto& o : tracked.observations) {
-          const auto id = odometry->landmark_id(o.track_id);
-          if (!id) continue;
-          const auto it = by_landmark.find(*id);
-          if (it == by_landmark.end()) continue;
-          const MapPoint& p = *it->second;
-          if (p.max_parallax_degrees < 2 || p.keyframe_observations < 3 || !std::isfinite(p.depth_sigma_ratio)) continue;
-          const double z = R[6] * p.position[0] + R[7] * p.position[1] + R[8] * p.position[2] + t[2];
-          if (z > 0) input.references.push_back({o.x, o.y, z, p.depth_sigma_ratio});
-        }
-      }
+      // References for the depth confidence model (keyframe_depth.hpp).
+      input.references = depth_references(*odometry, tracked, r.pose);
       const auto K = config.odometry.intrinsics ? *config.odometry.intrinsics :
           CameraIntrinsics::from_horizontal_fov(tracked.width, tracked.height, config.odometry.horizontal_fov_degrees);
       const auto samples = odometry->trajectory();  // current (bundle-adjusted) keyframe poses
@@ -1178,6 +1160,9 @@ struct Session {
       std::strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", std::localtime(&now));
       const auto folder = out_root / config.video.stem() / stamp;
       std::filesystem::create_directories(folder);
+      // Global bundle adjustment first (all keyframes, every sighting): the
+      // live map is updated too (map_generation changes, viewers refetch).
+      odometry->global_bundle_adjust();
       const auto samples = odometry->trajectory();
       std::ofstream trajectory(folder / "trajectory.csv");
       write_trajectory_csv(trajectory, samples);
