@@ -125,3 +125,62 @@ motion (tens of px on the sides; mostly forward motion, so the epipole sits
 near the image centre), and the frame rate is three times lower than in the
 phone clips. Expect the flow tracker's association radius and coasting
 defaults to need tuning.
+
+## ADVIO: handheld iPhone video with loops
+
+Added 2026-10-01. Source: [ADVIO](https://github.com/AaltoVision/ADVIO),
+archives on [Zenodo 1476931](https://zenodo.org/records/1476931) (CC BY-NC 4.0).
+A pedestrian carrying a phone rig through a mall, a metro station, two office
+buildings and outdoor (urban) areas in Helsinki. It is the closest benchmark to the
+lab's own phone clips. All 23 sequences (3.1 GB of zips) are in
+`data/datasets/advio/advio-NN/`; the ADVIO repo (calibration, scripts) is in
+`data/datasets/advio/repo/`.
+
+- **Video:** `iphone/frames.mov`, H.264 1280×720 at 60 fps with a −90° display
+  matrix (shown portrait). The workbench reads it directly; no re-encoding.
+- **Ground truth:** `ground-truth/pose.csv`, 100 Hz camera poses in metres,
+  from the IMU plus manually placed fix points. Accuracy is about a decimetre,
+  not motion-capture level: good for loop drift and ATE, too coarse for fine RPE.
+  ARKit, ARCore and Tango poses are included as phone-VIO baselines.
+- **Calibration:** four batches, published for the *portrait* image.
+
+`native_workbench/tools/advio_prepare.py data/datasets/advio/advio-??` writes,
+per sequence: `rgb.mov` (symlink), `frames.csv`, `groundtruth.txt` (TUM format)
+and `calibration.json`, with intrinsics converted to native landscape pixels
+(portrait = native rotated 90° clockwise, as ADVIO's own rosbag script does:
+native fx, fy, cx, cy = fy_p, fx_p, cy_p, 720 − cx_p). It also stores
+`vo_division_k1` (≈ +0.02, mild pincushion): the first-order equivalent of the
+OpenCV k1 for the VO's division model.
+
+| Sequences | `--intrinsics` (native px) |
+| --- | --- |
+| 01–12 | `1079.3 1077.2 636.39 357.86` |
+| 13–17 | `1084.4 1082.4 643.31 355.32` |
+| 18–19 | `1078.5 1076.9 639.31 359.04` |
+| 20–23 | `1082.1 1081.1 640.79 360.41` |
+
+Closed loops (ground-truth end within 1.5 m of the start), from the GT tracks:
+
+| Seq | Venue | Duration | Path | Start–end |
+| --- | --- | ---: | ---: | ---: |
+| 03 | mall | 2.5 min | 153 m | 0.2 m |
+| 08 | mall | 1.8 min | 99 m | 0.5 m |
+| 09 | mall | 1.6 min | 87 m | 0.1 m |
+| 10 | mall | 2.1 min | 125 m | 0.7 m |
+| 12 | metro | 1.9 min | 136 m | 1.0 m |
+| 13 | office | 2.5 min | 142 m | 0.2 m |
+| 14 | office | 1.9 min | 70 m | 1.4 m |
+| 18 | office | 3.3 min | 132 m | 0.4 m |
+| 19 | office | 2.4 min | 135 m | 0.1 m |
+| 20 | outdoor | 5.0 min | 474 m | 0.7 m |
+| 21 | outdoor | 5.3 min | 477 m | 0.4 m |
+
+The others are open or partial loops (up to 515 m). Several include stairs,
+escalators or elevators, which tests monocular VO under motion that vision
+alone cannot observe (in an elevator the camera sees no motion), and crowds
+(06, 11, 12, 22, 23).
+
+```bash
+./run-workbench.sh --video data/datasets/advio/advio-09/rgb.mov \
+  --intrinsics 1079.3 1077.2 636.39 357.86 --k1 0.0222
+```
