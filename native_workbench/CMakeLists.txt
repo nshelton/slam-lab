@@ -270,6 +270,22 @@ if(SLAM_NATIVE_BUILD_APP)
     target_include_directories(slam-native-voxel-hash-test PRIVATE include)
     target_link_libraries(slam-native-voxel-hash-test PRIVATE CUDA::cudart)
     add_test(NAME native_voxel_hash COMMAND slam-native-voxel-hash-test)
+    add_executable(slam-native-live-depth-test tests/test_live_depth.cpp src/live_depth.cu)
+    target_include_directories(slam-native-live-depth-test PRIVATE include)
+    target_link_libraries(slam-native-live-depth-test PRIVATE slam-native-store slam-native-vo CUDA::cudart)
+    add_test(NAME native_live_depth COMMAND slam-native-live-depth-test)
+    add_executable(slam-native-live-depth-bench
+      tests/bench_live_depth.cpp
+      src/live_depth.cu
+      src/ffmpeg_cuda_decoder.cpp
+      src/tensorrt_superpoint.cu
+      src/optical_flow.cu
+      src/flow_association.cu
+      src/color_sampler.cu
+    )
+    target_include_directories(slam-native-live-depth-bench PRIVATE include third_party/nvof ${TENSORRT_INCLUDE_DIR})
+    target_link_libraries(slam-native-live-depth-bench PRIVATE slam-native-store slam-native-vo PkgConfig::FFMPEG
+      CUDA::cudart CUDA::cuda_driver ${TENSORRT_LIBRARY} ${CMAKE_DL_LIBS})
     add_executable(slam-native-display-test
       tests/test_display.cpp
       src/ffmpeg_cuda_decoder.cpp
