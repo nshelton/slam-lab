@@ -31,13 +31,17 @@ struct PointCloudCamera {
   int rotation{};  // clockwise display rotation of the video (degrees)
 };
 
-enum class PointColor { plain, image };
+// age: by frames since the landmark's first keyframe, on a yellow (new) ->
+// magenta -> blue (age_span frames or older) ramp.
+enum class PointColor { plain, image, age };
 
 struct PointCloudStyle {
   float size{0.01F};   // world-space diameter (segment units)
   float brightness{1};  // multiplies the colour (retired points are dimmer)
   PointColor color{PointColor::image};  // image: falls back to plain without a colour
   int segment{-1};      // only this segment's points; < 0 draws all
+  float current_frame{};  // PointColor::age: the frame ages are counted from
+  float age_span{300};    // PointColor::age: frames over which the ramp runs
 };
 
 // A dense cloud (e.g. a keyframe's back-projected depth): points in its own
@@ -110,7 +114,7 @@ class PointCloudRenderer {
   unsigned int program_{}, mesh_{};
   int u_pivot_{-1}, u_right_{-1}, u_up_{-1}, u_toward_{-1}, u_eye_distance_{-1}, u_perspective_{-1},
       u_focal_{-1}, u_scale_{-1}, u_near_{-1}, u_far_{-1}, u_viewport_{-1}, u_rotation_{-1}, u_size_{-1},
-      u_brightness_{-1}, u_color_mode_{-1}, u_segment_{-1};
+      u_brightness_{-1}, u_color_mode_{-1}, u_segment_{-1}, u_current_frame_{-1}, u_age_span_{-1};
   unsigned int msaa_fbo_{}, msaa_color_{}, msaa_depth_{}, resolve_fbo_{}, texture_{};
   bool cloud_gl_ready_{}, cloud_gl_failed_{};
   unsigned int cloud_program_{};

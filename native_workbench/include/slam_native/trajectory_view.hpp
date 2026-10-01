@@ -18,6 +18,8 @@ class TrajectoryView {
   // samples that can still change are re-read).
   void update(const VisualOdometry& odometry);
   void reset();
+  // The odometry's active map as of the last update().
+  [[nodiscard]] const std::vector<MapPoint>& active_map() const { return active_; }
   // Clockwise display rotation of the video (degrees): the view's "up"
   // follows the upright image rather than the sensor's y axis.
   void set_display_rotation(int degrees) { rotation_ = degrees; }
@@ -39,7 +41,8 @@ class TrajectoryView {
   bool follow_{false};
   bool show_points_{true};
   bool show_retired_{true};
-  int color_mode_{1};            // PointColor: 0 plain, 1 image
+  int color_mode_{1};            // PointColor: 0 plain, 1 image, 2 age
+  float age_span_{300.0F};       // colour by age: frames from new to the ramp's end
   bool dim_retired_{true};
   // World-space diameter of the map points. Segment units: the first
   // keyframe's median scene depth is 1.

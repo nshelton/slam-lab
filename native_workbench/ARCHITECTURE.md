@@ -501,8 +501,9 @@ by *Trajectory* in the Pipeline panel) shows:
 - state, inliers, map size, keyframes and timing;
 - the current segment's path (keyframes as squares), the current camera
   frustum and the active map points;
-- active and retired map points (retired optionally dimmed), coloured plain
-  or by image colour, a grid on the
+- active and retired map points (retired optionally dimmed), coloured plain,
+  by image colour or by age (frames since the landmark's first keyframe:
+  yellow new, blue at the *Age span* slider's value or older), a grid on the
   X–Z plane at the first keyframe's height (monocular VO knows no floor);
   points are solid, unlit (constant-colour) icosahedrons drawn by `PointCloudRenderer`
   (`src/point_cloud_renderer.cpp`): one instanced GL draw per set into a 4×

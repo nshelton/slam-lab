@@ -97,7 +97,8 @@ stays in the map, instead of being deleted as before. A segment's landmarks
 are retired when the segment ends. Each landmark stores the mean image colour
 of its keyframe observations (sampled on the GPU with a 3×3 mean), its track
 ID, and its first and last frames. The trajectory view draws retired points
-dimmer than active ones, optionally in their image colour.
+dimmer than active ones, optionally in their image colour or coloured by age
+(frames since the landmark's first keyframe).
 The bench's `export-map` writes the map as CSV (format in `track_io.hpp`).
 Track exports carry optional `r,g,b` columns.
 
@@ -239,6 +240,9 @@ raw detections before the 1,000-track cap. Every detection is red; track trails
 and flow arrows are hidden in this view. Tracking continues in the background,
 and the view can be switched while paused.
 
+**Point view → Landmark age** colours tracks with a 3D landmark by the
+frames since the landmark's first keyframe (yellow new, blue at the *Age
+span* or older; a landmark taken over by a new track keeps its age).
 **Point view → Pose inliers** colours tracks by the camera-pose fit. Green
 tracks have a 3D landmark that reprojects within the pose threshold
 (`reprojection_threshold_px`, 3 px). Red tracks have a landmark but miss the

@@ -102,7 +102,8 @@ struct Runtime {
   bool close_requested{};
   bool restart_requested{};
   bool show_features{true};
-  int point_display_mode{2}; // 0: tracked points, 1: all raw SuperPoint detections, 2: pose inliers (default)
+  int point_display_mode{2}; // 0: tracked points, 1: all raw SuperPoint detections, 2: pose inliers (default), 3: landmark age
+  float age_span{300.0F};   // landmark age view: frames from new to the ramp's end
   float flow_sigma{};       // tracker position fusion; <= 0 snaps to detections
   int display_rotation{};   // clockwise degrees; display only (processing uses native frames)
   int metadata_rotation{};
@@ -132,6 +133,9 @@ struct Runtime {
   std::vector<bool> supported;  // false: carried by flow this frame (no detection)
   std::vector<Keypoint> detections;
   std::vector<std::uint64_t> landmark_ids;
+  // Per point: the first keyframe of its 3D landmark (kNoLandmark: none).
+  static constexpr std::uint64_t kNoLandmark = std::numeric_limits<std::uint64_t>::max();
+  std::vector<std::uint64_t> landmark_first_frames;
   std::vector<float> corrections;
   bool cache_hit{};
   double flow_ms{};
@@ -156,6 +160,17 @@ ImU32 landmark_color(std::uint64_t id, int alpha = 220) {
   ImVec4 rgb;
   ImGui::ColorConvertHSVtoRGB(hue, 0.8F, 1.0F, rgb.x, rgb.y, rgb.z);
   return ImGui::ColorConvertFloat4ToU32({rgb.x, rgb.y, rgb.z, alpha / 255.0F});
+}
+
+// Same ramp as the trajectory view's map points (PointColor::age): yellow
+// (new) -> magenta -> blue (t = 1: the age span or older).
+ImU32 age_color(float t) {
+  const ImVec4 young(1.0F, 0.90F, 0.30F, 1), mid(0.92F, 0.30F, 0.50F, 1), old(0.25F, 0.50F, 1.0F, 1);
+  t = std::clamp(t, 0.0F, 1.0F);
+  const auto mix = [](const ImVec4& a, const ImVec4& b, float s) {
+    return ImVec4(a.x + s * (b.x - a.x), a.y + s * (b.y - a.y), a.z + s * (b.z - a.z), 1);
+  };
+  return ImGui::ColorConvertFloat4ToU32(t < 0.5F ? mix(young, mid, 2 * t) : mix(mid, old, 2 * t - 1));
 }
 
 std::string format_video_time(double seconds) {
@@ -237,11 +252,19 @@ void draw_sidebar(Runtime& runtime,
                       "Each previous track still accepts only one detection.");
   }
   ImGui::Combo("Point view", &runtime.point_display_mode,
-               "Tracked points\0SuperPoint detections (red)\0Pose inliers (green) / outliers (red)\0");
+               "Tracked points\0SuperPoint detections (red)\0Pose inliers (green) / outliers (red)\0"
+               "Landmark age\0");
   if (ImGui::IsItemHovered())
     ImGui::SetTooltip("Pose inliers: tracks with a 3D landmark whose reprojection under the\n"
                       "current camera pose is within the threshold (green), beyond it (red).\n"
+                      "Landmark age: frames since the 3D landmark's first keyframe (yellow: new,\n"
+                      "magenta: half the age span, blue: the age span or older). A landmark\n"
+                      "taken over by a new track keeps its age.\n"
                       "Grey: tracked, no landmark yet (hollow: flow-only this frame).");
+  if (runtime.point_display_mode == 3) {
+    ImGui::SetNextItemWidth(110);
+    ImGui::SliderFloat("Age span", &runtime.age_span, 10.0F, 10000.0F, "%.0f frames", ImGuiSliderFlags_Logarithmic);
+  }
   ImGui::SetNextItemWidth(110);
   ImGui::DragFloat("Flow sigma", &runtime.flow_sigma, 0.02F, 0.0F, 10.0F,
                    runtime.flow_sigma > 0 ? "%.2f px" : "off", ImGuiSliderFlags_AlwaysClamp);
@@ -409,6 +432,24 @@ void draw_video(Runtime& runtime, bool optical_flow, std::int64_t duration_ns,
         draw->AddCircle(center, 2.5F, IM_COL32(170, 170, 170, 170), 0, 1.0F);
       }
       if (id == runtime.selected_landmark) draw->AddCircle(center, 7.0F, IM_COL32_WHITE, 0, 2.0F);
+    }
+  } else if (runtime.show_features && runtime.point_display_mode == 3) {
+    for (std::size_t index = 0; index < runtime.points.size(); ++index) {
+      const auto& point = runtime.points[index];
+      const ImVec2 center = screen(point.x, point.y);
+      const std::uint64_t first = index < runtime.landmark_first_frames.size() ?
+          runtime.landmark_first_frames[index] : Runtime::kNoLandmark;
+      const bool supported = index >= runtime.supported.size() || runtime.supported[index];
+      if (first != Runtime::kNoLandmark) {
+        const float age = runtime.frame_index > first ? static_cast<float>(runtime.frame_index - first) : 0.0F;
+        draw->AddCircleFilled(center, 3.0F, age_color(age / std::max(runtime.age_span, 1.0F)));
+      } else if (supported) {
+        draw->AddCircleFilled(center, 1.8F, IM_COL32(170, 170, 170, 170));
+      } else {
+        draw->AddCircle(center, 2.5F, IM_COL32(170, 170, 170, 170), 0, 1.0F);
+      }
+      if (runtime.landmark_ids[index] == runtime.selected_landmark)
+        draw->AddCircle(center, 7.0F, IM_COL32_WHITE, 0, 2.0F);
     }
   } else if (runtime.show_features) {
     for (std::size_t index = 0; index < runtime.points.size(); ++index) {
@@ -688,6 +729,15 @@ struct Session {
     runtime.points = features.keypoints;
     runtime.supported = features.superpoint_supported;
     runtime.landmark_ids = features.landmark_ids;
+    {
+      std::unordered_map<std::uint64_t, std::uint64_t> first_frames;  // by track
+      for (const auto& p : trajectory_view.active_map()) first_frames.emplace(p.track_id, p.first_frame);
+      runtime.landmark_first_frames.assign(runtime.landmark_ids.size(), Runtime::kNoLandmark);
+      for (std::size_t i = 0; i < runtime.landmark_ids.size(); ++i)
+        if (auto it = first_frames.find(runtime.landmark_ids[i]);
+            it != first_frames.end() && odometry->has_landmark(runtime.landmark_ids[i]))
+          runtime.landmark_first_frames[i] = it->second;
+    }
     runtime.corrections = features.correction_distances;
     runtime.cache_hit = cached.has_value();
     runtime.new_landmarks = features.new_landmarks;

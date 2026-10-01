@@ -110,9 +110,12 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
     ImGui::Checkbox("Perspective", &perspective_);
   }
   if (show_points_) {
-    const char* colors[] = {"Plain", "Image colour"};
+    const char* colors[] = {"Plain", "Image colour", "Age"};
     ImGui::SetNextItemWidth(110);
     ImGui::Combo("##colour", &color_mode_, colors, IM_ARRAYSIZE(colors));
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Age: frames since the landmark's first keyframe.\n"
+                        "Yellow: new; magenta: half the age span; blue: the age span or older.");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(110);
     ImGui::SliderFloat("Point size", &point_size_, 0.001F, 0.2F, "%.3f", ImGuiSliderFlags_Logarithmic);
@@ -121,6 +124,10 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
     if (show_retired_) {
       ImGui::SameLine();
       ImGui::Checkbox("Dim retired", &dim_retired_);
+    }
+    if (color_mode_ == 2) {
+      ImGui::SetNextItemWidth(110);
+      ImGui::SliderFloat("Age span", &age_span_, 10.0F, 10000.0F, "%.0f frames", ImGuiSliderFlags_Logarithmic);
     }
   }
 
@@ -287,8 +294,9 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
     camera.rotation = rotation_;
     const int only = all_segments_ ? -1 : segment;
     const auto color = static_cast<PointColor>(color_mode_);
-    const PointCloudStyle retired{point_size_, dim_retired_ ? 0.6F : 1.0F, color, only};
-    const PointCloudStyle active{point_size_, 1.0F, color, only};
+    const auto now = static_cast<float>(current->frame_index);
+    const PointCloudStyle retired{point_size_, dim_retired_ ? 0.6F : 1.0F, color, only, now, age_span_};
+    const PointCloudStyle active{point_size_, 1.0F, color, only, now, age_span_};
     points_renderer_.render(draw, {origin.x, origin.y}, {origin.x + size.x, origin.y + size.y},
                             io.DisplayFramebufferScale.x, camera, show_retired_ ? &retired_ : nullptr, retired,
                             &active_, active);

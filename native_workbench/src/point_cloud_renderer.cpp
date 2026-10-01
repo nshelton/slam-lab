@@ -15,27 +15,30 @@
 namespace slam_native {
 namespace {
 
-// Per-point instance data (20 bytes). Positions stay in the camera-frame
+// Per-point instance data (24 bytes). Positions stay in the camera-frame
 // world: the shader applies the display rotation, so rotating the video never
 // re-uploads the map.
 struct Instance {
   float position[3];
   std::uint8_t color[4];  // rgb, a = 255 when the point has an image colour
   std::int32_t segment;
+  float first_frame;  // MapPoint::first_frame
 };
-static_assert(sizeof(Instance) == 20);
+static_assert(sizeof(Instance) == 24);
 
 constexpr const char* kVertexShader = R"(#version 330 core
 layout(location = 0) in vec3 a_vertex;    // unit icosahedron corner
 layout(location = 2) in vec3 i_position;  // camera-frame world position
 layout(location = 3) in vec4 i_color;     // rgb, a > 0.5: has an image colour
 layout(location = 4) in int i_segment;
+layout(location = 5) in float i_first_frame;
 
 uniform vec3 u_pivot, u_right, u_up, u_toward;
 uniform float u_eye_distance, u_focal, u_scale, u_near, u_far;
-uniform int u_perspective, u_rotation, u_color_mode, u_segment;  // colour: 0 plain, 1 image
+uniform int u_perspective, u_rotation, u_color_mode, u_segment;  // colour: 0 plain, 1 image, 2 age
 uniform vec2 u_viewport;  // logical pixels
 uniform float u_size, u_brightness;  // u_size: world-space diameter
+uniform float u_current_frame, u_age_span;  // colour by age: frames
 
 flat out vec3 v_color;
 
@@ -74,6 +77,11 @@ void main() {
   }
   vec3 base = vec3(235.0 / 255.0);
   if (u_color_mode == 1 && i_color.a > 0.5) base = i_color.rgb;
+  if (u_color_mode == 2) {  // yellow (new) -> magenta -> blue (u_age_span frames or older)
+    const vec3 young = vec3(1.0, 0.90, 0.30), mid = vec3(0.92, 0.30, 0.50), old = vec3(0.25, 0.50, 1.0);
+    float t = clamp((u_current_frame - i_first_frame) / max(u_age_span, 1.0), 0.0, 1.0);
+    base = t < 0.5 ? mix(young, mid, 2.0 * t) : mix(mid, old, 2.0 * t - 1.0);
+  }
   v_color = base * u_brightness;  // unlit: constant colour
 }
 )";
@@ -267,6 +275,8 @@ bool PointCloudRenderer::ensure_gl() {
   u_brightness_ = uniform("u_brightness");
   u_color_mode_ = uniform("u_color_mode");
   u_segment_ = uniform("u_segment");
+  u_current_frame_ = uniform("u_current_frame");
+  u_age_span_ = uniform("u_age_span");
 
   GLint previous_vao = 0, previous_buffer = 0;
   glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &previous_vao);
@@ -296,6 +306,10 @@ bool PointCloudRenderer::ensure_gl() {
     glEnableVertexAttribArray(4);
     glVertexAttribIPointer(4, 1, GL_INT, sizeof(Instance), reinterpret_cast<const void*>(offsetof(Instance, segment)));
     glVertexAttribDivisor(4, 1);
+    glEnableVertexAttribArray(5);
+    glVertexAttribPointer(5, 1, GL_FLOAT, GL_FALSE, sizeof(Instance),
+                          reinterpret_cast<const void*>(offsetof(Instance, first_frame)));
+    glVertexAttribDivisor(5, 1);
   }
   glBindVertexArray(static_cast<GLuint>(previous_vao));
   glBindBuffer(GL_ARRAY_BUFFER, static_cast<GLuint>(previous_buffer));
@@ -464,7 +478,7 @@ void PointCloudRenderer::upload(InstanceSet& set, const std::vector<MapPoint>& p
     const auto& p = points[i];
     staging.push_back({{p.position[0], p.position[1], p.position[2]},
                        {p.color[0], p.color[1], p.color[2], static_cast<std::uint8_t>(p.has_color ? 255 : 0)},
-                       p.segment});
+                       p.segment, static_cast<float>(p.first_frame)});
   }
   glBufferSubData(GL_ARRAY_BUFFER, static_cast<GLintptr>(set.uploaded * sizeof(Instance)),
                   static_cast<GLsizeiptr>(staging.size() * sizeof(Instance)), staging.data());
@@ -477,6 +491,8 @@ void PointCloudRenderer::draw_set(const InstanceSet& set, const PointCloudStyle&
   glUniform1f(u_brightness_, style.brightness);
   glUniform1i(u_color_mode_, static_cast<int>(style.color));
   glUniform1i(u_segment_, style.segment);
+  glUniform1f(u_current_frame_, style.current_frame);
+  glUniform1f(u_age_span_, style.age_span);
   glBindVertexArray(set.vao);
   glDrawArraysInstanced(GL_TRIANGLES, 0, kMeshVertices, static_cast<GLsizei>(set.uploaded));
 }
