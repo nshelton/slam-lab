@@ -152,6 +152,8 @@ if(SLAM_NATIVE_BUILD_APP)
     src/cuda_frame_presenter.cu
     src/trajectory_view.cpp
     src/point_cloud_renderer.cpp
+    src/voxel_hash.cu
+    src/voxel_renderer.cpp
     src/fov_view.cpp
     src/color_sampler.cu
     ${imgui_SOURCE_DIR}/imgui.cpp
@@ -264,6 +266,10 @@ if(SLAM_NATIVE_BUILD_APP)
     add_executable(slam-native-gpu-tracker-test tests/test_flow_tracker.cpp src/flow_association.cu)
     target_link_libraries(slam-native-gpu-tracker-test PRIVATE slam-native-store CUDA::cudart)
     add_test(NAME native_gpu_flow_tracker COMMAND slam-native-gpu-tracker-test)
+    add_executable(slam-native-voxel-hash-test tests/test_voxel_hash.cpp src/voxel_hash.cu)
+    target_include_directories(slam-native-voxel-hash-test PRIVATE include)
+    target_link_libraries(slam-native-voxel-hash-test PRIVATE CUDA::cudart)
+    add_test(NAME native_voxel_hash COMMAND slam-native-voxel-hash-test)
     add_executable(slam-native-display-test
       tests/test_display.cpp
       src/ffmpeg_cuda_decoder.cpp

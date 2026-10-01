@@ -497,8 +497,8 @@ void PointCloudRenderer::render(ImDrawList* draw, std::array<float, 2> min, std:
                                 const std::vector<MapPoint>* outside, const PointCloudStyle& outside_style,
                                 const std::vector<MapPoint>* local, const PointCloudStyle& local_style,
                                 const std::vector<DenseCloudDraw>* clouds, float cloud_point_pixels,
-                                std::uint64_t cloud_generation) {
-  if (!outside && !local && !(clouds && !clouds->empty())) return;
+                                std::uint64_t cloud_generation, const ExtraPass* extra) {
+  if (!outside && !local && !(clouds && !clouds->empty()) && !(extra && *extra)) return;
   const float logical_width = max[0] - min[0], logical_height = max[1] - min[1];
   const int width = std::max(1, static_cast<int>(std::lround(logical_width * pixel_scale)));
   const int height = std::max(1, static_cast<int>(std::lround(logical_height * pixel_scale)));
@@ -550,6 +550,7 @@ void PointCloudRenderer::render(ImDrawList* draw, std::array<float, 2> min, std:
   if (local) draw_set(local_, local_style);
   if (clouds && !clouds->empty())
     draw_clouds(*clouds, camera, logical_width, logical_height, cloud_point_pixels * pixel_scale, cloud_generation);
+  if (extra && *extra) (*extra)(camera, logical_width, logical_height);
 
   glBindFramebuffer(GL_READ_FRAMEBUFFER, msaa_fbo_);
   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, resolve_fbo_);

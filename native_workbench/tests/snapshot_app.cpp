@@ -1,14 +1,18 @@
 // Headless screenshot of the real workbench UI after processing some frames
 // (visual check of the panels). Not part of CTest.
-// usage: slam-native-snapshot VIDEO ENGINE START_SECONDS FRAMES OUT.ppm
+// usage: slam-native-snapshot VIDEO ENGINE START_SECONDS FRAMES OUT.ppm [VOXEL_SIZE [CARVE [OBSERVERS [points]]]]
+// VOXEL_SIZE shows the voxel map instead of the map points ("points": both),
+// with this carve weight (1) and rays from all observers (1) or only each
+// landmark's first and last frames (0), and prints the voxel counts.
 #include "../src/app.cpp"
 #include <fstream>
 #include <iostream>
 
 int main(int argc, char** argv) {
   using namespace slam_native;
-  if (argc != 6) {
-    std::cerr << "usage: slam-native-snapshot VIDEO ENGINE START_SECONDS FRAMES OUT.ppm\n";
+  if (argc < 6 || argc > 10) {
+    std::cerr << "usage: slam-native-snapshot VIDEO ENGINE START_SECONDS FRAMES OUT.ppm "
+                 "[VOXEL_SIZE [CARVE [OBSERVERS [points]]]]\n";
     return 2;
   }
   const auto root = std::filesystem::temp_directory_path() /
@@ -34,9 +38,14 @@ int main(int argc, char** argv) {
     session.runtime.playing = true;
     const int frames = std::stoi(argv[4]);
     for (int i = 0; i < frames; ++i) session.advance();
+    if (argc > 6)
+      session.trajectory_view.show_voxels(std::stof(argv[6]), argc > 9, argc > 7 ? std::stof(argv[7]) : 1.0F,
+                                          argc > 8 ? std::stoi(argv[8]) != 0 : true);
     DatabaseSummary database_summary;
     int width = 0, height = 0;
-    for (int pass = 0; pass < 3; ++pass) {  // first passes settle window sizes
+    // First passes settle window sizes; the voxel view refines its shading with every pass.
+    const int passes = argc > 6 ? 300 : 3;
+    for (int pass = 0; pass < passes; ++pass) {
       ImGui_ImplOpenGL3_NewFrame();
       ImGui_ImplGlfw_NewFrame();
       ImGui::NewFrame();
@@ -62,6 +71,13 @@ int main(int argc, char** argv) {
     for (int y = height - 1; y >= 0; --y)
       out.write(reinterpret_cast<const char*>(pixels.data() + static_cast<std::size_t>(y) * width * 3), width * 3);
     session.store->flush();
+    if (argc > 6) {
+      const auto& voxels = session.trajectory_view.voxels();
+      const auto stats = voxels.stats();
+      std::cout << "voxels: " << stats.voxels << " allocated, " << stats.solid << " solid, " << stats.samples
+                << " samples (" << stats.rays << " rays), rebuild " << voxels.build_ms() << " ms, shade pass "
+                << stats.shade_ms << " ms" << (voxels.error().empty() ? "" : ", error: " + voxels.error()) << '\n';
+    }
     std::cout << "odometry: " << to_string(session.odometry->last().state) << ", "
               << session.odometry->trajectory_size() << " posed frames\n";
   } catch (const std::exception& error) {

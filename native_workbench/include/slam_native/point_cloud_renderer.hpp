@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <unordered_map>
 #include <vector>
@@ -68,6 +69,9 @@ struct DenseCloudDraw {
 
 class PointCloudRenderer {
  public:
+  // Arguments: the camera and the target's size in logical pixels.
+  using ExtraPass = std::function<void(const PointCloudCamera&, float, float)>;
+
   PointCloudRenderer() = default;
   ~PointCloudRenderer();
   PointCloudRenderer(const PointCloudRenderer&) = delete;
@@ -81,11 +85,15 @@ class PointCloudRenderer {
   // `clouds` (optional): dense clouds, depth-tested with the map points;
   // cloud_point_pixels is their sprite size. A changed cloud_generation drops
   // all uploaded clouds first (the owner removed some).
+  // `extra` (optional): called last with the target bound and depth testing
+  // on, to draw other geometry among the points (the voxel map). It may change
+  // the bound program, vertex array and array buffer; they are restored.
   void render(ImDrawList* draw, std::array<float, 2> min, std::array<float, 2> max, float pixel_scale,
               const PointCloudCamera& camera, const std::vector<MapPoint>* outside,
               const PointCloudStyle& outside_style, const std::vector<MapPoint>* local,
               const PointCloudStyle& local_style, const std::vector<DenseCloudDraw>* clouds = nullptr,
-              float cloud_point_pixels = 2.0F, std::uint64_t cloud_generation = 0);
+              float cloud_point_pixels = 2.0F, std::uint64_t cloud_generation = 0,
+              const ExtraPass* extra = nullptr);
 
  private:
   struct InstanceSet {

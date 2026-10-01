@@ -617,6 +617,102 @@ headlessly for inspection.
   `FrameFeatures::track_descriptors`) drive re-association and
   relocalization; loop closure would use them too.
 
+## Voxel map (display only) — 2026-10-01
+
+```text
+TrajectoryView (map points + trajectory poses) ─► VoxelSample list (point, observing camera centre, RGB, segment)
+      ─► VoxelHash (CUDA, src/voxel_hash.cu): allocate band → integrate band + carve free space
+      ─► compact into a GL instance buffer (CUDA–GL interop) ─► VoxelRenderer: instanced, face-shaded cubes
+```
+
+A second way to draw the map in the **Camera trajectory** window (*Voxels*).
+It reads `MapPoint`s and trajectory poses and writes nothing back: the
+tracker and the VO do not know it exists.
+
+- **Samples.** One per camera that saw a landmark: every keyframe in
+  `VisualOdometry::landmark_observations()` plus the landmark's `last_frame`
+  (*All observers*; off: only `first_frame` and `last_frame`). The camera
+  centres are looked up by frame index in the trajectory (same segment), so
+  the rays follow bundle adjustment; a landmark with no camera found becomes
+  a point without a ray. On `disney_04` at frame 900 that is 22,280 rays for
+  3,407 landmarks, against 6,814 with two per landmark.
+- **Modified TSDF.** A depth-image TSDF gathers: every voxel in the frustum
+  looks up its depth. With sparse points that is all empty, so this one
+  scatters: each ray updates the voxels within ± `truncation_voxels` (2) of
+  its point with the signed distance of the voxel centre along the ray, then
+  walks back to the camera adding "free" (+truncation) to the voxels it
+  crosses, weighted by `carve_weight`. The walk only looks voxels up, it never
+  allocates, so the table holds the bands and not the empty space. A voxel is
+  drawn when its mean distance is within *Band* voxels of zero and its weight
+  is at least *Min weight*; a landmark that other rays pass through drifts
+  toward +2 and disappears.
+- **Hash.** Open addressing with linear probing over 64-bit keys (10 bits of
+  segment, 3 × 18 bits of voxel index, so ± 131,072 voxels per axis), claimed
+  with `atomicCAS`; sums are `atomicAdd`. Allocation and integration are
+  separate kernels: allocation only inserts keys, so when the table fills it
+  is grown (rehash, load ≤ 0.5) and allocation simply runs again before
+  anything is summed. Segments never share voxels. The table is capped at
+  2^24 slots (512 MB); beyond that the view reports an error instead of
+  drawing.
+- **Rebuilt, not updated.** Bundle adjustment moves landmarks and they can be
+  deleted, so the view clears the table and integrates all samples whenever
+  the map changed (every processed frame while the voxels are shown) or the
+  voxel size or carve weight changed. Nothing depends on any map point
+  being final. `VoxelHash::integrate()` itself is incremental (it adds to what
+  is there), which is the path for final data such as semi-dense depth.
+- **Cost** (Debug build, RTX 2080 Ti, `disney_04` at frame 900: 3,407
+  landmarks, 6,814 rays): 10,463 / 17,768 / 22,078 voxels at voxel size
+  0.15 / 0.05 / 0.02, 2.7 / 3.1 / 4.5 ms per rebuild including the sample
+  upload and compaction, before ambient occlusion (with it: 6.9 ms at 0.15
+  and 9.5 ms at 0.05 for the first build, which traces 8 rays per face). Nothing runs while the voxels are hidden.
+- **Drawing.** `PointCloudRenderer::render()` takes an optional extra pass;
+  the cubes are drawn in it, into the same multisampled, depth-tested target
+  as the map points, with the same camera. One fixed eye-space light shades
+  the three visible faces differently. Colour: plain, image colour, weight or
+  signed distance. Voxel size is in segment units, like the point size.
+- **Ambient occlusion: a progressive Monte Carlo tracer**
+  (`VoxelHash::shade()`). Each voxel keeps a running average of the ambient
+  visibility of its six faces (16-bit, plus a sample count; one colour per
+  voxel, not per face). A pass sends one ray per face of every drawn voxel:
+  from a random point of the face, cosine-distributed about its normal,
+  walked through the hash with the carving traversal for up to 48 voxels. A
+  voxel on the way blocks `weight / opaque_weight` of the ray (2 = one
+  landmark seen from two cameras is opaque), and only voxels that are drawn
+  (min weight, band) block at all. The sample points come from a 4D
+  low-discrepancy sequence (Roberts' R4) shifted per voxel face. The view
+  runs one pass per drawn frame until a face has 2,048 samples, then stops.
+  - *Rebuilds.* `reset()` swaps the table aside instead of dropping it; the
+    next `shade()` copies each surviving voxel's averages over by key, cut to
+    64 samples so they follow a changing map. A voxel that is new gets 8 rays
+    per face at once. A changed voxel size starts over; a changed min weight
+    or band keeps the averages but cuts them to 4 samples.
+  - *Display.* The face colour is multiplied by visibility^(1/2.2) (the
+    visibility is light, the colours are display values), scaled by
+    `VoxelStyle::ambient` (*Ambient* slider; 0 turns the tracer off). *Reach*
+    is the ray length in voxels.
+  - *Cost* (RTX 2080 Ti; synthetic room, rays from cameras inside it): 27k
+    voxels: 1.0 ms per pass, 7.6 ms for the first; 152k voxels: 6 ms; 630k
+    voxels: 41 ms per pass and 45 ms to rebuild, so semi-dense input needs a
+    per-frame ray budget (a share of the voxels per pass), empty-space
+    skipping and incremental integration rather than rebuilds.
+- **What carving removes** (`disney_04`, frame 900, voxel 0.05, band 0.75,
+  min weight 1; drawn voxels with carve weight 0 → 1): 5,801 → 5,111 (−12%)
+  with all observers, 5,878 → 5,407 (−8%) with two rays per landmark. Whether
+  the removed voxels are outliers has not been checked.
+- **Not done:** semi-dense depth as a second sample source; history for a
+  voxel that disappears for a rebuild or two (a landmark jittering across a
+  voxel boundary restarts its shading each time).
+
+`slam-native-voxel-hash-test` (CTest `native_voxel_hash`) checks occupancy and
+colour means, the band's signed distances, carving and its step cap, that
+free space allocates nothing, band voxels against a slab test on random
+oblique rays, growth across several `integrate()` calls, rejected input, and
+the ambient visibility against known values (0.8 for the floor next to a
+box: the form factor of two unit squares at a right angle is 0.2), across a
+rebuild, for half-opaque voxels and after a restart.
+`slam-native-snapshot ... OUT.ppm VOXEL_SIZE [CARVE [OBSERVERS [points]]]`
+renders the voxel view headlessly and prints the voxel counts.
+
 ## Cache boundary
 
 Schema 3 stores frame identity, source dimensions, float32 coordinates/scores,

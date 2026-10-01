@@ -44,6 +44,55 @@ void TrajectoryView::reset() {
   samples_.clear();
   local_.clear();
   outside_.clear();
+  voxels_stale_ = true;
+}
+
+// One sample per camera that saw the landmark: every keyframe that observed
+// it and its last frame, or only its first and last frames. The poses are
+// read from the trajectory, so the rays follow bundle adjustment.
+std::vector<VoxelSample> TrajectoryView::voxel_samples(const VisualOdometry& odometry) const {
+  std::vector<VoxelSample> out;
+  // Sorted by landmark id, then frame.
+  const auto observations = voxel_all_observers_ ? odometry.landmark_observations() : std::vector<LandmarkObservation>{};
+  out.reserve(std::max(observations.size(), 2 * (outside_.size() + local_.size())));
+  std::vector<std::uint64_t> frames;
+  const auto center = [&](std::uint64_t frame, int segment) -> std::optional<std::array<double, 3>> {
+    const auto it = std::lower_bound(samples_.begin(), samples_.end(), frame,
+                                     [](const TrajectorySample& s, std::uint64_t f) { return s.frame_index < f; });
+    if (it == samples_.end() || it->frame_index != frame || it->segment != segment) return std::nullopt;
+    return it->pose.center();
+  };
+  for (const auto* points : {&outside_, &local_}) {
+    for (const auto& p : *points) {
+      VoxelSample sample{};
+      std::copy(p.position.begin(), p.position.end(), sample.point);
+      std::copy(p.color.begin(), p.color.end(), sample.color);
+      sample.flags = p.has_color ? VoxelSample::has_color : 0;
+      sample.segment = p.segment;
+      sample.weight = 1;
+      frames.clear();
+      const auto range = std::equal_range(observations.begin(), observations.end(),
+                                          LandmarkObservation{p.landmark_id, 0},
+                                          [](const LandmarkObservation& a, const LandmarkObservation& b) {
+                                            return a.landmark_id < b.landmark_id;
+                                          });
+      for (auto it = range.first; it != range.second; ++it) frames.push_back(it->frame_index);
+      if (frames.empty()) frames.push_back(p.first_frame);
+      if (frames.back() != p.last_frame) frames.push_back(p.last_frame);  // usually not a keyframe
+      bool any = false;
+      for (const std::uint64_t frame : frames) {
+        const auto c = center(frame, p.segment);
+        if (!c) continue;
+        VoxelSample ray = sample;
+        ray.flags |= VoxelSample::has_ray;
+        for (int a = 0; a < 3; ++a) ray.origin[a] = static_cast<float>((*c)[a]);
+        out.push_back(ray);
+        any = true;
+      }
+      if (!any) out.push_back(sample);  // no camera found: the point alone
+    }
+  }
+  return out;
 }
 
 void TrajectoryView::update(const VisualOdometry& odometry) {
@@ -55,6 +104,7 @@ void TrajectoryView::update(const VisualOdometry& odometry) {
   local_.clear();
   outside_.clear();
   for (auto& point : odometry.map()) (point.local ? local_ : outside_).push_back(point);
+  voxels_stale_ = true;
 }
 
 void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_width, int frame_height) {
@@ -125,6 +175,56 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
       ImGui::SetNextItemWidth(110);
       ImGui::SliderFloat("Age span", &age_span_, 10.0F, 10000.0F, "%.0f frames", ImGuiSliderFlags_Logarithmic);
     }
+  }
+  ImGui::Checkbox("Voxels", &show_voxels_);
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("Landmarks as a voxel map (display only): each landmark fills the voxels around it\n"
+                      "along the rays from the cameras that saw it, and those rays mark the voxels\n"
+                      "they cross on the way as free.");
+  if (show_voxels_) {
+    ImGui::SameLine();
+    const char* colors[] = {"Plain", "Image colour", "Weight", "Distance"};
+    ImGui::SetNextItemWidth(110);
+    ImGui::Combo("##voxel-colour", &voxel_color_, colors, IM_ARRAYSIZE(colors));
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Weight: rays through the voxel, dark blue (few) to yellow.\n"
+                        "Distance: blue behind the landmarks, white at them, red in front (free).");
+    ImGui::SetNextItemWidth(110);
+    ImGui::SliderFloat("Voxel size", &voxel_size_, 0.002F, 0.5F, "%.3f", ImGuiSliderFlags_Logarithmic);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Voxel edge; 1 = the first keyframe's median scene depth.");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(110);
+    ImGui::SliderFloat("Carve", &voxel_carve_, 0.0F, 4.0F, "%.2f");
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Weight of a ray passing through a voxel against a landmark in it. 0: no carving.");
+    ImGui::SetNextItemWidth(110);
+    ImGui::SliderFloat("Min weight", &voxel_min_weight_, 0.0F, 20.0F, "%.1f");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hide voxels that fewer rays (weighted) have touched.");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(110);
+    ImGui::SliderFloat("Band", &voxel_band_, 0.1F, 2.0F, "%.2f");
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Draw voxels whose mean signed distance is within this many voxels of zero.\n"
+                        "Carved voxels drift toward +2 and drop out.");
+    ImGui::SetNextItemWidth(110);
+    ImGui::SliderFloat("Ambient", &voxel_ambient_, 0.0F, 1.0F, "%.2f");
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Ambient occlusion: each face is darkened by how much of its surroundings other\n"
+                        "voxels block, traced with one more ray per face every frame. 0: off.");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(110);
+    ImGui::SliderFloat("Reach", &voxel_ambient_distance_, 4.0F, 256.0F, "%.0f voxels", ImGuiSliderFlags_Logarithmic);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("How far the ambient rays look for something in the way.");
+    if (ImGui::Checkbox("All observers", &voxel_all_observers_)) voxels_stale_ = true;
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Rays from every keyframe that saw a landmark (and its last frame).\n"
+                        "Off: only from its first and last frames.");
+    const auto stats = voxels_.stats();
+    if (!voxels_.error().empty()) ImGui::TextColored({1, 0.4F, 0.3F, 1}, "Voxels: %s", voxels_.error().c_str());
+    else
+      ImGui::TextDisabled("%zu voxels (%zu solid) from %zu rays  |  %.2f ms  |  shading %d / %d", voxels_.voxels(),
+                          stats.solid, stats.rays, voxels_.build_ms(), voxels_.shade_samples(), voxels_.shade_target());
   }
 
   const ImVec2 origin = ImGui::GetCursorScreenPos();
@@ -274,9 +374,9 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
     line({0, 0, 0}, {0, 0, axis}, IM_COL32(60, 100, 235, 255), 2.0F);
   }
 
-  if (show_points_) {
-    // Solid icosahedrons on the GPU, depth-tested among themselves and drawn
-    // over the grid, under the trajectory and frustum overlays.
+  if (show_points_ || show_voxels_) {
+    // Solid icosahedrons (and the voxel cubes) on the GPU, depth-tested among
+    // themselves and drawn over the grid, under the trajectory and frustum overlays.
     PointCloudCamera camera;
     camera.pivot = {pivot.x, pivot.y, pivot.z};
     camera.right = {right.x, right.y, right.z};
@@ -293,9 +393,24 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
     const auto now = static_cast<float>(current->frame_index);
     const PointCloudStyle outside{point_size_, dim_outside_ ? 0.6F : 1.0F, color, only, now, age_span_};
     const PointCloudStyle local{point_size_, 1.0F, color, only, now, age_span_};
+    PointCloudRenderer::ExtraPass voxel_pass;
+    if (show_voxels_) {
+      voxels_.set_config({voxel_size_, 2.0F, voxel_carve_, 4096});
+      if (voxels_stale_) {
+        voxels_.set_samples(voxel_samples(odometry));
+        voxels_stale_ = false;
+      }
+      VoxelStyle style{voxel_min_weight_, voxel_band_, static_cast<VoxelColor>(voxel_color_), only};
+      style.ambient = voxel_ambient_;
+      style.ambient_distance = voxel_ambient_distance_;
+      voxel_pass = [this, style](const PointCloudCamera& c, float width, float height) {
+        voxels_.draw(c, width, height, style);
+      };
+    }
     points_renderer_.render(draw, {origin.x, origin.y}, {origin.x + size.x, origin.y + size.y},
-                            io.DisplayFramebufferScale.x, camera, show_outside_ ? &outside_ : nullptr, outside,
-                            &local_, local);
+                            io.DisplayFramebufferScale.x, camera,
+                            show_points_ && show_outside_ ? &outside_ : nullptr, outside,
+                            show_points_ ? &local_ : nullptr, local, nullptr, 2.0F, 0, &voxel_pass);
   }
   const TrajectorySample* previous = nullptr;
   for (const auto& s : samples_) {
