@@ -28,6 +28,13 @@ int main(int argc, char** argv) {
     if (const char* model = std::getenv("SLAM_DEPTH_MODEL")) config.depth_model = model;  // preset name, "" = off
     Session session(config);
     session.runtime.realtime_pacing = false;
+    if (const char* fusion = std::getenv("SLAM_FUSION")) {  // depth fusion window: 1 side by side, 2 overlay
+      session.runtime.fusion.enabled = true;
+      session.runtime.show_trajectory = false;  // room for the fusion window
+      session.runtime.show_depth = false;
+      session.runtime.fusion.overlay = std::string(fusion) == "2";
+      if (const char* view = std::getenv("SLAM_FUSION_VIEW")) session.runtime.fusion.view = std::atoi(view);
+    }
     if (std::stod(argv[3]) > 0) {
       session.runtime.seek_seconds = std::stod(argv[3]);
       session.runtime.seek_requested = true;
@@ -52,8 +59,10 @@ int main(int argc, char** argv) {
       draw_video(session.runtime, true, session.decoder->duration_ns(), session.decoder->start_time_ns());
       draw_flow_diagnostics(session.runtime, *session.flow_tracker);
       draw_depth(session.runtime);
-      session.trajectory_view.draw(*session.odometry, &session.runtime.show_trajectory,
-                                   session.runtime.frame_width, session.runtime.frame_height);
+      if (session.runtime.show_trajectory)
+        session.trajectory_view.draw(*session.odometry, &session.runtime.show_trajectory,
+                                     session.runtime.frame_width, session.runtime.frame_height);
+      draw_fusion(session.runtime);
       ImGui::Render();
       glfwGetFramebufferSize(window.get(), &width, &height);
       glViewport(0, 0, width, height);
@@ -76,6 +85,12 @@ int main(int argc, char** argv) {
                  std::to_string(depth.width) + "x" + std::to_string(depth.height) + ", centre " +
                  std::to_string(depth.at_source(depth.source_width / 2.0F, depth.source_height / 2.0F)) + " m")
               << '\n';
+    const auto& fusion = session.runtime.fusion;
+    if (fusion.enabled)
+      std::cout << "fusion: " << (fusion.status.empty() ? "running" : fusion.status) << ", " << fusion.stats.valid
+                << " px, " << fusion.ms << " ms, flicker raw " << fusion.stats.flicker_raw << " fused "
+                << fusion.stats.flicker_fused << ", keyframe clouds " << fusion.keyframes_fused << " fused / "
+                << fusion.keyframes_raw << " raw\n";
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     return 1;

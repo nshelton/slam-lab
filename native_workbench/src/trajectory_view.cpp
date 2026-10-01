@@ -119,6 +119,28 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
     ImGui::SameLine();
     ImGui::Checkbox("Perspective", &perspective_);
   }
+  ImGui::Checkbox("Covisibility", &show_covisibility_);
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("Magenta lines between keyframes that observe common landmarks.\n"
+                      "Links far apart in time are loops / revisits the map already knows.");
+  if (show_covisibility_) {
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(90);
+    ImGui::SliderInt("shared##covis", &covisibility_min_shared_, 1, 200);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(90);
+    ImGui::SliderInt("gap (KFs)##covis", &covisibility_min_gap_, 1, 200);
+    std::uint64_t keyframe_count = 0;
+    for (const auto& s : samples_) keyframe_count += s.keyframe;
+    const std::array<std::uint64_t, 4> key{keyframe_count, map_generation_,
+        static_cast<std::uint64_t>(covisibility_min_shared_), static_cast<std::uint64_t>(covisibility_min_gap_)};
+    if (key != covisibility_key_) {
+      covisibility_ = odometry.covisibility(covisibility_min_shared_, covisibility_min_gap_);
+      covisibility_key_ = key;
+    }
+    ImGui::SameLine();
+    ImGui::Text("%zu links", covisibility_.size());
+  }
   if (show_points_) {
     const char* colors[] = {"Plain", "Image colour", "Confidence"};
     ImGui::SetNextItemWidth(110);
@@ -386,6 +408,16 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
                             show_points_ && show_retired_ ? &retired_ : nullptr, retired,
                             show_points_ ? &active_ : nullptr, active, &clouds, dense_point_pixels_,
                             depth_store_ ? depth_store_->generation() : 0);
+  }
+  if (show_covisibility_ && !covisibility_.empty()) {
+    std::unordered_map<std::uint64_t, const TrajectorySample*> keyframe_samples;
+    for (const auto& s : samples_)
+      if (s.keyframe && visible(s)) keyframe_samples[s.frame_index] = &s;
+    for (const auto& edge : covisibility_) {
+      const auto a = keyframe_samples.find(edge.frame_a), b = keyframe_samples.find(edge.frame_b);
+      if (a == keyframe_samples.end() || b == keyframe_samples.end()) continue;
+      line(display(a->second->pose.center()), display(b->second->pose.center()), IM_COL32(255, 0, 255, 140), 1.0F);
+    }
   }
   const TrajectorySample* previous = nullptr;
   for (const auto& s : samples_) {

@@ -113,6 +113,13 @@ struct VisualOdometryConfig {
   int keyframe_min_interval{6};
   int keyframe_max_interval{20};
   double keyframe_track_ratio{0.75};    // tracked landmarks vs last keyframe
+  // Emergency keyframe, ignoring keyframe_min_interval: when the tracked
+  // landmarks collapse (below keyframe_emergency_ratio x the last keyframe's,
+  // or below keyframe_emergency_points) a keyframe refills the map before
+  // tracking is lost. In fast motion tracked landmarks halve every frame
+  // (fr1_room), faster than the minimum interval allows. 0 disables each test.
+  double keyframe_emergency_ratio{0.4};
+  int keyframe_emergency_points{0};
   double min_triangulation_parallax_degrees{0.5};
   int window_keyframes{8};
   int bundle_iterations{8};
@@ -174,6 +181,30 @@ struct VisualOdometryConfig {
   int loop_covisibility_min{30};   // shared landmarks for a covisibility edge
   int loop_cooldown_keyframes{10};
   double loop_edge_weight{10.0};
+  // Appearance (global) search, no pose prior.
+  // The keyframe's landmarks are matched by descriptor against every older
+  // landmark of the segment (mutual best, cosine >= relocalization_min_similarity,
+  // cosine distance <= loop_global_ratio x the runner-up's), a P3P RANSAC
+  // pose needs loop_global_min_inliers; the correction is that pose, scaled by
+  // the median old/current landmark depth ratio. Then as above. Measured
+  // offline on fr1_room: no wrong pose had more than 10 P3P inliers; true
+  // revisits a median of 48. Runs at every keyframe (also during the loop
+  // cooldown, for its statistics; loop_global_interval_frames > 0 thins it)
+  // next to the spatial search; the loop with more verified pairs wins. It
+  // brute-forces every old descriptor (match_all_descriptors): the baseline
+  // to compare an indexed retrieval against.
+  bool loop_global_search{true};
+  int loop_global_interval_frames{0};
+  int loop_global_min_inliers{20};
+  double loop_global_ratio{0.9};
+  int loop_global_iterations{1000};
+  // The scale (old / current depth over the pose inliers that carry a
+  // current landmark) is accepted when p75 <= loop_global_scale_spread x p25,
+  // from at least loop_global_min_pairs pairs within 25% of the median.
+  // fr1_room: without these gates a loop applied a 1.63x scale read from 18
+  // pairs spread 1.45-2.03 (ATE 37.7 cm); with them 24.7 cm.
+  double loop_global_scale_spread{1.3};
+  int loop_global_min_pairs{20};
   // Solve the pose graph on the calling thread, applying the correction in
   // the same frame (deterministic: bench, tests). Otherwise a worker thread
   // solves it and a later frame applies it.
@@ -184,6 +215,13 @@ struct VisualOdometryConfig {
   // exporting (TUM suite, 20 iterations at the end: mean ATE 10.0 -> 8.4 cm,
   // fr2_desk 12.3 -> 6.4, no sequence worse).
   int final_bundle_iterations{20};
+  // Global bundle adjustment of the segment right after a loop correction is
+  // applied (iterations; 0: off). The pose graph only moves keyframes as
+  // rigid blocks; this re-fits every keyframe and landmark to all sightings,
+  // including the merged loop landmarks. fr1_room, global loop search: ATE
+  // 51.5 -> 37.7 cm without the loop_global scale gates, 24.7 cm with them.
+  // Runs on the calling thread (~0.1-4 s per loop on fr1_room).
+  int loop_bundle_iterations{20};
   // Cull also re-checks observations from keyframes outside the BA window
   // (dropping those that no longer reproject within 2x the threshold). Off:
   // only windowed observations are checked, as before.
@@ -303,6 +341,15 @@ struct OdometryFrameResult {
   bool loop_closed{};
   std::int64_t loop_keyframe{-1}, loop_candidate{-1};  // frame indices
   int loop_inliers{};
+  bool loop_global{};  // the detected loop came from the appearance search
+  // Appearance (global) search statistics, on keyframes where it ran:
+  // queries (this keyframe's landmarks) x database (older landmarks),
+  // mutual-best matches, the matcher's time, P3P inliers, and whether it
+  // verified a loop (closed only when no correction is pending/cooling down).
+  bool global_search{};
+  int global_queries{}, global_database{}, global_matches{}, global_pose_inliers{};
+  double global_match_ms{};
+  bool global_found{};
   std::vector<std::pair<std::uint64_t, double>> keyframe_scale_changes;
   // On keyframes: the keyframe that just left the bundle-adjustment window
   // (-1 = none) and its scale refitted at its now-final pose and landmarks.
@@ -363,6 +410,12 @@ struct TrajectorySample {
   Pose pose;  // latest estimate: follows keyframe bundle-adjustment updates
 };
 
+// Two keyframes (by frame index) that observe `shared` common landmarks.
+struct CovisibilityEdge {
+  std::uint64_t frame_a{}, frame_b{};  // frame_a < frame_b
+  int shared{};
+};
+
 class VisualOdometry {
  public:
   explicit VisualOdometry(VisualOdometryConfig config = {});
@@ -408,6 +461,11 @@ class VisualOdometry {
   // The landmark a live track currently observes, if any.
   [[nodiscard]] std::optional<std::uint64_t> landmark_id(std::uint64_t track_id) const;
   [[nodiscard]] std::optional<std::array<double, 3>> landmark(std::uint64_t track_id) const;
+  // Keyframe pairs sharing at least min_shared landmarks (active, dormant,
+  // suspended and archived ones; retired landmarks without an archive copy
+  // have no sightings), at least min_keyframe_gap keyframes apart. Cost grows
+  // with sightings per landmark squared: for display, not per frame.
+  [[nodiscard]] std::vector<CovisibilityEdge> covisibility(int min_shared, int min_keyframe_gap = 1) const;
   [[nodiscard]] const OdometryFrameResult& last() const;
   [[nodiscard]] const VisualOdometryConfig& config() const;
 

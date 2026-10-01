@@ -92,6 +92,58 @@ void distort_point(float& x, float& y, int width, int height, double k1) {
 }
 
 namespace {
+// Global descriptor matching, the baseline for loop retrieval: every query
+// against every database descriptor (unit length assumed after normalizing
+// here). Returns (query, database) index pairs that are mutual best matches
+// with cosine >= min_similarity and cosine distance <= ratio x the query's
+// runner-up. A hashed or vocabulary index can replace this; compare it with
+// OdometryFrameResult::global_* on the same run.
+std::vector<std::pair<std::size_t, std::size_t>> match_all_descriptors(const std::vector<const float*>& queries,
+                                                                       const std::vector<const float*>& database,
+                                                                       int dimension, float min_similarity,
+                                                                       double ratio) {
+  std::vector<std::pair<std::size_t, std::size_t>> matches;
+  if (queries.empty() || database.empty()) return matches;
+  Eigen::MatrixXf Q(dimension, static_cast<Eigen::Index>(queries.size()));
+  for (std::size_t a = 0; a < queries.size(); ++a)
+    Q.col(static_cast<Eigen::Index>(a)) = Eigen::Map<const Eigen::VectorXf>(queries[a], dimension).normalized();
+  // In blocks of the database: per query the best and second best, per
+  // database entry its best query (for the mutual check).
+  const auto nq = static_cast<Eigen::Index>(queries.size());
+  std::vector<float> best(queries.size(), -2), second(queries.size(), -2);
+  std::vector<std::size_t> best_entry(queries.size(), 0);
+  std::vector<Eigen::Index> best_query(database.size(), -1);
+  constexpr std::size_t kBlock = 2048;
+  Eigen::MatrixXf D(dimension, static_cast<Eigen::Index>(kBlock));
+  for (std::size_t start = 0; start < database.size(); start += kBlock) {
+    const std::size_t count = std::min(kBlock, database.size() - start);
+    for (std::size_t b = 0; b < count; ++b)
+      D.col(static_cast<Eigen::Index>(b)) = Eigen::Map<const Eigen::VectorXf>(database[start + b], dimension).normalized();
+    const Eigen::MatrixXf S = D.leftCols(static_cast<Eigen::Index>(count)).transpose() * Q;  // database x query
+    for (std::size_t b = 0; b < count; ++b) {
+      Eigen::Index q;
+      S.row(static_cast<Eigen::Index>(b)).maxCoeff(&q);
+      best_query[start + b] = q;
+      for (Eigen::Index a = 0; a < nq; ++a) {
+        const float v = S(static_cast<Eigen::Index>(b), a);
+        const auto ua = static_cast<std::size_t>(a);
+        if (v > best[ua]) {
+          second[ua] = best[ua];
+          best[ua] = v;
+          best_entry[ua] = start + b;
+        } else if (v > second[ua]) {
+          second[ua] = v;
+        }
+      }
+    }
+  }
+  for (std::size_t a = 0; a < queries.size(); ++a)
+    if (best[a] >= min_similarity && best_query[best_entry[a]] == static_cast<Eigen::Index>(a) &&
+        1 - best[a] <= ratio * (1 - second[a]))
+      matches.emplace_back(a, best_entry[a]);
+  return matches;
+}
+
 // Bilinear weights of the scale grid's nodes at a pixel.
 void scale_grid_weights(int width, int height, double x, double y, int index[4], double weight[4]) {
   const double gx = std::clamp(x / std::max(width - 1, 1) * (kScaleGridX - 1), 0.0, kScaleGridX - 1 - 1e-9);
@@ -143,6 +195,7 @@ void VisualOdometryConfig::validate() const {
       homography_ratio > 0 && distortion_k1 > -1 && ransac_threshold_px > 0 && ransac_iterations > 0 && max_init_frames > 0 &&
       min_tracked_points >= 6 && reprojection_threshold_px > 0 && keyframe_min_interval >= 1 &&
       keyframe_max_interval >= keyframe_min_interval && keyframe_track_ratio > 0 &&
+      keyframe_emergency_ratio >= 0 && keyframe_emergency_points >= 0 &&
       min_triangulation_parallax_degrees >= 0 && window_keyframes >= 2 && bundle_iterations >= 0 &&
       (!intrinsics || (intrinsics->fx > 0 && intrinsics->fy > 0)) && relocalization_max_frames >= 1 &&
       relocalization_min_keyframes >= 2 && relocalization_radius_px > 0 && relocalization_threshold_px > 0 &&
@@ -150,9 +203,11 @@ void VisualOdometryConfig::validate() const {
       reassociation_radius_px > 0 && dormant_max_frames >= 0 && max_dormant_landmarks >= 0 &&
       depth_relative_sigma > 0 && depth_scale_min_samples >= 1 && depth_scale_min_keyframes >= 2 &&
       depth_scale_min_parallax_degrees >= 0 && depth_scale_max_relative_sigma > 0 && depth_scale_drift_sigma >= 0 &&
-      depth_scale_floor_sigma > 0 && loop_min_keyframe_gap >= 1 && loop_max_distance_ratio > 0 &&
+      depth_scale_floor_sigma > 0 && loop_bundle_iterations >= 0 && loop_min_keyframe_gap >= 1 && loop_max_distance_ratio > 0 &&
       loop_max_angle_degrees > 0 && loop_min_inliers >= 3 && loop_distance_tolerance > 0 && loop_covisibility_min >= 1 &&
-      loop_cooldown_keyframes >= 0 && loop_edge_weight > 0 &&
+      loop_cooldown_keyframes >= 0 && loop_edge_weight > 0 && loop_global_min_inliers >= 6 &&
+      loop_global_ratio > 0 && loop_global_iterations >= 1 && loop_global_scale_spread >= 1 &&
+      loop_global_min_pairs >= 3 && loop_global_interval_frames >= 0 &&
       observation_sigma_px > 0 && min_observation_sigma_px > 0 && confidence_depth_ratio > 0 &&
       confidence_two_view >= 0 && confidence_two_view <= 1 && confidence_consistency_scale > 0 &&
       pose_landmark_covariance_scale > 0;
@@ -252,6 +307,7 @@ struct VisualOdometry::Impl {
   std::unordered_map<std::uint64_t, Landmark> archive;
   std::uint64_t map_generation{};
   int keyframes_since_loop{1 << 30};
+  std::optional<std::uint64_t> last_global_search;  // frame of the last appearance search
   // A loop correction being solved (on a worker unless loop_synchronous).
   struct LoopJob {
     int segment{};
@@ -638,6 +694,9 @@ struct VisualOdometry::Impl {
       if (state == OdometryState::tracking) track(frame, result);
       else initialize(frame, result);
     }
+    if (result.loop_closed && config.loop_bundle_iterations > 0 &&
+        global_bundle_adjustment(segment, config.loop_bundle_iterations) && result.has_pose)
+      result.pose = to_pose(last_pose);
     result.segment = segment;
     if (auto it = depth_scales.find(segment); it != depth_scales.end()) {
       result.metric_scale = std::exp(it->second.log_scale);
@@ -890,9 +949,12 @@ struct VisualOdometry::Impl {
     // Before the keyframe step, so a re-found landmark is not triangulated again.
     reassociate(frame, pose, current, std::unordered_set<std::uint64_t>(inlier_ids.begin(), inlier_ids.end()), result);
     ++frames_since_keyframe;
-    const bool keyframe = frames_since_keyframe >= config.keyframe_min_interval &&
-        (count < config.keyframe_track_ratio * keyframe_landmarks ||
-         frames_since_keyframe >= config.keyframe_max_interval);
+    const bool emergency = count < config.keyframe_emergency_ratio * keyframe_landmarks ||
+                           count < config.keyframe_emergency_points;
+    const bool keyframe = (frames_since_keyframe >= config.keyframe_min_interval &&
+                           (count < config.keyframe_track_ratio * keyframe_landmarks ||
+                            frames_since_keyframe >= config.keyframe_max_interval)) ||
+                          emergency;
     if (keyframe) {
       const int id = add_keyframe(frame.frame_index, pose, current, sigmas);
       for (auto track_id : inlier_ids) {
@@ -1314,12 +1376,206 @@ struct VisualOdometry::Impl {
     return false;
   }
 
+  // A verified loop: candidate (position in segment_keyframes), similarity
+  // mapping the current map onto the old one, and (current, old) landmark pairs.
+  struct LoopFound {
+    std::size_t position{};
+    Sim3 S;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> pairs;
+    bool global{};  // found by the appearance search
+  };
+
+  // RANSAC similarity on 3D-3D matches (current X -> old Y), verified by
+  // reprojecting the old points through the corrected pose of the newest
+  // keyframe (`pixels`: the current observations). Returns the similarity and
+  // the verified pairs when at least `min_inliers` survive.
+  std::optional<std::pair<Sim3, std::vector<std::pair<std::uint64_t, std::uint64_t>>>> fit_similarity(
+      const std::vector<Vec3>& X, const std::vector<Vec3>& Y, const std::vector<double>& tolerance,
+      const std::vector<std::pair<std::uint64_t, std::uint64_t>>& pairs, const std::vector<Vec2>& pixels,
+      int k, int min_inliers) const {
+    if (static_cast<int>(pairs.size()) < min_inliers) return std::nullopt;
+    const SE3& Tk = keyframes[k].pose;
+    const std::uint32_t seed = static_cast<std::uint32_t>(keyframes[k].frame_index * 2654435761U);
+    Sim3 S;
+    std::vector<char> inliers;
+    if (const int n = ransac_similarity(X, Y, tolerance, 400, seed, S, inliers); n < min_inliers) {
+      if (std::getenv("SLAM_VO_LOOP_DEBUG")) std::fprintf(stderr, "    similarity: %d of %zu inliers\n", n, pairs.size());
+      return std::nullopt;
+    }
+    const Sim3 corrected = Sim3::from(Tk) * S.inverse();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> verified;
+    for (std::size_t i = 0; i < pairs.size(); ++i) {
+      if (!inliers[i]) continue;
+      const Vec3 xc = corrected * Y[i];
+      if (xc.z() > 1e-9 && (K.project(xc) - pixels[i]).norm() <= 2 * config.relocalization_threshold_px)
+        verified.push_back(pairs[i]);
+    }
+    if (std::getenv("SLAM_VO_LOOP_DEBUG"))
+      std::fprintf(stderr, "    %d ransac inliers, %zu verified, scale %.3f\n",
+                   static_cast<int>(std::count(inliers.begin(), inliers.end(), 1)), verified.size(), S.s);
+    if (static_cast<int>(verified.size()) < min_inliers) return std::nullopt;
+    return std::make_pair(S, std::move(verified));
+  }
+
+  // Appearance search, no pose prior: this keyframe's landmarks (by their
+  // tracks' descriptors in `frame`) against every old landmark of the segment
+  // (not seen by the last loop_min_keyframe_gap keyframes), mutual best with
+  // a ratio test; P3P RANSAC on the old points gives the correction. Catches revisits whose drift is beyond the spatial
+  // candidates' reach. The candidate is the old keyframe that observes most
+  // of the verified landmarks.
+  std::optional<LoopFound> global_loop_candidate(const TrackedFrame& frame, int k, std::uint32_t seed, bool debug,
+                                                 OdometryFrameResult& result) const {
+    const int last = static_cast<int>(segment_keyframes.size()) - 1 - config.loop_min_keyframe_gap;
+    if (last < 0) return std::nullopt;
+    const std::uint64_t horizon = keyframes[segment_keyframes[static_cast<std::size_t>(last)]].frame_index;
+    // Query: every track of this frame with a descriptor. P3P needs only its
+    // pixel; the scale and the merge use the ones that carry a landmark.
+    struct Query {
+      std::uint64_t track;
+      std::optional<std::uint64_t> landmark;
+      Vec2 u;
+    };
+    std::vector<Query> queries;
+    std::unordered_set<std::uint64_t> tracked;  // landmarks observed now: not "old"
+    for (const auto& o : frame.observations) {
+      if (!descriptors.count(o.track_id)) continue;
+      std::optional<std::uint64_t> landmark;
+      if (auto it = track_landmark.find(o.track_id); it != track_landmark.end()) {
+        landmark = it->second;
+        tracked.insert(it->second);
+      }
+      queries.push_back({o.track_id, landmark, Vec2(o.x, o.y)});
+    }
+    result.global_search = true;
+    result.global_queries = static_cast<int>(queries.size());
+    if (static_cast<int>(queries.size()) < config.loop_global_min_inliers) return std::nullopt;
+    std::vector<std::uint64_t> old;
+    const auto gather = [&](const std::unordered_map<std::uint64_t, Landmark>& source) {
+      for (const auto& [id, landmark] : source)
+        if (landmark.segment == segment && static_cast<int>(landmark.descriptor.size()) == descriptor_dimension &&
+            landmark.last_frame < horizon && !tracked.count(id))
+          old.push_back(id);
+    };
+    gather(landmarks);
+    gather(dormant);
+    gather(archive);
+    if (static_cast<int>(old.size()) < config.loop_global_min_inliers) return std::nullopt;
+    std::sort(old.begin(), old.end());
+    std::vector<const float*> query_descriptors, database;
+    for (const auto& q : queries) query_descriptors.push_back(descriptors.at(q.track));
+    for (auto id : old) database.push_back(find_landmark(id)->descriptor.data());
+    const auto started = std::chrono::steady_clock::now();
+    std::vector<PoseObservation> observations;
+    std::vector<std::size_t> matched, matched_old;  // query index / old position per observation
+    for (const auto& [a, b] : match_all_descriptors(query_descriptors, database, descriptor_dimension,
+                                                    static_cast<float>(config.relocalization_min_similarity),
+                                                    config.loop_global_ratio)) {
+      observations.push_back({find_landmark(old[b])->X, queries[a].u, sigma_of(queries[a].track)});
+      matched.push_back(a);
+      matched_old.push_back(b);
+    }
+    result.global_match_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    result.global_database = static_cast<int>(old.size());
+    result.global_matches = static_cast<int>(observations.size());
+    if (debug)
+      std::fprintf(stderr, "  global: %zu queries x %zu old landmarks, %zu matches\n", queries.size(), old.size(),
+                   observations.size());
+    if (static_cast<int>(observations.size()) < config.loop_global_min_inliers) return std::nullopt;
+    SE3 pose;
+    std::vector<char> pose_inliers;
+    if (ransac_pnp(K, observations, config.relocalization_threshold_px, config.loop_global_iterations, seed, pose,
+                   pose_inliers) < config.loop_global_min_inliers)
+      return std::nullopt;
+    // Refine on the RANSAC inliers only (optimize_pose starts from all
+    // observations, and most global matches are outliers), then recount.
+    {
+      std::vector<PoseObservation> consensus;
+      for (std::size_t i = 0; i < observations.size(); ++i)
+        if (pose_inliers[i]) consensus.push_back(observations[i]);
+      std::vector<char> consensus_inliers;
+      optimize_pose(K, consensus, pose, config.reprojection_threshold_px, consensus_inliers, 10,
+                    config.pose_landmark_pixel_gate);
+    }
+    int pose_count = 0;
+    for (std::size_t i = 0; i < observations.size(); ++i) {
+      const Vec3 xc = pose * observations[i].X;
+      pose_inliers[i] = xc.z() > 1e-9 && (K.project(xc) - observations[i].u).norm() <= config.relocalization_threshold_px;
+      pose_count += pose_inliers[i];
+    }
+    result.global_pose_inliers = pose_count;
+    if (debug) std::fprintf(stderr, "  global: %d P3P inliers\n", pose_count);
+    if (pose_count < config.loop_global_min_inliers) return std::nullopt;
+    // The correction comes from the P3P pose, not a 3D-3D fit: this
+    // keyframe's own landmarks are young and their depths too noisy (on
+    // fr1_room 4-8 of 20-50 pose inliers passed a 5% similarity tolerance).
+    // Scale: median ratio of old to current depth over the pose inliers.
+    const SE3& Tk = keyframes[k].pose;
+    std::vector<double> ratios;
+    std::vector<std::size_t> used;
+    for (std::size_t i = 0; i < observations.size(); ++i) {
+      const auto& landmark = queries[matched[i]].landmark;
+      if (!pose_inliers[i] || !landmark) continue;
+      const double z_old = (pose * observations[i].X).z(), z_cur = (Tk * landmarks.at(*landmark).X).z();
+      if (z_old <= 1e-9 || z_cur <= 1e-9) continue;
+      ratios.push_back(z_old / z_cur);
+      used.push_back(i);
+    }
+    if (static_cast<int>(ratios.size()) < config.loop_global_min_inliers / 2) return std::nullopt;
+    const double scale = median(ratios);  // old units per current unit
+    {
+      // A scale read from a spread-out sample is unreliable (young or
+      // mismatched points); wait for a later keyframe.
+      std::vector<double> sorted = ratios;
+      std::sort(sorted.begin(), sorted.end());
+      if (sorted[3 * sorted.size() / 4] > config.loop_global_scale_spread * sorted[sorted.size() / 4]) {
+        if (debug) std::fprintf(stderr, "  global: scale %.3f too spread\n", scale);
+        return std::nullopt;
+      }
+    }
+    // Old world -> current keyframe camera (current units), and S with
+    // Sim3::from(Tk) * S^-1 equal to it (S maps the current map onto the old).
+    const Sim3 corrected = Sim3{1 / scale, Mat3::Identity(), Vec3::Zero()} * Sim3::from(pose);
+    const Sim3 S = corrected.inverse() * Sim3::from(Tk);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> pairs;
+    for (std::size_t j = 0; j < used.size(); ++j)  // depth-consistent pairs are merged
+      if (std::abs(std::log(ratios[j] / scale)) < 0.25)
+        pairs.emplace_back(*queries[matched[used[j]]].landmark, old[matched_old[used[j]]]);
+    if (debug) {
+      std::vector<double> sorted = ratios;
+      std::sort(sorted.begin(), sorted.end());
+      std::fprintf(stderr, "  global kf %llu: scale %.3f (p25 %.3f p75 %.3f, n %zu), %zu depth-consistent pairs\n",
+                   static_cast<unsigned long long>(keyframes[k].frame_index), scale, sorted[sorted.size() / 4],
+                   sorted[3 * sorted.size() / 4], sorted.size(), pairs.size());
+    }
+    if (static_cast<int>(pairs.size()) < config.loop_global_min_pairs) return std::nullopt;
+    std::optional<std::pair<Sim3, std::vector<std::pair<std::uint64_t, std::uint64_t>>>> fit =
+        std::make_pair(S, std::move(pairs));
+    // Candidate: the old keyframe (>= the gap back) observing most verified landmarks.
+    std::unordered_map<int, int> votes;
+    for (const auto& [cur, old_id] : fit->second)
+      for (const auto& o : find_landmark(old_id)->observations) ++votes[o.keyframe];
+    std::optional<std::size_t> position;
+    int most = 0;
+    for (int p = 0; p <= last; ++p)
+      if (auto it = votes.find(segment_keyframes[static_cast<std::size_t>(p)]); it != votes.end() && it->second > most) {
+        most = it->second;
+        position = static_cast<std::size_t>(p);
+      }
+    if (!position) return std::nullopt;
+    if (debug)
+      std::fprintf(stderr, "  global: candidate %llu (%d votes)\n",
+                   static_cast<unsigned long long>(keyframes[segment_keyframes[*position]].frame_index), most);
+    return LoopFound{*position, fit->first, std::move(fit->second), true};
+  }
+
   // Looks for a revisit at keyframe `k`; starts (or, synchronously, applies)
   // the correction. See VisualOdometryConfig::loop_closure.
   void detect_loop(const TrackedFrame& frame, int k, OdometryFrameResult& result) {
-    if (!config.loop_closure || descriptor_dimension == 0 || loop_job ||
-        keyframes_since_loop < config.loop_cooldown_keyframes)
-      return;
+    if (!config.loop_closure || descriptor_dimension == 0) return;
+    // The appearance search also runs while no loop can be closed (cooldown,
+    // pending correction), so its statistics cover every keyframe.
+    const bool can_close = !loop_job && keyframes_since_loop >= config.loop_cooldown_keyframes;
+    if (!can_close && !config.loop_global_search) return;
     const SE3& Tk = keyframes[k].pose;
     // The keyframe's own landmarks.
     std::vector<std::uint64_t> current;
@@ -1362,13 +1618,9 @@ struct VisualOdometry::Impl {
       std::fprintf(stderr, "loop kf %llu: %zu current, scene %.3f, %zu candidates (%d keyframes back max)\n",
                    static_cast<unsigned long long>(keyframes[k].frame_index), current.size(), scene, candidates.size(), last);
 
-    struct Found {
-      std::size_t position{};
-      Sim3 S;
-      std::vector<std::pair<std::uint64_t, std::uint64_t>> pairs;
-    };
-    std::optional<Found> best;
+    std::optional<LoopFound> best;
     const std::uint32_t seed = static_cast<std::uint32_t>(keyframes[k].frame_index * 2654435761U);
+    if (!can_close) candidates.clear();
     for (const auto& [distance, position] : candidates) {
       // The candidate's neighbourhood (2 keyframes either side) and its landmarks.
       std::unordered_set<int> around;
@@ -1427,27 +1679,21 @@ struct VisualOdometry::Impl {
         pixels.emplace_back(o.x, o.y);
       }
       if (debug) std::fprintf(stderr, "    %zu descriptor matches\n", pairs.size());
-      if (static_cast<int>(pairs.size()) < config.loop_min_inliers) continue;
-      Sim3 S;
-      std::vector<char> inliers;
-      if (ransac_similarity(X, Y, tolerance, 400, seed, S, inliers) < config.loop_min_inliers) continue;
-      // Verify by reprojection: the old points through the corrected keyframe pose.
-      const Sim3 corrected = Sim3::from(Tk) * S.inverse();
-      std::vector<std::pair<std::uint64_t, std::uint64_t>> verified;
-      for (std::size_t i = 0; i < pairs.size(); ++i) {
-        if (!inliers[i]) continue;
-        const Vec3 xc = corrected * Y[i];
-        if (xc.z() > 1e-9 && (K.project(xc) - pixels[i]).norm() <= 2 * config.relocalization_threshold_px)
-          verified.push_back(pairs[i]);
-      }
-      if (debug) std::fprintf(stderr, "    %d ransac inliers, %zu verified, scale %.3f\n",
-                              static_cast<int>(std::count(inliers.begin(), inliers.end(), 1)), verified.size(), S.s);
-      if (static_cast<int>(verified.size()) < config.loop_min_inliers) continue;
-      if (!best || verified.size() > best->pairs.size()) best = Found{position, S, std::move(verified)};
+      if (auto fit = fit_similarity(X, Y, tolerance, pairs, pixels, k, config.loop_min_inliers))
+        if (!best || fit->second.size() > best->pairs.size()) best = LoopFound{position, fit->first, std::move(fit->second)};
     }
-    if (!best) return;
+    if (config.loop_global_search &&
+        (!last_global_search ||
+         frame.frame_index >= *last_global_search + static_cast<std::uint64_t>(config.loop_global_interval_frames))) {
+      last_global_search = frame.frame_index;
+      auto found = global_loop_candidate(frame, k, seed, debug, result);
+      result.global_found = found.has_value();
+      if (found && (!best || found->pairs.size() > best->pairs.size())) best = std::move(found);
+    }
+    if (!best || !can_close) return;
     const int c = segment_keyframes[best->position];
     result.loop_detected = true;
+    result.loop_global = best->global;
     result.loop_keyframe = static_cast<std::int64_t>(keyframes[k].frame_index);
     result.loop_candidate = static_cast<std::int64_t>(keyframes[c].frame_index);
     result.loop_inliers = static_cast<int>(best->pairs.size());
@@ -1880,6 +2126,30 @@ std::vector<MapPoint> VisualOdometry::retired_map(std::size_t first) const {
 double VisualOdometry::segment_scale(int segment) const {
   auto it = impl_->depth_scales.find(segment);
   return it == impl_->depth_scales.end() ? 0.0 : std::exp(it->second.log_scale);
+}
+std::vector<CovisibilityEdge> VisualOdometry::covisibility(int min_shared, int min_keyframe_gap) const {
+  std::map<std::pair<int, int>, int> shared;
+  std::vector<int> seen;
+  const auto count = [&](const std::unordered_map<std::uint64_t, Impl::Landmark>& source) {
+    for (const auto& [id, landmark] : source) {
+      seen.clear();
+      for (const auto& o : landmark.observations) seen.push_back(o.keyframe);
+      std::sort(seen.begin(), seen.end());
+      seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
+      for (std::size_t a = 0; a < seen.size(); ++a)
+        for (std::size_t b = a + 1; b < seen.size(); ++b)
+          if (seen[b] - seen[a] >= min_keyframe_gap) ++shared[{seen[a], seen[b]}];
+    }
+  };
+  count(impl_->landmarks);
+  count(impl_->dormant);
+  count(impl_->archive);
+  if (impl_->lost) count(impl_->lost->landmarks);
+  std::vector<CovisibilityEdge> edges;
+  for (const auto& [pair, n] : shared)
+    if (n >= min_shared)
+      edges.push_back({impl_->keyframes[pair.first].frame_index, impl_->keyframes[pair.second].frame_index, n});
+  return edges;
 }
 bool VisualOdometry::has_landmark(std::uint64_t track_id) const { return impl_->track_landmark.count(track_id) > 0; }
 std::optional<std::uint64_t> VisualOdometry::landmark_id(std::uint64_t track_id) const {

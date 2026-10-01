@@ -9,6 +9,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 namespace slam_native {
@@ -55,6 +56,13 @@ class TrajectoryView {
   int rotation_{};
   bool perspective_{true};  // orbit view only; fixed views are orthographic
   bool all_segments_{false};
+  // Magenta lines between keyframes that share landmarks (VisualOdometry::covisibility),
+  // recomputed when a keyframe is added, the map moves or the thresholds change.
+  bool show_covisibility_{false};
+  int covisibility_min_shared_{30};
+  int covisibility_min_gap_{10};  // keyframes apart; hides the always-present neighbour links
+  std::vector<CovisibilityEdge> covisibility_;
+  std::array<std::uint64_t, 4> covisibility_key_{};
   const KeyframeDepthStore* depth_store_{};
   bool show_dense_{true};
   float dense_point_pixels_{2.0F};

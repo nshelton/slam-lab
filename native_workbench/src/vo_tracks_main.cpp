@@ -38,6 +38,8 @@ int main(int argc, char** argv) {
         else if (key == "keyframe_max_interval") config.keyframe_max_interval = static_cast<int>(v);
         else if (key == "keyframe_min_interval") config.keyframe_min_interval = static_cast<int>(v);
         else if (key == "keyframe_track_ratio") config.keyframe_track_ratio = v;
+        else if (key == "keyframe_emergency_ratio") config.keyframe_emergency_ratio = v;
+        else if (key == "keyframe_emergency_points") config.keyframe_emergency_points = static_cast<int>(v);
         else if (key == "bundle_iterations") config.bundle_iterations = static_cast<int>(v);
         else if (key == "min_tracked_points") config.min_tracked_points = static_cast<int>(v);
         else if (key == "use_observation_sigma") config.use_observation_sigma = v != 0;

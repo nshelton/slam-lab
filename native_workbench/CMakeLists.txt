@@ -133,6 +133,8 @@ if(SLAM_NATIVE_BUILD_APP)
   )
   FetchContent_MakeAvailable(imgui)
 
+  # The depth filter runs per pixel on the CPU in the app: optimised even in Debug builds.
+  set_source_files_properties(src/depth_filter.cpp PROPERTIES COMPILE_OPTIONS "-O2")
   add_executable(slam-native-workbench
     src/main.cpp
     src/app.cpp
@@ -153,6 +155,7 @@ if(SLAM_NATIVE_BUILD_APP)
     src/depth_sampling.cpp
     src/keyframe_depth.cpp
     src/depth_confidence.cpp
+    src/depth_filter.cpp
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp

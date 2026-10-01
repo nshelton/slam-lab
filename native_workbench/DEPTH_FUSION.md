@@ -77,7 +77,84 @@ the surface random-walks sideways (up to ~0.7 px per frame). The 4-neighbour,
 nearest-wins splat also grows the foreground. The slow, long sequences (fr2,
 fr3), where under 1 % of pixels are ever re-initialised, suffer most.
 
-**Next:** anchor the state to the keyframe, as LSD-SLAM does (Engel et al.
+**Keyframe-anchored version (built 2026-09-30, the current code).** The state
+stays in the anchor keyframe's pixels. Each frame samples the network map at
+the anchor pixels' projections (z-buffer visibility, bilinear except across
+edges) with an EKF row H = [J, 1]. The state is splatted once per keyframe
+(a nearer surface wins only the pixels whose centres it covers). Exact on the
+synthetic tests, with and without rotation (1e-7 / 1e-4). Further findings on
+fr1_desk:
+
+- **Geometry is right.** With TUM ground-truth depth as the measurement and
+  ground-truth poses (`fuse-truth-depth DIR fuse-gt SEQ`), the fused map is
+  within 0.012 of the truth (3 % of points over 10 %).
+- **VO units drift.** The keyframe's log metres per unit falls from 0.53 to
+  0.24 within 50 frames. A state in VO units goes stale against the poses,
+  and the bias absorbs it. The state is now in network metres; translations
+  are converted with a smoothed scale, and the grid only corrects the shape.
+- **Network maps alone still don't improve accuracy.** Median error is 0.065
+  with per-frame scale alignment (`fuse-align`) and 0.074 without, against
+  0.046 raw. With ground-truth poses, the earlier version scored 0.076.
+- **The network's error is mostly shared between consecutive keyframes**
+  (cell correlation 0.78 in image coordinates), so averaging maps can't
+  improve accuracy by much. Part of the error is fixed in the image rather
+  than tied to the surface: the top rows read 7–14 % too near and the lower
+  centre 3 % too far (`position_bias` on 224 keyframes). Fusing carries
+  values measured at one image position to another, which the
+  surface-attached bias model doesn't represent.
+
+**Correctness audit (2026-10-01, after trails and smearing in the app).** On
+fr1_desk with dumps of the fused state at each keyframe (`fuse-dump DIR`)
+next to the raw map. Four defects, all fixed:
+
+1. **Resampling** at re-anchoring and render took the nearest source's depth,
+   whose true position can be up to ~0.7 px from the target pixel. On slanted
+   surfaces that's a per-pixel error at every keyframe (speckle, compounding).
+   Now the depth is corrected along the local plane through the neighbours'
+   projections. Synthetic, turning: 3e-4 → 3e-7.
+2. **Gaps** under magnification let hidden surfaces show through. The splat
+   footprint now grows with the local spacing.
+3. **Measurement noise was modelled far too low.** After transport, network
+   maps differ by 0.054 median frame to frame; the model said 0.02–0.04. So
+   14 % of updates were gated, with hundreds of resets per frame: trails and
+   speckle. Now it's floored at each frame's measured innovation spread (MAD;
+   `adaptive_noise`). Gated 14 % → 3 %.
+4. **Per-pixel z/b split.** Network maps can't observe b, so each pixel split
+   innovations by its own history, and z came out 5× rougher than the raw
+   map. b's mean is no longer estimated (`estimate_bias` off): the mean is a
+   scalar filter's, and the covariance still carries b, so σ stays honest.
+
+Also: the anchor pose is refreshed from the VO's bundle-adjusted trajectory
+each frame (`set_anchor_pose`), and per-frame alignment is now off by default
+(with the fixes above it cost accuracy).
+
+| fr1_desk, 300 frames | Median error | > 10 % off | Roughness | Flicker vs raw |
+|---|---|---|---|---|
+| raw network | 0.050 | 27.8 % | 0.0038 | 1 |
+| fused before the audit | 0.077 | 39 % | 0.043 | 0.13 |
+| fused after | 0.053 | 28.4 % | 0.0030 | 0.41 |
+
+The earlier large flicker reductions were partly the bug: the state was
+frozen. Ground truth through the filter: ground-truth depth with ground-truth
+poses gives 0.011, and with VO poses 0.035. The remaining gap from VO poses is
+real pose and scale error on a fast sequence.
+
+**Full TUM after the audit** (whole sequences, default VO; median error of
+shown points / share more than 10 % off; flicker = fused / raw):
+
+| Sequence | Raw | Fused | Flicker | Fused, before the audit |
+|---|---|---|---|---|
+| fr1_desk | 0.047 / 24.7 % | 0.050 / 25.3 % | 0.44 | 0.065 / 32 % |
+| fr1_room | 0.057 / 28.4 % | 0.062 / 31.3 % | 0.46 | 0.069 / 36 % |
+| fr1_xyz | 0.033 / 15.1 % | 0.036 / 15.8 % | 0.55 | 0.041 / 20 % |
+| fr2_desk | 0.049 / 25.6 % | 0.049 / 26.0 % | 0.59 | 0.114 / 55 % |
+| fr3_long_office | 0.054 / 28.3 % | 0.055 / 28.8 % | 0.51 | 0.098 / 49 % |
+
+Accuracy is now at parity with raw (within 0.001–0.005), with half the
+flicker. As expected, network maps alone can't buy accuracy; that needs a
+geometric measurement (step 3).
+
+**Origin of the anchored design (done, see above):** anchor the state to the keyframe, as LSD-SLAM does (Engel et al.
 2014; semi-dense VO, ICCV 2013). Each new map is read by projecting keyframe
 pixels into the frame and sampling the measurement there (bilinear). The state
 is splatted into a new keyframe only at keyframe creation. Duplicates are

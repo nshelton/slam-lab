@@ -9,6 +9,7 @@
 #include "slam_native/optical_flow.hpp"
 #include "slam_native/color_sampler.hpp"
 #include "slam_native/depth_estimator.hpp"
+#include "slam_native/depth_filter.hpp"
 #include "slam_native/depth_sampling.hpp"
 #include "slam_native/keyframe_depth.hpp"
 #include "slam_native/focal_estimation.hpp"
@@ -38,6 +39,8 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <regex>
+#include <sstream>
 #include <stdexcept>
 #include <map>
 #include <string>
@@ -46,6 +49,25 @@
 
 namespace slam_native {
 namespace {
+// Intrinsics from a calibration.json next to the video (the TUM and KITTI
+// conversions write one: "fx", "fy", "cx", "cy" in source-video pixels).
+std::optional<CameraIntrinsics> read_calibration(const std::filesystem::path& video) {
+  std::ifstream in(video.parent_path() / "calibration.json");
+  if (!in) return std::nullopt;
+  std::stringstream text;
+  text << in.rdbuf();
+  const std::string json = text.str();
+  const auto number = [&](const char* key) -> std::optional<double> {
+    std::smatch match;
+    if (!std::regex_search(json, match, std::regex(std::string("\"") + key + "\"\\s*:\\s*([-+0-9.eE]+)")))
+      return std::nullopt;
+    return std::stod(match[1]);
+  };
+  const auto fx = number("fx"), fy = number("fy"), cx = number("cx"), cy = number("cy");
+  if (!fx || !fy || !cx || !cy || *fx <= 0 || *fy <= 0) return std::nullopt;
+  return CameraIntrinsics{*fx, *fy, *cx, *cy};
+}
+
 
 using Clock = std::chrono::steady_clock;
 
@@ -127,10 +149,37 @@ struct Runtime {
   int depth_texture_width{};
   int depth_texture_height{};
   float depth_near{}, depth_far{};  // colour range (2nd / 98th percentile)
+  // Depth fusion (DEPTH_FUSION.md): the filter runs on frames that have a
+  // depth map and a pose; the window shows its state rendered into the latest
+  // such frame.
+  struct Fusion {
+    bool show{true};
+    bool enabled{true};      // also the source of the keyframe depth clouds (fused instead of raw)
+    int view{};              // index into kFusionViews
+    bool overlay{};
+    float opacity{0.6F};
+    std::string status;      // why it is not running
+    DepthFilterStats stats;
+    double ms{};
+    DepthFilterView fused;   // rendered into the frame of `raw`
+    DepthMap raw;            // that frame's network map
+    bool dirty{};
+    int uploaded_view{-1};
+    unsigned int texture{};
+    int texture_width{}, texture_height{};
+    float near{}, far{};     // depth colour range (2nd / 98th percentile of the raw map)
+    int keyframes_fused{}, keyframes_raw{};  // keyframe clouds built from each
+  } fusion;
   OdometryFrameResult odometry;
   int relocalizations{};             // since the odometry was (re)created
   int loops_closed{};
   std::string last_loop;             // its event text
+  // Global (appearance) loop search, same span: keyframes searched, their
+  // total matching time, verified poses, and the latest search's result.
+  int global_searches{}, global_verified{};
+  double global_total_ms{};
+  OdometryFrameResult last_global;
+  std::string intrinsics_source;     // "calibration.json", "--intrinsics" or empty (hfov guess)
   std::size_t reassociations{};      // landmarks re-found by new tracks, same span
   std::string last_relocalization;   // its event text
   bool export_requested{};
@@ -300,6 +349,8 @@ void draw_sidebar(Runtime& runtime,
   ImGui::Checkbox("Trajectory", &runtime.show_trajectory);
   ImGui::SameLine();
   ImGui::Checkbox("Lens", &runtime.show_fov);
+  ImGui::SameLine();
+  ImGui::Checkbox("Depth fusion", &runtime.fusion.show);
   ImGui::Separator();
   ImGui::Text("Codec: %s", decoder.codec_name().c_str());
   ImGui::Text("Nominal FPS: %.2f", decoder.nominal_fps());
@@ -330,11 +381,24 @@ void draw_sidebar(Runtime& runtime,
   if (runtime.odometry.has_pose) {
     ImGui::Text("Pose inliers: %d / %d", runtime.odometry.inliers, runtime.odometry.correspondences);
   }
+  if (!runtime.intrinsics_source.empty()) ImGui::TextDisabled("Intrinsics: %s", runtime.intrinsics_source.c_str());
   ImGui::Text("Relocalized: %d   Loops closed: %d", runtime.relocalizations, runtime.loops_closed);
   if (ImGui::IsItemHovered() && !(runtime.last_relocalization.empty() && runtime.last_loop.empty()))
     ImGui::SetTooltip("Last relocalization: %s\nLast loop closure: %s",
                       runtime.last_relocalization.empty() ? "-" : runtime.last_relocalization.c_str(),
                       runtime.last_loop.empty() ? "-" : runtime.last_loop.c_str());
+  if (runtime.global_searches > 0) {
+    const auto& g = runtime.last_global;
+    ImGui::Text("Global search: %d, %d verified, %.0f ms avg", runtime.global_searches, runtime.global_verified,
+                runtime.global_total_ms / runtime.global_searches);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Appearance search at each keyframe: its descriptors against every older landmark\n"
+                        "(brute force), then P3P RANSAC. Last, frame %llu:\n"
+                        "  %d queries x %d landmarks, %d matches, %d P3P inliers, %.1f ms%s",
+                        static_cast<unsigned long long>(g.frame_index), g.global_queries, g.global_database,
+                        g.global_matches, g.global_pose_inliers, g.global_match_ms,
+                        g.global_found ? ", verified" : "");
+  }
   ImGui::Text("Untracked in view: %zu, re-found %d (%zu)",
               runtime.odometry.untracked_landmarks.size(), runtime.odometry.reassociated,
               runtime.reassociations);
@@ -751,6 +815,202 @@ void upload_depth_texture(Runtime& runtime) {
   }
 }
 
+constexpr const char* kFusionViews[] = {"Fused depth", "Raw network depth", "Consistency (sigma of z+b)",
+                                        "Uncertainty (sigma of z)", "Fused - raw", "Observations"};
+
+// Colours the selected fusion view into runtime.fusion.texture (transparent where empty).
+void upload_fusion_texture(Runtime::Fusion& f) {
+  const DepthFilterView& fused = f.fused;
+  const DepthMap& raw = f.raw;
+  const std::size_t n = static_cast<std::size_t>(fused.width) * static_cast<std::size_t>(fused.height);
+  if (n == 0 || raw.metres.size() != n) return;
+  std::vector<float> valid;
+  for (std::size_t i = 0; i < n; i += 7)
+    if (raw.metres[i] > 0) valid.push_back(raw.metres[i]);
+  if (!valid.empty()) {
+    const auto percentile = [&](double q) {
+      auto at = valid.begin() + static_cast<std::ptrdiff_t>(q * (valid.size() - 1));
+      std::nth_element(valid.begin(), at, valid.end());
+      return *at;
+    };
+    f.near = std::max(0.05F, percentile(0.02));
+    f.far = std::max(f.near * 1.01F, percentile(0.98));
+  }
+  const float log_near = std::log(std::max(0.05F, f.near));
+  const float inv_range = 1.0F / std::max(1e-3F, std::log(std::max(f.far, f.near * 1.01F)) - log_near);
+  // Sigma views: log scale from 0.5 % (blue, consistent) to 30 % (red).
+  const float sigma_lo = std::log(0.005F), sigma_inv = 1.0F / (std::log(0.3F) - sigma_lo);
+  std::vector<std::uint8_t> rgba(n * 4, 0);
+  for (std::size_t i = 0; i < n; ++i) {
+    float t = -1;
+    switch (f.view) {
+      case 0: if (fused.metres[i] > 0) t = 1.0F - (std::log(fused.metres[i]) - log_near) * inv_range; break;
+      case 1: if (raw.metres[i] > 0) t = 1.0F - (std::log(raw.metres[i]) - log_near) * inv_range; break;
+      case 2: if (fused.consistency[i] > 0) t = (std::log(fused.consistency[i]) - sigma_lo) * sigma_inv; break;
+      case 3: if (fused.sigma[i] > 0) t = (std::log(fused.sigma[i]) - sigma_lo) * sigma_inv; break;
+      case 4:  // +-15 % around green
+        if (fused.metres[i] > 0 && raw.metres[i] > 0) t = 0.5F + std::log(fused.metres[i] / raw.metres[i]) / 0.3F;
+        break;
+      case 5: if (fused.observations[i] > 0) t = std::log1p(static_cast<float>(fused.observations[i])) / std::log1p(100.0F); break;
+      default: break;
+    }
+    // Fused depth: pixels the anchor keyframe never saw show the raw map, dimmed.
+    bool dim = false;
+    if (f.view == 0 && t < 0 && raw.metres[i] > 0) {
+      t = 1.0F - (std::log(raw.metres[i]) - log_near) * inv_range;
+      dim = true;
+    }
+    if (t < 0 && !(f.view == 4 && fused.metres[i] > 0 && raw.metres[i] > 0)) continue;
+    auto rgb = turbo(t);
+    if (dim)
+      for (auto& c : rgb) c = static_cast<std::uint8_t>(c / 3);
+    std::copy(rgb.begin(), rgb.end(), rgba.begin() + static_cast<std::ptrdiff_t>(i * 4));
+    rgba[i * 4 + 3] = 255;
+  }
+  if (!f.texture) {
+    glGenTextures(1, &f.texture);
+    glBindTexture(GL_TEXTURE_2D, f.texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  }
+  glBindTexture(GL_TEXTURE_2D, f.texture);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  if (f.texture_width != fused.width || f.texture_height != fused.height) {
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, fused.width, fused.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    f.texture_width = fused.width;
+    f.texture_height = fused.height;
+  } else {
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, fused.width, fused.height, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+  }
+}
+
+void draw_fusion(Runtime& runtime) {
+  auto& f = runtime.fusion;
+  if (!f.show) return;
+  ImGui::SetNextWindowPos({700, 300}, ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize({720, 440}, ImGuiCond_FirstUseEver);
+  if (!ImGui::Begin("Depth fusion", &f.show)) {
+    ImGui::End();
+    return;
+  }
+  ImGui::Checkbox("Run fusion", &f.enabled);
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("Per-pixel depth filter (DEPTH_FUSION.md): each network depth map is fused into a state\n"
+                      "anchored to the current keyframe, using the camera pose. CPU, ~40 ms per map.\n"
+                      "While on, keyframe depth clouds are built from the fused map instead of the raw one.");
+  ImGui::SameLine();
+  ImGui::TextDisabled("keyframe clouds: %d fused, %d raw", f.keyframes_fused, f.keyframes_raw);
+  if (runtime.depth_model < 0) {
+    ImGui::TextDisabled("Pick a depth model in the Depth window first.");
+  } else if (!f.enabled) {
+    ImGui::TextDisabled("Off.");
+  } else if (!f.status.empty()) {
+    ImGui::TextDisabled("%s", f.status.c_str());
+  }
+  const DepthFilterStats& st = f.stats;
+  if (f.fused.width > 0) {
+    ImGui::Text("Frame %llu (video at %llu), anchor keyframe %llu, %.1f ms",
+                static_cast<unsigned long long>(f.raw.frame_index), static_cast<unsigned long long>(runtime.frame_index),
+                static_cast<unsigned long long>(f.fused.frame_index), f.ms);
+    const double updates = std::max(1, st.updated + st.gated);
+    ImGui::Text("Valid %d px, gated %.1f%%, resets %d, occluded %d%s", st.valid, 100.0 * st.gated / updates, st.resets,
+                st.occluded, st.reanchored ? ", re-anchored" : "");
+    if (st.flicker_pixels > 0)
+      ImGui::Text("Flicker (median |d log z|): raw %.4f, fused %.4f", st.flicker_raw, st.flicker_fused);
+  }
+  ImGui::SetNextItemWidth(230);
+  if (ImGui::BeginCombo("View", kFusionViews[f.view])) {
+    for (int i = 0; i < static_cast<int>(std::size(kFusionViews)); ++i)
+      if (ImGui::Selectable(kFusionViews[i], f.view == i)) f.view = i;
+    ImGui::EndCombo();
+  }
+  ImGui::SameLine();
+  ImGui::Checkbox("Overlay on video", &f.overlay);
+  if (f.overlay) {
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(100);
+    ImGui::SliderFloat("##opacity", &f.opacity, 0.0F, 1.0F, "%.2f");
+  }
+  switch (f.view) {
+    case 0: ImGui::TextDisabled("Log depth: red %.2f m ... blue %.2f m (dimmed: raw, outside the keyframe's view)", f.near, f.far); break;
+    case 1: ImGui::TextDisabled("Log depth: red %.2f m ... blue %.2f m", f.near, f.far); break;
+    case 2: ImGui::TextDisabled("How well successive maps agree: blue 0.5 %% ... red 30 %%"); break;
+    case 3: ImGui::TextDisabled("Includes the network's shared bias (only geometry reduces it): blue 0.5 %% ... red 30 %%"); break;
+    case 4: ImGui::TextDisabled("log(fused / raw): blue -15 %% ... green 0 ... red +15 %%"); break;
+    case 5: ImGui::TextDisabled("Maps fused per pixel: blue 1 ... red 100"); break;
+    default: break;
+  }
+  if (f.dirty || f.uploaded_view != f.view) {
+    upload_fusion_texture(f);
+    f.dirty = false;
+    f.uploaded_view = f.view;
+  }
+  if (!f.texture || f.fused.width == 0 || f.raw.metres.empty()) {
+    ImGui::End();
+    return;
+  }
+  // Depth content: the upright frame inside the letterboxed output grid.
+  const DepthMap& geometry = f.raw;
+  const bool sideways = geometry.rotation == 90 || geometry.rotation == 270;
+  const float upright_width = static_cast<float>(sideways ? geometry.source_height : geometry.source_width);
+  const float upright_height = static_cast<float>(sideways ? geometry.source_width : geometry.source_height);
+  const ImVec2 uv0(geometry.offset_x / geometry.width, geometry.offset_y / geometry.height);
+  const ImVec2 uv1((geometry.offset_x + upright_width * geometry.scale_x) / geometry.width,
+                   (geometry.offset_y + upright_height * geometry.scale_y) / geometry.height);
+  const ImVec2 available = ImGui::GetContentRegionAvail();
+  const float panels = f.overlay ? 1.0F : 2.0F;
+  const float gap = f.overlay ? 0.0F : 6.0F;
+  const float scale = std::max(0.01F, std::min((available.x - gap) / (panels * upright_width), available.y / upright_height));
+  const ImVec2 size(upright_width * scale, upright_height * scale);
+  const ImVec2 origin = ImGui::GetCursorScreenPos();
+  ImDrawList* draw = ImGui::GetWindowDrawList();
+  // The video frame (current, so it may lead the fused frame by a frame or two).
+  if (runtime.texture && runtime.frame_width > 0) {
+    const ImVec2 corners[4] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+    const int first = (4 - runtime.display_rotation / 90) % 4;
+    draw->AddImageQuad(static_cast<ImTextureID>(runtime.texture), origin, {origin.x + size.x, origin.y},
+                       {origin.x + size.x, origin.y + size.y}, {origin.x, origin.y + size.y}, corners[first],
+                       corners[(first + 1) % 4], corners[(first + 2) % 4], corners[(first + 3) % 4]);
+  }
+  const ImVec2 depth_origin = f.overlay ? origin : ImVec2(origin.x + size.x + gap, origin.y);
+  const auto alpha = static_cast<int>(std::clamp(f.overlay ? f.opacity : 1.0F, 0.0F, 1.0F) * 255.0F);
+  draw->AddImage(static_cast<ImTextureID>(f.texture), depth_origin, {depth_origin.x + size.x, depth_origin.y + size.y},
+                 uv0, uv1, IM_COL32(255, 255, 255, alpha));
+  ImGui::InvisibleButton("##fusion-image", {f.overlay ? size.x : 2 * size.x + gap, size.y});
+  if (ImGui::IsItemHovered()) {
+    ImVec2 mouse = ImGui::GetMousePos();
+    if (!f.overlay && mouse.x >= depth_origin.x) mouse.x -= size.x + gap;  // either panel
+    const float u = uv0.x + (uv1.x - uv0.x) * (mouse.x - origin.x) / size.x;
+    const float v = uv0.y + (uv1.y - uv0.y) * (mouse.y - origin.y) / size.y;
+    const int x = std::clamp(static_cast<int>(u * f.fused.width), 0, f.fused.width - 1);
+    const int y = std::clamp(static_cast<int>(v * f.fused.height), 0, f.fused.height - 1);
+    const std::size_t i = static_cast<std::size_t>(y) * f.fused.width + x;
+    const float fused = f.fused.metres[i], raw = f.raw.metres[i];
+    if (fused > 0)
+      ImGui::SetTooltip("fused %.3f m   raw %.3f m (%+.1f%%)\nconsistency %.1f%%   uncertainty %.1f%%\nbias %+.1f%%   maps %d",
+                        fused, raw, raw > 0 ? 100.0 * (fused / raw - 1) : 0.0, 100.0 * f.fused.consistency[i],
+                        100.0 * f.fused.sigma[i], 100.0 * f.fused.bias[i], f.fused.observations[i]);
+    else
+      ImGui::SetTooltip("no fused depth   raw %.3f m", raw);
+  }
+  ImGui::End();
+}
+
+// The current (bundle-adjusted) pose of a recent frame; nullopt if it has none.
+std::optional<Pose> current_pose(const VisualOdometry& odometry, std::uint64_t frame_index) {
+  const std::size_t n = odometry.trajectory_size();
+  for (const std::size_t back : {std::size_t{64}, n}) {
+    const auto samples = odometry.trajectory(n > back ? n - back : 0);
+    const auto it = std::lower_bound(samples.begin(), samples.end(), frame_index,
+                                     [](const TrajectorySample& s, std::uint64_t f) { return s.frame_index < f; });
+    if (it != samples.end() && it->frame_index == frame_index) return it->pose;
+    if (back >= n || (!samples.empty() && samples.front().frame_index <= frame_index)) break;
+  }
+  return std::nullopt;
+}
+
 void draw_depth(Runtime& runtime) {
   if (!runtime.show_depth) return;
   ImGui::SetNextWindowPos({1090, 8}, ImGuiCond_FirstUseEver);
@@ -829,6 +1089,12 @@ struct Session {
                        config.superpoint.input_height, config.superpoint.max_keypoints,
                        config.superpoint.detection_threshold);
     flow_tracker = std::make_unique<FlowTracker>(config.flow_tracker);
+    if (config.odometry.intrinsics) {
+      runtime.intrinsics_source = "--intrinsics";
+    } else if (auto calibration = read_calibration(config.video)) {
+      config.odometry.intrinsics = calibration;
+      runtime.intrinsics_source = "calibration.json";
+    }
     odometry = std::make_unique<VisualOdometry>(config.odometry);
     trajectory_view.set_depth_store(&keyframe_depth);
     next_cache_index = static_cast<std::uint64_t>(store->last_frame_index() + 1);
@@ -894,6 +1160,8 @@ struct Session {
     runtime.relocalizations = 0;
     runtime.loops_closed = 0;
     runtime.last_loop.clear();
+    runtime.global_searches = runtime.global_verified = 0;
+    runtime.global_total_ms = 0;
     runtime.reassociations = 0;
     runtime.last_relocalization.clear();
     runtime.trails.clear();
@@ -1035,6 +1303,12 @@ struct Session {
     }
     const auto& r = runtime.odometry;
     for (const auto& [frame, factor] : r.keyframe_scale_changes) keyframe_depth.rescale(frame, factor);
+    if (r.global_search) {
+      ++runtime.global_searches;
+      runtime.global_verified += r.global_found;
+      runtime.global_total_ms += r.global_match_ms;
+      runtime.last_global = r;
+    }
     if (r.loop_closed) {
       ++runtime.loops_closed;
       runtime.last_loop = "frame " + std::to_string(r.frame_index) + ": " + r.event;
@@ -1042,6 +1316,9 @@ struct Session {
     if (r.settled_keyframe >= 0)  // that keyframe's scale from its final geometry
       keyframe_depth.settle(static_cast<std::uint64_t>(r.settled_keyframe), r.settled_log_scale,
                             r.settled_scale_grid_valid ? &r.settled_scale_grid : nullptr);
+    // Depth fusion first: at a keyframe the filter re-anchors there, and its
+    // state becomes the keyframe's (fused) depth map for the cloud.
+    if (map) run_fusion(tracked, *map, r);
     if (map && r.keyframe && r.has_pose) {
       // Local scale: this keyframe's own grid/estimate (the VO's scale drifts
       // within a segment), else the segment's filtered one, else unknown.
@@ -1063,10 +1340,86 @@ struct Session {
         if (it == samples.end() || it->frame_index != frame) return std::nullopt;
         return it->pose;
       };
-      keyframe_depth.add(input, *map, grid_colors, K, config.odometry.distortion_k1, pose_of);
+      // Fused when the filter is anchored at this keyframe; the grid shape it
+      // puts back is the one the store removes again.
+      DepthMap fused;
+      const bool use_fused = runtime.fusion.enabled && !depth_filter.empty() && depth_filter.frame_index() == r.frame_index;
+      if (use_fused) fused = depth_filter.to_depth_map(input.log_scale, input.grid);
+      keyframe_depth.add(input, use_fused ? fused : *map, grid_colors, K, config.odometry.distortion_k1, pose_of);
+      runtime.fusion.keyframes_fused += use_fused;
+      runtime.fusion.keyframes_raw += !use_fused;
     }
     trajectory_view.update(*odometry);
     focal.add(tracked);  // background thread
+  }
+
+  // Depth fusion on a frame with its depth map (DEPTH_FUSION.md). Network
+  // maps are converted with the latest keyframe's scale; the filter's own
+  // sigma model learns the raw network's error at keyframes.
+  void run_fusion(const TrackedFrame& tracked, const DepthMap& map, const OdometryFrameResult& r) {
+    auto& f = runtime.fusion;
+    if (!f.enabled) {
+      if (!depth_filter.empty()) depth_filter.clear();
+      return;
+    }
+    const float max_metres = depth ? depth->spec().max_depth_m : 0.0F;
+    if (depth_filter.config().max_metres != max_metres) {
+      DepthFilterConfig filter_config;
+      filter_config.max_metres = max_metres;
+      depth_filter = DepthFilter(filter_config);
+    }
+    if (r.segment != fusion_segment) {
+      fusion_log_scale = std::numeric_limits<double>::quiet_NaN();
+      fusion_has_grid = false;
+      fusion_segment = r.segment;
+    }
+    if (r.keyframe && r.has_pose && std::isfinite(r.keyframe_log_scale)) {
+      fusion_log_scale = r.keyframe_log_scale;
+      fusion_has_grid = r.keyframe_scale_grid_valid;
+      if (fusion_has_grid) fusion_grid = r.keyframe_scale_grid;
+      add_depth_references(fusion_sigma_model, map, depth_references(*odometry, tracked, r.pose), r.keyframe_log_scale,
+                           fusion_has_grid ? &fusion_grid : nullptr);
+      fusion_sigma_model.fit(4);
+    }
+    // Loop corrections move past poses and units: start over.
+    if (!r.has_pose || r.relocalized || r.loop_closed || !std::isfinite(fusion_log_scale)) {
+      depth_filter.clear();
+      f.status = !r.has_pose ? "Waiting for a camera pose." :
+                 !std::isfinite(fusion_log_scale) ? "Waiting for the first keyframe's depth scale." :
+                 "Restarted after a relocalisation or loop closure.";
+      return;
+    }
+    f.status.clear();
+    const auto t0 = Clock::now();
+    std::vector<float> sigma_map;
+    if (fusion_sigma_model.fitted()) {
+      std::vector<Keypoint> landmarks;  // the nearest_landmark cue
+      for (const auto& o : tracked.observations)
+        if (odometry->has_landmark(o.track_id)) landmarks.push_back({o.x, o.y, 0});
+      sigma_map = network_sigma_map(map, fusion_sigma_model, landmarks);
+    }
+    DepthFilterFrame input;
+    input.depth = &map;
+    input.pose = r.pose;
+    input.segment = r.segment;
+    input.keyframe = r.keyframe;
+    input.K = config.odometry.intrinsics ? *config.odometry.intrinsics :
+        CameraIntrinsics::from_horizontal_fov(tracked.width, tracked.height, config.odometry.horizontal_fov_degrees);
+    input.k1 = config.odometry.distortion_k1;
+    input.log_scale = fusion_log_scale;
+    input.grid = fusion_has_grid ? &fusion_grid : nullptr;
+    input.sigma = sigma_map.empty() ? nullptr : &sigma_map;
+    input.rotation_sigma_degrees = r.rotation_sigma_degrees;
+    input.translation_sigma_ratio = r.translation_sigma_ratio;
+    // The anchor keyframe's pose as the VO has refined it since (bundle
+    // adjustment): the frame's pose is relative to the refined map.
+    if (!depth_filter.empty())
+      if (const auto anchor = current_pose(*odometry, depth_filter.frame_index())) depth_filter.set_anchor_pose(*anchor);
+    f.stats = depth_filter.process(input);
+    depth_filter.render(r.pose, f.fused);
+    f.raw = map;
+    f.ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    f.dirty = true;
   }
 
   // Runs the VO on queued frames whose depth has arrived (or was never
@@ -1086,6 +1439,11 @@ struct Session {
     pending.clear();
     depth_maps.clear();
     keyframe_depth.clear();
+    depth_filter.clear();
+    runtime.fusion.fused = {};
+    runtime.fusion.raw = {};
+    runtime.fusion.keyframes_fused = runtime.fusion.keyframes_raw = 0;
+    runtime.fusion.dirty = true;
   }
 
   // (Re)creates the depth engine for the selected model and display
@@ -1137,6 +1495,7 @@ struct Session {
   // Restart the camera pose from the current frame with a new lens model.
   void apply_lens(const LensChoice& lens) {
     config.odometry.intrinsics.reset();
+    runtime.intrinsics_source.clear();
     config.odometry.horizontal_fov_degrees = lens.hfov_degrees;
     config.odometry.distortion_k1 = lens.k1;
     odometry = std::make_unique<VisualOdometry>(config.odometry);
@@ -1146,6 +1505,8 @@ struct Session {
     runtime.relocalizations = 0;
     runtime.loops_closed = 0;
     runtime.last_loop.clear();
+    runtime.global_searches = runtime.global_verified = 0;
+    runtime.global_total_ms = 0;
     runtime.reassociations = 0;
     runtime.last_relocalization.clear();
   }
@@ -1205,6 +1566,12 @@ struct Session {
   std::deque<PendingFrame> pending;
   std::map<std::uint64_t, DepthMap> depth_maps;  // recent finished maps by frame index
   KeyframeDepthStore keyframe_depth;
+  DepthFilter depth_filter;                  // depth fusion (Runtime::fusion)
+  DepthConfidenceModel fusion_sigma_model;   // the raw network's error, for the filter
+  double fusion_log_scale{std::numeric_limits<double>::quiet_NaN()};
+  bool fusion_has_grid{};
+  ScaleGrid fusion_grid{};
+  int fusion_segment{-1};
   TrajectoryView trajectory_view;
   ColorSampler color_sampler;
   BackgroundFocalEstimator focal;
@@ -1277,6 +1644,7 @@ int run_app(const AppConfig& config) {
                  session->decoder->start_time_ns());
       if (session->flow_tracker) draw_flow_diagnostics(session->runtime, *session->flow_tracker);
       draw_depth(session->runtime);
+      draw_fusion(session->runtime);
       if (session->odometry) {
         session->trajectory_view.set_display_rotation(session->runtime.display_rotation);
         session->trajectory_view.draw(*session->odometry, &session->runtime.show_trajectory,

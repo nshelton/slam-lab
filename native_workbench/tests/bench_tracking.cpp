@@ -45,6 +45,21 @@ float nearest(const std::vector<Keypoint>& points, float x, float y) {
 }
 }  // namespace
 
+namespace {
+// The current (bundle-adjusted) pose of a recent frame; nullopt if it has none.
+std::optional<Pose> current_pose(const VisualOdometry& odometry, std::uint64_t frame_index) {
+  const std::size_t n = odometry.trajectory_size();
+  for (const std::size_t back : {std::size_t{64}, n}) {
+    const auto samples = odometry.trajectory(n > back ? n - back : 0);
+    const auto it = std::lower_bound(samples.begin(), samples.end(), frame_index,
+                                     [](const TrajectorySample& s, std::uint64_t f) { return s.frame_index < f; });
+    if (it != samples.end() && it->frame_index == frame_index) return it->pose;
+    if (back >= n || (!samples.empty() && samples.front().frame_index <= frame_index)) break;
+  }
+  return std::nullopt;
+}
+}  // namespace
+
 int main(int argc, char** argv) {
   if (argc < 3) {
     std::cerr << "usage: slam-native-tracking-bench VIDEO ENGINE [START_SECONDS] [FRAMES]\n";
@@ -60,11 +75,15 @@ int main(int argc, char** argv) {
     OpticalFlowConfig flow_config;
     SuperPointConfig sp_config;
     std::string export_tracks, export_trajectory, export_map, export_features, depth_model, export_keyframe_depth;
+    bool gba_on_loop = false;  // full global bundle adjustment after every loop correction
     std::string export_clouds;
     DepthSamplingConfig depth_sampling;
     bool dense_clouds = false;
-    bool fuse_depth = false;
+    int fuse_depth = -1;  // -1: with dense 1 (keyframe clouds from the fused map, as the app); 0 off; 1 on
     std::string fuse_gt;    // TUM sequence dir: the filter uses ground-truth poses (metric) instead of the VO's
+    std::string fuse_log;  // per-frame filter stats CSV
+    std::string fuse_dump;  // DIR/<frame>.fused.f32 and .raw.f32 (output grid, metres) at re-anchored frames
+    std::string fuse_truth_depth;  // DIR/<frame>.f32 ground-truth depth (source size, metres): the filter's measurement
     bool fuse_grid = true;  // convert network maps with the keyframe's scale grid (else its single scale)
     DepthFilterConfig filter_config;
     KeyframeDepthStore keyframe_depth;
@@ -91,12 +110,21 @@ int main(int argc, char** argv) {
       if (key == "export-clouds") { export_clouds = argv[a + 1]; continue; }
       // Temporal depth fusion (DEPTH_FUSION.md): a per-pixel filter carried with the VO pose;
       // with dense 1 the keyframe clouds are snapshots of the fused map instead of the raw network.
-      if (key == "fuse-depth") { fuse_depth = std::stof(argv[a + 1]) != 0; continue; }
+      if (key == "fuse-depth") { fuse_depth = std::stof(argv[a + 1]) != 0 ? 1 : 0; continue; }
       if (key == "fuse-drift") { filter_config.drift_sigma = std::stod(argv[a + 1]); continue; }
       if (key == "fuse-bias-frames") { filter_config.bias_correlation_frames = std::stod(argv[a + 1]); continue; }
       if (key == "fuse-independent") { filter_config.independent_fraction = std::stod(argv[a + 1]); continue; }
+      if (key == "fuse-dump") { fuse_dump = argv[a + 1]; continue; }
+      if (key == "fuse-log") { fuse_log = argv[a + 1]; continue; }
+      if (key == "fuse-truth-depth") { fuse_truth_depth = argv[a + 1]; continue; }
       if (key == "fuse-gt") { fuse_gt = argv[a + 1]; continue; }
+      if (key == "fuse-align") { filter_config.align_frames = std::stof(argv[a + 1]) != 0; continue; }
       if (key == "fuse-grid") { fuse_grid = std::stof(argv[a + 1]) != 0; continue; }
+      if (key == "fuse-scale-sigma") { filter_config.scale_sigma = std::stod(argv[a + 1]); continue; }
+      if (key == "fuse-splat-tol") { filter_config.splat_tolerance = std::stof(argv[a + 1]); continue; }
+      if (key == "fuse-vis-tol") { filter_config.visibility_tolerance = std::stof(argv[a + 1]); continue; }
+      if (key == "fuse-adaptive") { filter_config.adaptive_noise = std::stof(argv[a + 1]) != 0; continue; }
+      if (key == "fuse-pointing") { filter_config.min_pointing_sigma_px = std::stod(argv[a + 1]); continue; }
       if (key == "fuse-gate") { filter_config.gate_sigmas = std::stod(argv[a + 1]); continue; }
       // Multi-view check tolerance: 0 fixed 6 % (default), 1 adaptive (between-view model).
       // dense-adaptive 2: adaptive but never looser than the fixed tolerance (tightening only).
@@ -121,11 +149,21 @@ int main(int argc, char** argv) {
       // Loop closure on/off, and solving it synchronously (deterministic) vs on a worker.
       if (key == "loop") { vo_config.loop_closure = value != 0; continue; }
       if (key == "loop-sync") { vo_config.loop_synchronous = value != 0; continue; }
+      if (key == "global-spread") { vo_config.loop_global_scale_spread = value; continue; }
+      if (key == "global-pairs") { vo_config.loop_global_min_pairs = static_cast<int>(value); continue; }
+      if (key == "loop-ba") { vo_config.loop_bundle_iterations = static_cast<int>(value); continue; }
+      if (key == "gba-on-loop") { gba_on_loop = value != 0; continue; }
+      if (key == "loop-global") { vo_config.loop_global_search = value != 0; continue; }
+      if (key == "loop-global-interval") { vo_config.loop_global_interval_frames = static_cast<int>(value); continue; }
       if (key == "reassoc") { vo_config.reassociation = value != 0; continue; }
       if (key == "reassoc-radius") { vo_config.reassociation_radius_px = value; continue; }
       if (key == "merge") { vo_config.merge_landmarks = value != 0; continue; }
       if (key == "dormant") { vo_config.dormant_max_frames = static_cast<int>(value); continue; }
       if (key == "kf-min") { vo_config.keyframe_min_interval = static_cast<int>(value); continue; }
+      if (key == "kf-emergency-ratio") { vo_config.keyframe_emergency_ratio = value; continue; }
+      if (key == "kf-emergency-points") { vo_config.keyframe_emergency_points = static_cast<int>(value); continue; }
+      if (key == "window") { vo_config.window_keyframes = static_cast<int>(value); continue; }
+      if (key == "kf-max") { vo_config.keyframe_max_interval = static_cast<int>(value); continue; }
       if (key == "radius") config.association_radius = value;
       else if (key == "min-sim") config.min_descriptor_similarity = value;
       else if (key == "weight") config.descriptor_weight = value;
@@ -155,7 +193,7 @@ int main(int argc, char** argv) {
     int filter_scale_segment = -1;
     struct FilterTotals {
       std::size_t frames{}, clears{}, valid{}, initialised{}, updated{}, gated{}, resets{};
-      double flicker_raw{}, flicker_fused{}, sigma{}, sum_sigma{}, ms{};
+      double flicker_raw{}, flicker_fused{}, sigma{}, sum_sigma{}, ms{}, offset{}, noise{};
       std::size_t flicker_frames{};
     } filter_totals;
     // fuse-gt: frame index -> world->camera pose (nearest ground truth within 20 ms).
@@ -198,6 +236,12 @@ int main(int argc, char** argv) {
       }
       std::printf("fuse-gt: %zu frames with ground-truth poses\n", truth_poses.size());
     }
+    std::ofstream fuse_log_out;
+    if (!fuse_log.empty()) {
+      fuse_log_out.open(fuse_log);
+      fuse_log_out << "frame,keyframe,reanchored,valid,initialised,updated,occluded,gated,resets,offset,flicker_raw,"
+                      "flicker_fused,sigma,log_scale,kf_log_scale\n";
+    }
     std::optional<DepthMap> fused_map;  // this frame's fused map in metres (for the keyframe clouds)
     std::size_t depth_samples = 0, depth_valid = 0, depth_edges = 0;
     if (!depth_model.empty()) {
@@ -233,6 +277,10 @@ int main(int argc, char** argv) {
     std::vector<float> untracked_nearest, random_nearest, tracked_landmark_nearest;
     std::mt19937 untracked_rng(1);
     double vo_ms = 0, vo_max_ms = 0;
+    // Appearance (global) loop search: the brute-force baseline's cost and yield.
+    int global_searches = 0, global_found = 0, global_loops = 0;
+    double global_ms = 0, global_max_ms = 0, global_database = 0, global_matches = 0;
+    std::vector<float> global_inliers;
     std::vector<float> vo_inlier_ratio, vo_reprojection;
 
     std::unordered_map<std::uint64_t, std::uint64_t> length;                // id -> observations
@@ -294,8 +342,9 @@ int main(int argc, char** argv) {
         write_tracks(tracks_out, tracked, columns);
       }
       const auto pose = odometry.process(tracked);
+      if (gba_on_loop && pose.loop_closed) odometry.global_bundle_adjust();
       fused_map.reset();
-      if (fuse_depth && !frame_depth.empty()) {
+      if ((fuse_depth == 1 || (fuse_depth < 0 && dense_clouds)) && !frame_depth.empty()) {
         if (pose.segment != filter_scale_segment) {
           filter_log_scale = std::numeric_limits<double>::quiet_NaN();
           filter_has_grid = false;
@@ -334,10 +383,36 @@ int main(int argc, char** argv) {
               if (odometry.has_landmark(o.track_id)) landmarks.push_back({o.x, o.y, 0});
             sigma_map = network_sigma_map(frame_depth, filter_sigma_model, landmarks);
           }
+          // fuse-truth-depth: ground truth sampled on the network's grid (nearest source pixel).
+          DepthMap truth_map;
+          if (!fuse_truth_depth.empty()) {
+            truth_map = frame_depth;
+            std::fill(truth_map.metres.begin(), truth_map.metres.end(), 0.0F);
+            std::ifstream in(std::filesystem::path(fuse_truth_depth) / (std::to_string(pose.frame_index) + ".f32"),
+                             std::ios::binary);
+            std::vector<float> truth(static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height));
+            if (in.read(reinterpret_cast<char*>(truth.data()), static_cast<std::streamsize>(truth.size() * sizeof(float))))
+              for (int v = 0; v < truth_map.height; ++v)
+                for (int u = 0; u < truth_map.width; ++u) {
+                  // Inverse of DepthMap::to_output.
+                  const float ux = (u + 0.5F - truth_map.offset_x) / truth_map.scale_x;
+                  const float uy = (v + 0.5F - truth_map.offset_y) / truth_map.scale_y;
+                  const auto w = static_cast<float>(truth_map.source_width), h = static_cast<float>(truth_map.source_height);
+                  float cx = ux, cy = uy;
+                  if (truth_map.rotation == 90) { cx = uy; cy = h - ux; }
+                  else if (truth_map.rotation == 180) { cx = w - ux; cy = h - uy; }
+                  else if (truth_map.rotation == 270) { cx = w - uy; cy = ux; }
+                  const int x = static_cast<int>(std::lround(cx - 0.5F)), y = static_cast<int>(std::lround(cy - 0.5F));
+                  if (x < 0 || y < 0 || x >= image.width || y >= image.height) continue;
+                  truth_map.metres[static_cast<std::size_t>(v) * truth_map.width + u] =
+                      truth[static_cast<std::size_t>(y) * image.width + x];
+                }
+          }
           DepthFilterFrame input;
-          input.depth = &frame_depth;
+          input.depth = fuse_truth_depth.empty() ? &frame_depth : &truth_map;
           input.pose = fuse_gt.empty() ? pose.pose : truth_pose->second;
           input.segment = fuse_gt.empty() ? pose.segment : 0;
+          input.keyframe = pose.keyframe;  // re-anchor the fused state at VO keyframes
           input.K = K;
           input.k1 = vo_config.distortion_k1;
           input.log_scale = filter_log_scale;
@@ -345,8 +420,24 @@ int main(int argc, char** argv) {
           input.sigma = sigma_map.empty() ? nullptr : &sigma_map;
           input.rotation_sigma_degrees = pose.rotation_sigma_degrees;
           input.translation_sigma_ratio = pose.translation_sigma_ratio;
+          // The anchor keyframe's pose as the VO has refined it since (bundle
+          // adjustment): the frame's pose is relative to the refined map.
+          if (fuse_gt.empty() && !depth_filter.empty())
+            if (const auto anchor = current_pose(odometry, depth_filter.frame_index())) depth_filter.set_anchor_pose(*anchor);
           const auto stats = depth_filter.process(input);
           fused_map = depth_filter.to_depth_map(filter_log_scale, input.grid);
+          if (!fuse_dump.empty() && stats.reanchored) {
+            std::filesystem::create_directories(fuse_dump);
+            const auto write = [&](const char* kind, const std::vector<float>& metres) {
+              std::ofstream out(std::filesystem::path(fuse_dump) / (std::to_string(pose.frame_index) + kind),
+                                std::ios::binary);
+              out.write(reinterpret_cast<const char*>(metres.data()), static_cast<std::streamsize>(metres.size() * sizeof(float)));
+            };
+            DepthFilterView view;
+            depth_filter.render(input.pose, view);  // the state in metres, as the app shows it
+            write(".fused.f32", view.metres);
+            write(".raw.f32", input.depth->metres);
+          }
           filter_totals.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - f0).count();
           ++filter_totals.frames;
           filter_totals.valid += static_cast<std::size_t>(stats.valid);
@@ -354,6 +445,14 @@ int main(int argc, char** argv) {
           filter_totals.updated += static_cast<std::size_t>(stats.updated);
           filter_totals.gated += static_cast<std::size_t>(stats.gated);
           filter_totals.resets += static_cast<std::size_t>(stats.resets);
+          filter_totals.offset += std::abs(stats.scale_offset);
+          filter_totals.noise += stats.frame_noise;
+          if (fuse_log_out)
+            fuse_log_out << pose.frame_index << ',' << pose.keyframe << ',' << stats.reanchored << ',' << stats.valid << ','
+                         << stats.initialised << ',' << stats.updated << ',' << stats.occluded << ',' << stats.gated << ','
+                         << stats.resets << ',' << stats.scale_offset << ',' << stats.flicker_raw << ','
+                         << stats.flicker_fused << ',' << stats.median_sigma << ',' << filter_log_scale << ','
+                         << pose.keyframe_log_scale << '\n';
           filter_totals.sigma += stats.median_sigma;
           filter_totals.sum_sigma += stats.median_sum_sigma;
           if (stats.flicker_pixels > 100) {
@@ -379,7 +478,7 @@ int main(int argc, char** argv) {
           const auto K = vo_config.intrinsics ? *vo_config.intrinsics :
               CameraIntrinsics::from_horizontal_fov(image.width, image.height, vo_config.horizontal_fov_degrees);
           const auto samples = odometry.trajectory();
-          keyframe_depth.add(input, fused_map ? *fused_map : frame_depth, {}, K, vo_config.distortion_k1,
+          keyframe_depth.add(input, fused_map && fused_map->frame_index == pose.frame_index ? *fused_map : frame_depth, {}, K, vo_config.distortion_k1,
                              [&](std::uint64_t f) -> std::optional<Pose> {
                                auto it = std::lower_bound(samples.begin(), samples.end(), f,
                                    [](const TrajectorySample& s, std::uint64_t x) { return s.frame_index < x; });
@@ -476,8 +575,23 @@ int main(int argc, char** argv) {
       if (std::getenv("SLAM_VO_VERBOSE") && pose.relocalization_candidates > 0 && !pose.relocalized)
         std::cout << "  vo frame " << pose.frame_index << ": relocalization tried, " << pose.relocalization_candidates
                   << " descriptor matches\n";
+      if (pose.global_search) {
+        ++global_searches;
+        global_found += pose.global_found;
+        global_ms += pose.global_match_ms;
+        global_max_ms = std::max(global_max_ms, pose.global_match_ms);
+        global_database += pose.global_database;
+        global_matches += pose.global_matches;
+        global_inliers.push_back(static_cast<float>(pose.global_pose_inliers));
+        if (std::getenv("SLAM_VO_GLOBAL_TRACE"))
+          std::cout << "  global " << pose.frame_index << " q " << pose.global_queries << " db " << pose.global_database
+                    << " matches " << pose.global_matches << " p3p " << pose.global_pose_inliers
+                    << (pose.global_found ? " FOUND" : "") << " " << pose.global_match_ms << " ms\n";
+      }
+      global_loops += pose.loop_detected && pose.loop_global;
       if (pose.loop_detected || pose.loop_closed)
-        std::cout << "  vo frame " << pose.frame_index << ": " << pose.event << '\n';
+        std::cout << "  vo frame " << pose.frame_index << ": " << pose.event << (pose.loop_global ? " [global]" : "")
+                  << '\n';
       if (pose.state == OdometryState::lost || pose.relocalized || pose.event == "pose re-estimated (P3P RANSAC)")
         std::cout << "  vo frame " << pose.frame_index << ": " << pose.event << '\n';
       vo_ms += pose.ms;
@@ -584,6 +698,12 @@ int main(int argc, char** argv) {
     for (const auto& sample : odometry.trajectory()) ++segment_poses[sample.segment];
     int largest = 0;
     for (const auto& [id, n] : segment_poses) largest = std::max(largest, n);
+    if (global_searches > 0)
+      std::printf("global loop search: %d keyframes searched, database %.0f landmarks and %.1f matches on average, "
+                  "matching %.2f ms mean (max %.1f), P3P inliers median %.0f p90 %.0f, %d verified, %d loops detected\n",
+                  global_searches, global_database / global_searches, global_matches / global_searches,
+                  global_ms / global_searches, global_max_ms, percentile(global_inliers, 0.5),
+                  percentile(global_inliers, 0.9), global_found, global_loops);
     std::printf("camera pose: posed %d/%d frames, %d keyframes, %d losses, %d relocalized, %zu segments "
                 "(largest %d poses), inlier ratio median %.3f, "
                 "median reprojection %.2f px, %.2f ms/frame (max %.1f)\n", vo_posed, processed + 1, vo_keyframes,
@@ -594,10 +714,10 @@ int main(int argc, char** argv) {
       const double n = static_cast<double>(filter_totals.frames), f = std::max<double>(1, filter_totals.flicker_frames);
       const double updates = std::max<double>(1, filter_totals.updated + filter_totals.gated);
       std::printf("depth fusion: %zu frames (%zu clears), %.0f px valid/frame, %.1f%% initialised, %.2f%% gated, "
-                  "%.3f%% reset; flicker raw %.4f fused %.4f (x%.2f); median sigma z %.3f, z+b %.3f; %.2f ms/frame\n",
+                  "%.3f%% reset, mean |frame scale offset| %.4f, frame noise %.4f; flicker raw %.4f fused %.4f (x%.2f); median sigma z %.3f, z+b %.3f; %.2f ms/frame\n",
                   filter_totals.frames, filter_totals.clears, filter_totals.valid / n,
                   100.0 * filter_totals.initialised / std::max<double>(1, filter_totals.valid),
-                  100.0 * filter_totals.gated / updates, 100.0 * filter_totals.resets / updates,
+                  100.0 * filter_totals.gated / updates, 100.0 * filter_totals.resets / updates, filter_totals.offset / n, filter_totals.noise / n,
                   filter_totals.flicker_raw / f, filter_totals.flicker_fused / f,
                   filter_totals.flicker_fused / std::max(1e-12, filter_totals.flicker_raw), filter_totals.sigma / n,
                   filter_totals.sum_sigma / n, filter_totals.ms / n);
