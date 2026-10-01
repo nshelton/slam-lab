@@ -118,6 +118,85 @@ std::vector<float> icosahedron() {
 
 constexpr GLsizei kMeshVertices = 60;
 
+
+// Dense clouds: one GL point per sample, world = u_model * (p * u_units) + u_origin,
+// then the same display mapping and projection as the map points.
+constexpr const char* kCloudVertexShader = R"(#version 330 core
+layout(location = 0) in vec3 a_position;  // cloud frame
+layout(location = 1) in vec3 a_color;
+layout(location = 2) in float a_sigma;  // network depth sigma (log depth); < 0: unknown
+uniform mat3 u_model;
+uniform float u_max_sigma, u_sigma_reference;
+uniform int u_color_by_confidence;
+uniform vec3 u_origin;
+uniform float u_units;
+uniform vec3 u_pivot, u_right, u_up, u_toward;
+uniform float u_eye_distance, u_focal, u_scale, u_near, u_far, u_point_size;
+uniform int u_perspective, u_rotation;
+uniform vec2 u_viewport;
+out vec3 v_color;
+vec3 display(vec3 p) {
+  float u = p.x, v = p.y;
+  if (u_rotation == 90) { u = -p.y; v = p.x; }
+  else if (u_rotation == 180) { u = -p.x; v = -p.y; }
+  else if (u_rotation == 270) { u = p.y; v = -p.x; }
+  return vec3(u, -v, p.z);
+}
+void main() {
+  if (a_sigma > u_max_sigma) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); v_color = vec3(0.0); return; }
+  vec3 world = u_model * (a_position * u_units) + u_origin;
+  vec3 d = display(world) - u_pivot;
+  vec3 e = vec3(dot(u_right, d), dot(u_up, d), u_eye_distance - dot(u_toward, d));
+  vec2 ndc = 2.0 / u_viewport;
+  if (u_perspective != 0) {
+    if (e.z < u_near) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); v_color = vec3(0.0); return; }
+    float a = (u_far + u_near) / (u_far - u_near), b = -2.0 * u_far * u_near / (u_far - u_near);
+    gl_Position = vec4(e.x * u_focal * ndc.x, e.y * u_focal * ndc.y, a * e.z + b, e.z);
+  } else {
+    gl_Position = vec4(e.x * u_scale * ndc.x, e.y * u_scale * ndc.y, (e.z - u_eye_distance) / u_far, 1.0);
+  }
+  gl_PointSize = u_point_size;
+  v_color = a_color;
+  if (u_color_by_confidence != 0) {  // same red-yellow-green ramp as the map points
+    const vec3 low = vec3(0.84, 0.19, 0.15), mid = vec3(1.0, 0.88, 0.45), high = vec3(0.10, 0.60, 0.31);
+    float q = a_sigma / u_sigma_reference, c = 1.0 / (1.0 + q * q);
+    v_color = a_sigma < 0.0 ? vec3(0.5) : c < 0.5 ? mix(low, mid, 2.0 * c) : mix(mid, high, 2.0 * c - 1.0);
+  }
+}
+)";
+
+constexpr const char* kCloudFragmentShader = R"(#version 330 core
+in vec3 v_color;
+out vec4 frag;
+void main() { frag = vec4(v_color, 1.0); }
+)";
+
+GLuint link(const char* vertex_source, const char* fragment_source) {
+  const GLuint vertex = compile(GL_VERTEX_SHADER, vertex_source);
+  const GLuint fragment = compile(GL_FRAGMENT_SHADER, fragment_source);
+  if (!vertex || !fragment) {
+    glDeleteShader(vertex);
+    glDeleteShader(fragment);
+    return 0;
+  }
+  const GLuint program = glCreateProgram();
+  glAttachShader(program, vertex);
+  glAttachShader(program, fragment);
+  glLinkProgram(program);
+  glDeleteShader(vertex);
+  glDeleteShader(fragment);
+  GLint ok = 0;
+  glGetProgramiv(program, GL_LINK_STATUS, &ok);
+  if (!ok) {
+    char log[2048];
+    glGetProgramInfoLog(program, sizeof(log), nullptr, log);
+    std::fprintf(stderr, "PointCloudRenderer: program link failed:\n%s\n", log);
+    glDeleteProgram(program);
+    return 0;
+  }
+  return program;
+}
+
 void composite_premultiplied(const ImDrawList*, const ImDrawCmd*) {
   // The resolved target is premultiplied (clear alpha 0, MSAA edge coverage).
   glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
@@ -132,6 +211,11 @@ PointCloudRenderer::~PointCloudRenderer() {
   }
   glDeleteBuffers(1, &mesh_);
   glDeleteProgram(program_);
+  for (auto& [key, cloud] : clouds_) {
+    glDeleteVertexArrays(1, &cloud.vao);
+    glDeleteBuffers(1, &cloud.buffer);
+  }
+  if (cloud_program_) glDeleteProgram(cloud_program_);
   glDeleteFramebuffers(1, &msaa_fbo_);
   glDeleteFramebuffers(1, &resolve_fbo_);
   glDeleteRenderbuffers(1, &msaa_color_);
@@ -225,6 +309,116 @@ bool PointCloudRenderer::ensure_gl() {
   return true;
 }
 
+bool PointCloudRenderer::ensure_cloud_gl() {
+  if (cloud_gl_ready_ || cloud_gl_failed_) return cloud_gl_ready_;
+  cloud_program_ = link(kCloudVertexShader, kCloudFragmentShader);
+  if (!cloud_program_) {
+    cloud_gl_failed_ = true;
+    return false;
+  }
+  const auto uniform = [&](const char* name) { return glGetUniformLocation(cloud_program_, name); };
+  c_pivot_ = uniform("u_pivot");
+  c_right_ = uniform("u_right");
+  c_up_ = uniform("u_up");
+  c_toward_ = uniform("u_toward");
+  c_eye_distance_ = uniform("u_eye_distance");
+  c_perspective_ = uniform("u_perspective");
+  c_focal_ = uniform("u_focal");
+  c_scale_ = uniform("u_scale");
+  c_near_ = uniform("u_near");
+  c_far_ = uniform("u_far");
+  c_viewport_ = uniform("u_viewport");
+  c_rotation_ = uniform("u_rotation");
+  c_model_ = uniform("u_model");
+  c_origin_ = uniform("u_origin");
+  c_units_ = uniform("u_units");
+  c_point_size_ = uniform("u_point_size");
+  c_max_sigma_ = uniform("u_max_sigma");
+  c_sigma_reference_ = uniform("u_sigma_reference");
+  c_color_by_confidence_ = uniform("u_color_by_confidence");
+  cloud_gl_ready_ = true;
+  return true;
+}
+
+void PointCloudRenderer::draw_clouds(const std::vector<DenseCloudDraw>& clouds, const PointCloudCamera& camera,
+                                     float logical_width, float logical_height, float point_pixels,
+                                     std::uint64_t generation) {
+  if (!ensure_cloud_gl()) return;
+  if (generation != cloud_generation_) {
+    for (auto& [key, cloud] : clouds_) {
+      glDeleteVertexArrays(1, &cloud.vao);
+      glDeleteBuffers(1, &cloud.buffer);
+    }
+    clouds_.clear();
+    cloud_generation_ = generation;
+  }
+  glUseProgram(cloud_program_);
+  glUniform3fv(c_pivot_, 1, camera.pivot.data());
+  glUniform3fv(c_right_, 1, camera.right.data());
+  glUniform3fv(c_up_, 1, camera.up.data());
+  glUniform3fv(c_toward_, 1, camera.toward.data());
+  glUniform1f(c_eye_distance_, camera.eye_distance);
+  glUniform1i(c_perspective_, camera.perspective ? 1 : 0);
+  glUniform1f(c_focal_, camera.focal);
+  glUniform1f(c_scale_, camera.scale);
+  glUniform1f(c_near_, camera.near_plane);
+  glUniform1f(c_far_, 1000.0F * camera.eye_distance);
+  glUniform2f(c_viewport_, logical_width, logical_height);
+  glUniform1i(c_rotation_, camera.rotation);
+  glUniform1f(c_point_size_, point_pixels);
+  glEnable(GL_PROGRAM_POINT_SIZE);
+  for (const auto& c : clouds) {
+    if (!c.points || c.points->empty()) continue;
+    auto [it, fresh] = clouds_.try_emplace(c.key);
+    CloudBuffer& buffer = it->second;
+    const bool masked = c.shown != nullptr;
+    if (fresh || buffer.version != c.version || buffer.masked != masked) {
+      // Interleaved position (3 floats) and colour (3 bytes, normalised).
+      struct Vertex {
+        float position[3];
+        std::uint8_t color[4];
+        float sigma;  // < 0: unknown
+      };
+      std::vector<Vertex> vertices;
+      vertices.reserve(c.points->size());
+      for (std::size_t i = 0; i < c.points->size(); ++i) {
+        if (masked && (i >= c.shown->size() || !(*c.shown)[i])) continue;
+        const auto& p = (*c.points)[i];
+        const auto rgb = c.colors && i < c.colors->size() ? (*c.colors)[i] : std::array<std::uint8_t, 3>{170, 170, 170};
+        const float sigma = c.sigma && i < c.sigma->size() ? (*c.sigma)[i] : -1.0F;
+        vertices.push_back({{p[0], p[1], p[2]}, {rgb[0], rgb[1], rgb[2], 255}, sigma});
+      }
+      if (fresh) {
+        glGenVertexArrays(1, &buffer.vao);
+        glGenBuffers(1, &buffer.buffer);
+      }
+      buffer.version = c.version;
+      buffer.masked = masked;
+      glBindVertexArray(buffer.vao);
+      glBindBuffer(GL_ARRAY_BUFFER, buffer.buffer);
+      glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(Vertex)), vertices.data(),
+                   GL_STATIC_DRAW);
+      glEnableVertexAttribArray(0);
+      glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), reinterpret_cast<const void*>(offsetof(Vertex, position)));
+      glEnableVertexAttribArray(1);
+      glVertexAttribPointer(1, 3, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex), reinterpret_cast<const void*>(offsetof(Vertex, color)));
+      glEnableVertexAttribArray(2);
+      glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(Vertex), reinterpret_cast<const void*>(offsetof(Vertex, sigma)));
+      buffer.count = static_cast<int>(vertices.size());
+    }
+    // GLSL mat3 is column-major: transpose the row-major rotation.
+    glUniformMatrix3fv(c_model_, 1, GL_TRUE, c.rotation.data());
+    glUniform3fv(c_origin_, 1, c.origin.data());
+    glUniform1f(c_units_, c.units_per_point_unit);
+    glUniform1f(c_max_sigma_, c.max_sigma);
+    glUniform1f(c_sigma_reference_, c.sigma_reference);
+    glUniform1i(c_color_by_confidence_, c.color_by_confidence ? 1 : 0);
+    glBindVertexArray(buffer.vao);
+    glDrawArrays(GL_POINTS, 0, buffer.count);
+  }
+  glDisable(GL_PROGRAM_POINT_SIZE);
+}
+
 void PointCloudRenderer::ensure_target(int width, int height) {
   if (width == width_ && height == height_) return;
   width_ = width;
@@ -290,8 +484,10 @@ void PointCloudRenderer::draw_set(const InstanceSet& set, const PointCloudStyle&
 void PointCloudRenderer::render(ImDrawList* draw, std::array<float, 2> min, std::array<float, 2> max,
                                 float pixel_scale, const PointCloudCamera& camera,
                                 const std::vector<MapPoint>* retired, const PointCloudStyle& retired_style,
-                                const std::vector<MapPoint>* active, const PointCloudStyle& active_style) {
-  if (!retired && !active) return;
+                                const std::vector<MapPoint>* active, const PointCloudStyle& active_style,
+                                const std::vector<DenseCloudDraw>* clouds, float cloud_point_pixels,
+                                std::uint64_t cloud_generation) {
+  if (!retired && !active && !(clouds && !clouds->empty())) return;
   const float logical_width = max[0] - min[0], logical_height = max[1] - min[1];
   const int width = std::max(1, static_cast<int>(std::lround(logical_width * pixel_scale)));
   const int height = std::max(1, static_cast<int>(std::lround(logical_height * pixel_scale)));
@@ -341,6 +537,8 @@ void PointCloudRenderer::render(ImDrawList* draw, std::array<float, 2> min, std:
   glUniform1i(u_rotation_, camera.rotation);
   if (retired) draw_set(retired_, retired_style);
   if (active) draw_set(active_, active_style);
+  if (clouds && !clouds->empty())
+    draw_clouds(*clouds, camera, logical_width, logical_height, cloud_point_pixels * pixel_scale, cloud_generation);
 
   glBindFramebuffer(GL_READ_FRAMEBUFFER, msaa_fbo_);
   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, resolve_fbo_);
