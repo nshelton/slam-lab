@@ -477,6 +477,71 @@ __global__ void fuse_kernel(const float* measured, const float* measured_varianc
   variance[index] = fmaxf(fused_var, floor * floor);
 }
 
+// One pass of regularization over the image, for display: it is not fed back
+// into the state, so nothing is counted twice.
+// - A pixel with an estimate takes the certainty-weighted mean of the
+//   neighbours that agree with it (and look alike in the image, so the mean
+//   does not cross an edge). It keeps its own variance: its neighbours'
+//   evidence is largely the same evidence.
+// - A pixel most of whose neighbours contradict it is dropped.
+// - A pixel without an estimate is filled from neighbours that agree with one
+//   another, at a larger variance.
+__global__ void regularize_kernel(const float* source, const float* source_variance, const std::uint8_t* image,
+                                  int width, int height, LiveDepthConfig config, float* inverse_depth,
+                                  float* variance) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= width || y >= height) return;
+  const int index = y * width + x, radius = config.regularize_radius;
+  const float own = source[index], own_variance = source_variance[index];
+  const bool has = own_variance < INFINITY;
+  const float tone = image[index];
+  const float sigmas2 = config.outlier_sigmas * config.outlier_sigmas;
+  // The neighbours that look like this pixel: their weighted mean, and among
+  // them those that agree with this pixel's estimate.
+  float weights = 0.0F, sum = 0.0F, squares = 0.0F, worst = 0.0F;
+  float agree_weights = 0.0F, agree_sum = 0.0F;
+  int valid = 0, agree = 0;
+  for (int j = -radius; j <= radius; ++j) {
+    const int py = y + j;
+    if (py < 0 || py >= height) continue;
+    for (int i = -radius; i <= radius; ++i) {
+      const int px = x + i;
+      if (px < 0 || px >= width || (i == 0 && j == 0)) continue;
+      const int q = py * width + px;
+      const float var = source_variance[q];
+      if (!(var < INFINITY) || fabsf(image[q] - tone) > config.regularize_luma) continue;
+      const float rho = source[q], w = 1.0F / var;
+      ++valid;
+      weights += w;
+      sum += w * rho;
+      squares += w * rho * rho;
+      worst = fmaxf(worst, var);
+      if (has && (rho - own) * (rho - own) <= sigmas2 * (var + own_variance)) {
+        ++agree;
+        agree_weights += w;
+        agree_sum += w * rho;
+      }
+    }
+  }
+  inverse_depth[index] = 0.0F;
+  variance[index] = INFINITY;
+  if (has) {
+    if (valid >= config.regularize_min_neighbours && 4 * agree < valid) return;  // contradicted by its surroundings
+    const float w = 1.0F / own_variance;
+    inverse_depth[index] = (agree_sum + w * own) / (agree_weights + w);
+    variance[index] = own_variance;
+    return;
+  }
+  if (valid < config.regularize_min_neighbours) return;
+  const float mean = sum / weights;
+  const float spread = fmaxf(squares / weights - mean * mean, 0.0F);
+  // Neighbours that scatter by more than their own uncertainty are two surfaces, not one.
+  if (spread > sigmas2 * worst) return;
+  inverse_depth[index] = mean;
+  variance[index] = 2.0F * worst + spread;
+}
+
 // The image handed out: the state, or the state combined with the anchors' interpolation.
 __global__ void output_kernel(const float* state, const float* state_variance, const float* anchored,
                               const float* anchored_variance, float sigmas, float* inverse_depth, float* variance,
@@ -528,6 +593,8 @@ struct LiveDepth::Impl {
   float* anchored_variance{};
   float* coarse{};           // the anchors' interpolation on its grid
   float* coarse_variance{};
+  float* smoothed[2]{};      // regularization passes
+  float* smoothed_variance[2]{};
   float* gathered{};
   bool state_filled{};
   int state_segment{-1};
@@ -550,7 +617,8 @@ struct LiveDepth::Impl {
     cudaFree(luma);
     cudaFree(flow);
     for (float** image : {&inverse_depth, &variance, &state[0], &state[1], &state_variance[0], &state_variance[1],
-                          &measured, &measured_variance, &anchored, &anchored_variance, &coarse, &coarse_variance}) {
+                          &measured, &measured_variance, &anchored, &anchored_variance, &coarse, &coarse_variance,
+                          &smoothed[0], &smoothed[1], &smoothed_variance[0], &smoothed_variance[1]}) {
       cudaFree(*image);
       *image = nullptr;
     }
@@ -606,7 +674,8 @@ struct LiveDepth::Impl {
     const std::size_t pixels = static_cast<std::size_t>(w) * h;
     cuda_check(cudaMalloc(&luma, kRing * pixels), "allocate live depth luma");
     for (float** image : {&inverse_depth, &variance, &state[0], &state[1], &state_variance[0], &state_variance[1],
-                          &measured, &measured_variance, &anchored, &anchored_variance, &coarse, &coarse_variance})
+                          &measured, &measured_variance, &anchored, &anchored_variance, &coarse, &coarse_variance,
+                          &smoothed[0], &smoothed[1], &smoothed_variance[0], &smoothed_variance[1]})
       cuda_check(cudaMalloc(image, pixels * sizeof(float)), "allocate live depth image");
     width = w;
     height = h;
@@ -617,7 +686,9 @@ struct LiveDepth::Impl {
 LiveDepth::LiveDepth(const LiveDepthConfig& config) : impl_(std::make_unique<Impl>()) {
   if (config.patch_half_length < 1 || config.patch_half_length > 4 || config.patch_half_width < 0 ||
       config.patch_half_width > 2 || !(config.search_step_px > 0) ||
-      !(config.search_radius_px >= config.search_step_px) || config.reference_gap < 1 || config.reference_gap >= kRing)
+      !(config.search_radius_px >= config.search_step_px) || config.reference_gap < 1 ||
+      config.reference_gap >= kRing || config.regularize_passes < 0 || config.regularize_passes > 8 ||
+      config.regularize_radius < 1 || config.regularize_radius > 4)
     throw std::invalid_argument("live depth: patch or search out of range");
   impl_->config = config;
 }
@@ -793,12 +864,23 @@ void LiveDepth::process(const GpuFrame& frame, const DeviceFlowField* flow, cons
                                                  m.state_variance[0], count);
         cuda_check(cudaGetLastError(), "fuse depth");
       }
-      // 4. The image: the state, or the state combined with what the landmarks alone say.
+      // 4. Regularization, for the image only.
+      const float* shown = m.state[0];
+      const float* shown_variance = m.state_variance[0];
+      for (int pass = 0; pass < m.config.regularize_passes; ++pass) {
+        regularize_kernel<<<grid, block, 0, m.stream>>>(shown, shown_variance, m.luma + m.newest * pixels, m.width,
+                                                       m.height, m.config, m.smoothed[pass % 2],
+                                                       m.smoothed_variance[pass % 2]);
+        cuda_check(cudaGetLastError(), "regularize depth");
+        shown = m.smoothed[pass % 2];
+        shown_variance = m.smoothed_variance[pass % 2];
+      }
+      // 5. The image: that, or that combined with what the landmarks alone say.
       const bool with_anchors = m.config.mode == LiveDepthMode::fused && enough_anchors;
       if (with_anchors) interpolate_anchors(m.anchored, m.anchored_variance);
       cuda_check(cudaMemsetAsync(m.counters, 0, counter_count * sizeof(unsigned), m.stream),
                  "clear live depth counters");
-      output_kernel<<<strips, 256, 0, m.stream>>>(m.state[0], m.state_variance[0], with_anchors ? m.anchored : nullptr,
+      output_kernel<<<strips, 256, 0, m.stream>>>(shown, shown_variance, with_anchors ? m.anchored : nullptr,
                                                  m.anchored_variance, m.config.outlier_sigmas, m.inverse_depth,
                                                  m.variance, count, m.counters);
       cuda_check(cudaGetLastError(), "compose depth image");

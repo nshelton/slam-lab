@@ -77,11 +77,20 @@ struct LiveDepthConfig {
   float anchor_sigma_per_px{0.0025F};
   // Filter. Sigmas are relative (of the inverse depth).
   float process_sigma{0.003F};             // added per frame carried
-  float propagation_tolerance_px{1.5F};    // a carried point must land this close to its pixel
+  float propagation_tolerance_px{0.75F};    // a carried point must land this close to its pixel
   float measurement_sigma{0.06F};          // added to every measurement: pose and model error
   float min_sigma{0.01F};                  // the fused estimate is never trusted beyond this
   float outlier_sigmas{2.5F};              // estimates further apart than this are not averaged
   bool scale_to_anchors{true};
+  // Regularization of the image handed out (the state is left alone): each
+  // pass averages a pixel with the neighbours within regularize_radius that
+  // agree with it and differ by at most regularize_luma in the image, drops
+  // a pixel that most of at least regularize_min_neighbours contradict, and
+  // fills an empty pixel from that many neighbours when they agree.
+  int regularize_passes{2};
+  int regularize_radius{2};
+  float regularize_luma{24.0F};
+  int regularize_min_neighbours{5};
 };
 
 // Why pixels got no measurement (LiveDepthMode::measurement), last frame.

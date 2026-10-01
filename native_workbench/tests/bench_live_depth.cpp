@@ -7,7 +7,8 @@
 //   patch-length, patch-width, search-radius, search-step, max-epipolar,
 //   min-gradient, max-residual, disparity-floor, image-noise,
 //   process-sigma, propagation-tolerance, measurement-sigma, min-sigma,
-//   outlier-sigmas, scale-to-anchors, anchor-sigma, anchor-sigma-per-px
+//   outlier-sigmas, scale-to-anchors, anchor-sigma, anchor-sigma-per-px,
+//   regularize (passes), regularize-radius, regularize-luma, regularize-neighbours
 // Dump: OUT_DIR/depth_<frame>.bin = int32 width, height; uint64 frame index;
 // float32 inverse depth [w*h]; float32 variance [w*h] (inf: no estimate).
 #include "slam_native/color_sampler.hpp"
@@ -76,6 +77,10 @@ int main(int argc, char** argv) {
       else if (key == "min-sigma") config.min_sigma = value;
       else if (key == "outlier-sigmas") config.outlier_sigmas = value;
       else if (key == "scale-to-anchors") config.scale_to_anchors = value != 0;
+      else if (key == "regularize") config.regularize_passes = static_cast<int>(value);
+      else if (key == "regularize-radius") config.regularize_radius = static_cast<int>(value);
+      else if (key == "regularize-luma") config.regularize_luma = value;
+      else if (key == "regularize-neighbours") config.regularize_min_neighbours = static_cast<int>(value);
       else if (key == "anchor-sigma") config.anchor_sigma = value;
       else if (key == "anchor-sigma-per-px") config.anchor_sigma_per_px = value;
       else throw std::invalid_argument("unknown option " + key);

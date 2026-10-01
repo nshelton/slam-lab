@@ -3,8 +3,9 @@
 Status 2026-10-01: build-order steps 1 to 4 are done and measured (bench,
 keypoints-only floor, single measurement, propagation and fusion, keypoint
 scale and combination; see "Measured so far" and "The filter"), and the
-overlay (6) is in the workbench: *Depth* in the Pipeline panel. Not done:
-regularization, the voxel feed.
+overlay (6) is in the workbench: *Depth* in the Pipeline panel.
+Regularization (5) is done too; its numbers supersede the table under "The
+filter". Not done: the voxel feed.
 
 A full-resolution inverse-depth and confidence image that runs beside the
 visual odometry, is carried forward every frame and refined by the camera
@@ -258,6 +259,40 @@ step's job.
 `SLAM_SNAPSHOT_DEPTH=3 slam-native-snapshot VIDEO ENGINE 0 600 OUT.ppm`
 renders it headlessly.
 
+## Regularization (step 5)
+
+Two changes, both aimed at the patchy textureless regions.
+
+- **Propagation no longer spreads estimates.** A carried point had to land
+  within 1.5 px of its pixel, so one estimate could be taken by several
+  neighbours every frame and grew into a blob with no evidence behind it.
+  The tolerance is now 0.75 px. On fr3 the filter's coverage falls from 78%
+  to 62% and its median error from 4.0% to 3.2%: the pixels it loses were
+  the bad ones. (0.5 px is too strict: estimates die out, 26% coverage.)
+- **The image handed out is regularized, the state is not** (two passes over
+  a 5×5 window). A pixel takes the certainty-weighted mean of the neighbours
+  that agree with it and look alike in the image; a pixel most of whose
+  neighbours contradict it is dropped; an empty pixel is filled from
+  neighbours that agree with one another, at twice their variance. Nothing
+  is fed back, so no evidence is counted twice.
+
+TUM, first 800 frames, median error (before regularization → now):
+
+| Sequence | Keypoints only | Fused, all pixels | Fused, textured px | Filter alone: coverage, error |
+| --- | --- | --- | --- | --- |
+| fr1_desk | 4.7% | 4.7% → 4.5% | 2.5% → 2.4% | 49%, 2.8% |
+| fr2_desk | 6.1% | 4.7% → 4.4% | 2.7% → 2.5% | 77%, 3.4% |
+| fr3_long_office | 4.9% | 4.2% → 4.0% | 2.5% → 2.3% | 69%, 2.9% |
+
+Pixels with sigma below 2% are now 14–20% of the image at 1.8–2.0% median
+error. The variance is still optimistic, by 1.1–1.5 over all pixels and
+1.7–1.9 for the most confident ones.
+
+On `disney_04` the filter's image no longer has blobs on the ceiling and the
+floor: it holds estimates on textured structure only (66% of pixels at frame
+600, from 86%), and "fused" fills the rest from the keypoints. Some wrong
+patches remain on the reflective floor.
+
 ## Measuring it
 
 TUM RGB-D has ground-truth depth per frame (`data/datasets/tum`,
@@ -272,11 +307,12 @@ their landmarks, and timing.
 
 ## Build order
 
-Steps 1 to 4 are done. What the measurements suggest for what is left: the
-regularization (5) should be aimed at the pixels far from keypoints, the
-keypoint interpolation needs a cheaper form before the overlay runs at 1080p
-(6), and choosing the reference by baseline rather than a fixed gap would
-help fr1_desk-like fast motion.
+Steps 1 to 6 are done. Left: the voxel feed (7), which first needs the
+voxel map to integrate incrementally. Open improvements, by what the
+measurements suggest: choose the reference by baseline rather than a fixed
+gap (fr1_desk-like fast motion, where the filter covers only half the
+image), and a variance model that accounts for consecutive measurements
+sharing frames and poses.
 
 1. **Bench and container.** `LiveDepth` class with the state, reset and
    export; the bench with ground-truth scoring; previous-luma copy. Scored

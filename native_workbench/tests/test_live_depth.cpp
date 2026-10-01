@@ -260,6 +260,25 @@ void filter() {
     run(depth, scene, 25, all, [](int) { return 1; }, {}, 24);
     require(depth.valid() && depth.stats().estimated == 0, "A new segment starts with an empty state");
   }
+  // Regularization only changes the image handed out: it fills small holes
+  // and does not cost accuracy on a smooth surface.
+  {
+    double coverage[2], median[2];
+    for (int passes : {0, 2}) {
+      LiveDepthConfig c = config;
+      c.regularize_passes = passes;
+      LiveDepth depth(c);
+      run(depth, scene, 21, all, one);
+      const auto e = errors(depth.download(), scene, 20);
+      coverage[passes ? 1 : 0] = e.coverage;
+      median[passes ? 1 : 0] = e.median;
+    }
+    if (std::getenv("LIVE_DEPTH_TEST_LOG"))
+      std::cout << " regularization: coverage " << coverage[0] << " -> " << coverage[1] << ", median " << median[0]
+                << " -> " << median[1] << '\n';
+    require(coverage[1] > coverage[0], "Regularization fills holes");
+    require(median[1] < 1.05 * median[0], "Regularization keeps the accuracy");
+  }
   // A state in the wrong scale is brought back to the landmarks under it.
   {
     LiveDepth depth(config);
