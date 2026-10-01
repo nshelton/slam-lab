@@ -60,10 +60,13 @@ Done (Phase 2 with the minimal Phases 0–1):
   drained in `advance()` too). Depth is sampled at the tracks, and colours
   for the cloud grid are sampled while the frame is alive.
 - **Dense keyframe clouds**: `KeyframeDepthStore` (grid = every 4th output
-  pixel, flying pixels and far points dropped, camera frame in metres),
-  drawn by `PointCloudRenderer` as point sprites with each keyframe's
-  *current* pose and **local** scale (the keyframe's own estimate, else the
-  segment's). Trajectory view: "Dense depth" checkbox and size.
+  pixel, flying pixels and far points dropped, camera frame), aligned per
+  pixel by the keyframe's `ScaleGrid` (provisional, then settled), and
+  cross-checked with the last 4 keyframes in both directions (agree within
+  6% / seen through / occluded = no vote; hidden when checked and never
+  confirmed). Drawn by `PointCloudRenderer` as point sprites with each
+  keyframe's *current* pose, re-uploaded when a cloud's version changes.
+  Trajectory view: "Dense depth", size, "Consistent only". Bench: `dense 1`.
 - CTest `native_depth`: grid/transform inversion for all rotations, the
   sampling policy, back-projection and edge dropping.
 
@@ -79,6 +82,27 @@ Measured (bench, DA-V2-S; the confidence session's Phase 0b agrees):
 - **Absolute scale is biased**: on TUM the ground truth gives 2.40 m/unit,
   the network 3.46 (+44 %, log +0.36), stable over the sequence. So metres
   stay an *estimate* (Phase 1), never trusted directly.
+- **Cloud consistency** (`tools/depth_consistency.py`: neighbouring keyframes'
+  depth projected into each other; median / p90 log disagreement at 1 and 4
+  keyframes apart, DA-V2-S):
+
+  | | disney_04 gap 1 | disney_04 gap 4 | fr1_room gap 1 | fr1_room gap 4 |
+  |---|---|---|---|---|
+  | per-keyframe scale (first version) | 0.034 / 0.105 | 0.065 / 0.231 | 0.052 / 0.206 | 0.089 / 0.538 |
+  | **VO grid, settled** (current) | **0.023 / 0.082** | **0.046 / 0.178** | **0.034 / 0.151** | **0.057 / 0.318** |
+  | offline best (landmark grid, final geometry) | 0.022 / 0.077 | 0.041 / 0.155 | 0.032 / 0.139 | 0.054 / 0.284 |
+
+  The network's errors are low-frequency *shape*, not just scale: a 4×3
+  log-scale grid per keyframe (`ScaleGrid`, fitted by the VO to the same
+  reference landmarks, refitted when the keyframe leaves the BA window:
+  `settled_*`) removes about a third of the disagreement, as much as the best
+  single scale per pair. No radial (FOV) trend; edges are about 2% of pixels.
+  Metric3D is worse after alignment (0.034 at gap 1) and 8× slower. Then the
+  multi-view check hides points that a neighbouring keyframe sees through:
+  disney_04 has 95% of points confirmed and 2.9% hidden; fr1_room 77% / 12.7%.
+  fr1_room's remaining disagreement is the VO's own scale collapse in
+  segment 0 (keyframe log-scale 0.5–5.4), which needs Phase 5, not depth
+  processing.
 - **The VO's scale drifts within a segment** on some clips (dreamworks:
   monotonic, ≈ 5× over the clip; TUM: none). One scale per segment is
   therefore wrong for output; clouds use per-keyframe scale. Fixing the drift
@@ -324,6 +348,25 @@ offline measurements only; nothing feeds back into the VO.
   Student-t (or Gaussian + outlier mixture) for the prior's robust loss.
 - Not yet tried: image gradient / texture cues (they need the depth maps, not
   per-track samples) and the TUM ground-truth check.
+
+**Online implementation (2026-09-30).** `DepthConfidenceModel`
+(`depth_confidence.{hpp,cpp}`, test `native_depth_confidence`) fits
+σ_net² = exp(w·(1, edge, log depth, radius, nearest landmark)) by Fisher
+scoring (ridge toward the constant prior σ = 0.2) over a rolling window of
+20 000 references. `KeyframeDepthStore` owns one model. At each keyframe the
+app passes the frame's observations of reference landmarks
+(`KeyframeDepthInput::references`, circularity rule: ≥ 2° parallax, ≥ 3
+keyframes, geometry-only σ). Residuals use the same scale-grid alignment as the
+clouds and the multi-view check. Then every new cloud point gets
+`KeyframeCloud::sigma`. The edge cue is continuous here (3×3 log max/min), and
+the radius and nearest-landmark cues are as in the offline tool. Trajectory
+view: *Max depth sigma* filters dense points, and colour mode *Confidence*
+colours them on the map points' ramp. On fr3_long_office (600 frames) the
+window fills after ~65 keyframes, and near surfaces come out confident and
+far/peripheral ones less so. Not used for the multi-view tolerance: σ_net
+describes errors largely *shared* by neighbouring views (median ~0.15–0.2),
+while inter-view disagreement after alignment is 2–4 %. A per-point
+tolerance would need a model of the *difference* between views.
 
 ## Phase 1: metric scale per segment (output only)
 

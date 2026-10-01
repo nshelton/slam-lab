@@ -1,4 +1,5 @@
 // Synthetic checks for the tracker-agnostic visual odometry (CPU).
+#include "slam_native/covariance_shape.hpp"
 #include "slam_native/track_io.hpp"
 #include "slam_native/visual_odometry.hpp"
 #include "vo_geometry.hpp"  // internal geometry, unit-tested directly
@@ -429,6 +430,32 @@ void reports_uncertainty() {
             << " tracked frames\n";
   require(bad > 1.5 * good, "imprecise points are not worse than precise ones");  // measured 2.2x
   require(ratio > 0.2 && ratio < 5, "predicted depth sigma is off by more than 5x");
+  // The covariance's longest axis (what the viewer draws as the ellipsoid's
+  // long axis) lies along the viewing ray: depth is the weak direction.
+  std::vector<double> alignment;
+  for (const auto& point : map) {
+    const auto shape = covariance_shape(point.covariance, std::numeric_limits<float>::max());
+    int longest = 0;
+    double best = -1;
+    for (int k = 0; k < 3; ++k) {
+      const double length = Eigen::Vector3d(shape[3 * k], shape[3 * k + 1], shape[3 * k + 2]).norm();
+      if (length > best) { best = length; longest = k; }
+    }
+    if (!(best > 0)) continue;
+    const Eigen::Vector3d axis = Eigen::Vector3d(shape[3 * longest], shape[3 * longest + 1], shape[3 * longest + 2]) / best;
+    // Ray from the camera that last saw it, in the VO's own frame.
+    const auto it = std::lower_bound(trajectory.begin(), trajectory.end(), point.last_frame,
+                                     [](const TrajectorySample& s, std::uint64_t f) { return s.frame_index < f; });
+    if (it == trajectory.end()) continue;
+    const auto c = it->pose.center();
+    const Eigen::Vector3d ray = (Eigen::Vector3d(point.position[0], point.position[1], point.position[2]) -
+                                 Eigen::Vector3d(c[0], c[1], c[2])).normalized();
+    alignment.push_back(std::abs(axis.dot(ray)));
+  }
+  const double aligned = median(alignment);
+  std::cout << "uncertainty ellipsoids: median |cos(long axis, viewing ray)| " << aligned << " over "
+            << alignment.size() << " points\n";
+  require(alignment.size() > 200 && aligned > 0.95, "covariance long axis is not along the viewing ray");
 }
 
 // Verification and consistency: on the default scene, the 80 independently

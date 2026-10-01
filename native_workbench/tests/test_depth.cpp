@@ -5,6 +5,9 @@
 
 #include <cmath>
 #include <iostream>
+#include <limits>
+#include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -112,7 +115,10 @@ void clouds_back_project_and_drop_edges() {
   const auto K = CameraIntrinsics::from_horizontal_fov(1920, 1080, 70);
   DepthMap plane = make_map(0, 4);
   const std::vector<std::array<std::uint8_t, 3>> colors(store.grid(plane).size(), {10, 20, 30});
-  const std::size_t kept = store.add(11, 0, 2.5, plane, colors, K, 0);
+  KeyframeDepthInput input;
+  input.frame_index = 11;
+  input.log_scale = std::log(2.5);
+  const std::size_t kept = store.add(input, plane, colors, K, 0);
   require(kept == store.grid(plane).size(), "flat plane: every grid point kept");
   const auto& cloud = store.clouds().back();
   bool centre = false;
@@ -120,14 +126,17 @@ void clouds_back_project_and_drop_edges() {
     require(std::abs(p[2] - 4) < 1e-5F, "plane points at z = 4");
     centre |= std::abs(p[0]) < 0.05F && std::abs(p[1]) < 0.05F;
   }
-  require(centre && cloud.colors.front()[2] == 30 && cloud.metres_per_unit == 2.5, "cloud contents");
+  require(centre && cloud.colors.front()[2] == 30 && std::abs(cloud.metres_per_unit - 2.5) < 1e-9,
+          "cloud contents");
   // A step: pixels next to it are flying pixels and are dropped.
   DepthMap step = plane;
   for (int v = 0; v < step.height; ++v)
     for (int u = 0; u < step.width / 2; ++u)
       if (step.metres[static_cast<std::size_t>(v) * step.width + u] > 0)
         step.metres[static_cast<std::size_t>(v) * step.width + u] = 2;
-  const std::size_t with_step = store.add(12, 0, 0, step, colors, K, 0);
+  input.frame_index = 12;
+  input.log_scale = std::numeric_limits<double>::quiet_NaN();
+  const std::size_t with_step = store.add(input, step, colors, K, 0);
   require(with_step < kept && with_step > kept * 9 / 10, "edge pixels dropped, the rest kept");
   const auto generation = store.generation();
   store.clear();
@@ -137,11 +146,91 @@ void clouds_back_project_and_drop_edges() {
 }
 }  // namespace
 
+// The scale grid corrects per pixel; settle() re-applies a new one.
+void grid_scales_points() {
+  KeyframeDepthStore store;
+  const auto K = CameraIntrinsics::from_horizontal_fov(1920, 1080, 70);
+  const DepthMap plane = make_map(0, 4);
+  ScaleGrid grid{};
+  for (int y = 0; y < kScaleGridY; ++y)
+    for (int x = 0; x < kScaleGridX; ++x) grid[static_cast<std::size_t>(y * kScaleGridX + x)] = x == 0 ? 0.2 : 0.0;
+  KeyframeDepthInput input;
+  input.frame_index = 5;
+  input.log_scale = 0;
+  input.grid = &grid;
+  store.add(input, plane, {}, K, 0);
+  const auto& cloud = store.clouds().back();
+  // In VO units (points / metres_per_unit): depth / exp(L). Left edge L = 0.2, right L = 0.
+  float lowest = 10, highest = 0;
+  for (std::size_t i = 0; i < cloud.points.size(); ++i) {
+    const double L = scale_grid_at(grid, 1920, 1080, cloud.pixels[i][0], cloud.pixels[i][1]);
+    require(std::abs(cloud.points[i][2] - 4 * std::exp(-L)) < 1e-4, "grid applied per pixel");
+    lowest = std::min(lowest, cloud.points[i][2]);
+    highest = std::max(highest, cloud.points[i][2]);
+  }
+  require(lowest < 3.4F && std::abs(highest - 4) < 1e-4F, "grid varies across the image");
+  const auto version = cloud.version;
+  require(store.settle(5, std::log(2.0), nullptr) && store.clouds().back().version != version &&
+          std::abs(store.clouds().back().points[0][2] - 4) < 1e-4F &&
+          std::abs(store.clouds().back().metres_per_unit - 2) < 1e-9, "settle re-applies the scale");
+  std::cout << "keyframe clouds: per-pixel scale grid, settle\n";
+}
+
+// Two views of a plane confirm each other; a floating patch that the other
+// view sees through is hidden; the plane behind an occluder is not penalised.
+void multi_view_check() {
+  KeyframeDepthStore store;
+  const auto K = CameraIntrinsics::from_horizontal_fov(1920, 1080, 70);
+  std::map<std::uint64_t, Pose> poses;
+  const auto pose_of = [&](std::uint64_t f) -> std::optional<Pose> {
+    auto it = poses.find(f);
+    return it == poses.end() ? std::nullopt : std::optional<Pose>(it->second);
+  };
+  KeyframeDepthInput a;
+  a.frame_index = 1;
+  a.log_scale = 0;  // metres = units
+  poses[1] = a.pose;
+  store.add(a, make_map(0, 4), {}, K, 0, pose_of);
+  KeyframeDepthInput b = a;
+  b.frame_index = 2;
+  b.pose.translation = {-0.2, 0, 0};  // camera 0.2 m to the right
+  poses[2] = b.pose;
+  DepthMap floating = make_map(0, 4);
+  int patch = 0;  // a 3 m patch in front of the 4 m plane, centre of the view
+  for (int v = 120; v < 170; ++v)
+    for (int u = 230; u < 290; ++u) {
+      floating.metres[static_cast<std::size_t>(v) * floating.width + u] = 3;
+      ++patch;
+    }
+  store.add(b, floating, {}, K, 0, pose_of);
+  const auto& first = store.clouds()[0];
+  const auto& second = store.clouds()[1];
+  std::size_t first_hidden = 0, second_hidden = 0, second_agree = 0, patch_points = 0, patch_hidden = 0;
+  for (std::size_t i = 0; i < first.shown.size(); ++i) first_hidden += !first.shown[i];
+  for (std::size_t i = 0; i < second.shown.size(); ++i) {
+    second_hidden += !second.shown[i];
+    second_agree += second.agree[i] > 0;
+    if (std::abs(second.raw[i][2] - 3) < 1e-4F) {
+      ++patch_points;
+      patch_hidden += !second.shown[i];
+    }
+  }
+  std::cout << "multi-view: first " << first_hidden << " hidden of " << first.shown.size() << "; second "
+            << second_hidden << " hidden, " << second_agree << " confirmed; floating patch " << patch_hidden << "/"
+            << patch_points << " hidden\n";
+  require(second_agree > second.shown.size() / 2, "the plane must be confirmed by the other view");
+  require(patch_points > 50 && patch_hidden * 10 >= patch_points * 9, "the floating patch must be hidden");
+  require(first_hidden * 100 <= first.shown.size(), "occluded plane points must not be hidden");
+  require(second_hidden <= patch_points + second.shown.size() / 100, "only the patch is hidden");
+}
+
 int main() {
   try {
     grid_inverts_the_map_transform();
     samples_follow_the_policy();
     clouds_back_project_and_drop_edges();
+    grid_scales_points();
+    multi_view_check();
     std::cout << "depth checks passed\n";
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

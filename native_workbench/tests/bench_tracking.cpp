@@ -3,6 +3,7 @@
 #include "slam_native/color_sampler.hpp"
 #include "slam_native/depth_estimator.hpp"
 #include "slam_native/depth_sampling.hpp"
+#include "slam_native/keyframe_depth.hpp"
 #include "slam_native/feature_store.hpp"
 #include "slam_native/flow_tracker.hpp"
 #include "slam_native/optical_flow.hpp"
@@ -19,7 +20,9 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
+#include <optional>
 #include <random>
 #include <string>
 #include <stdexcept>
@@ -56,6 +59,8 @@ int main(int argc, char** argv) {
     SuperPointConfig sp_config;
     std::string export_tracks, export_trajectory, export_map, export_features, depth_model, export_keyframe_depth;
     DepthSamplingConfig depth_sampling;
+    bool dense_clouds = false;
+    KeyframeDepthStore keyframe_depth;
     VisualOdometryConfig vo_config;
     for (int a = 5; a + 1 < argc; a += 2) {
       const std::string key = argv[a];
@@ -72,6 +77,15 @@ int main(int argc, char** argv) {
       // Each keyframe's raw depth map (DIR/kf_<frame>.f32, row-major float32) and
       // DIR/keyframes.csv (geometry and scale estimates), for tools/depth_consistency.py.
       if (key == "export-keyframe-depth") { export_keyframe_depth = argv[a + 1]; continue; }
+      // Build the app's keyframe depth clouds (alignment + multi-view check) and report them.
+      if (key == "dense") { dense_clouds = std::stof(argv[a + 1]) != 0; continue; }
+      // Multi-view check tolerance: adaptive (between-view model, default) or the fixed 6 %.
+      if (key == "dense-adaptive") {
+        KeyframeDepthConfig dense_config;
+        dense_config.adaptive_tolerance = std::stof(argv[a + 1]) != 0;
+        keyframe_depth = KeyframeDepthStore(dense_config);
+        continue;
+      }
       const float value = std::stof(argv[a + 1]);
       if (key == "hfov") { vo_config.horizontal_fov_degrees = value; continue; }
       if (key == "k1") { vo_config.distortion_k1 = value; continue; }
@@ -199,6 +213,40 @@ int main(int argc, char** argv) {
         write_tracks(tracks_out, tracked, columns);
       }
       const auto pose = odometry.process(tracked);
+      if (dense_clouds) {
+        if (pose.settled_keyframe >= 0)
+          keyframe_depth.settle(static_cast<std::uint64_t>(pose.settled_keyframe), pose.settled_log_scale,
+                                pose.settled_scale_grid_valid ? &pose.settled_scale_grid : nullptr);
+        if (pose.keyframe && pose.has_pose && !frame_depth.empty()) {
+          KeyframeDepthInput input;
+          input.frame_index = pose.frame_index;
+          input.segment = pose.segment;
+          input.log_scale = std::isfinite(pose.keyframe_log_scale) ? pose.keyframe_log_scale :
+              pose.metric_scale > 0 ? std::log(pose.metric_scale) : std::numeric_limits<double>::quiet_NaN();
+          input.grid = pose.keyframe_scale_grid_valid ? &pose.keyframe_scale_grid : nullptr;
+          input.pose = pose.pose;
+          const auto K = vo_config.intrinsics ? *vo_config.intrinsics :
+              CameraIntrinsics::from_horizontal_fov(image.width, image.height, vo_config.horizontal_fov_degrees);
+          const auto samples = odometry.trajectory();
+          keyframe_depth.add(input, frame_depth, {}, K, vo_config.distortion_k1,
+                             [&](std::uint64_t f) -> std::optional<Pose> {
+                               auto it = std::lower_bound(samples.begin(), samples.end(), f,
+                                   [](const TrajectorySample& s, std::uint64_t x) { return s.frame_index < x; });
+                               if (it == samples.end() || it->frame_index != f) return std::nullopt;
+                               return it->pose;
+                             });
+        }
+      }
+      if (!export_keyframe_depth.empty() && pose.settled_keyframe >= 0 && pose.settled_scale_grid_valid) {
+        const std::filesystem::path dir(export_keyframe_depth);
+        std::filesystem::create_directories(dir);
+        const bool fresh = !std::filesystem::exists(dir / "settled.csv");
+        std::ofstream settled(dir / "settled.csv", std::ios::app);
+        if (fresh) settled << "frame_index,log_scale,g0,g1,g2,g3,g4,g5,g6,g7,g8,g9,g10,g11\n";
+        settled << std::setprecision(9) << pose.settled_keyframe << ',' << pose.settled_log_scale;
+        for (double g : pose.settled_scale_grid) settled << ',' << g;
+        settled << '\n';
+      }
       if (!export_keyframe_depth.empty() && pose.keyframe && pose.has_pose && !frame_depth.empty()) {
         const std::filesystem::path dir(export_keyframe_depth);
         std::filesystem::create_directories(dir);
@@ -209,12 +257,15 @@ int main(int argc, char** argv) {
         std::ofstream index(dir / "keyframes.csv", std::ios::app);
         if (fresh)
           index << "frame_index,segment,width,height,source_width,source_height,rotation,scale_x,scale_y,offset_x,"
-                   "offset_y,keyframe_log_scale,metric_scale\n";
+                   "offset_y,keyframe_log_scale,metric_scale,g0,g1,g2,g3,g4,g5,g6,g7,g8,g9,g10,g11\n";
         index << std::setprecision(9) << pose.frame_index << ',' << pose.segment << ',' << frame_depth.width << ','
               << frame_depth.height << ',' << frame_depth.source_width << ',' << frame_depth.source_height << ','
               << frame_depth.rotation << ',' << frame_depth.scale_x << ',' << frame_depth.scale_y << ','
               << frame_depth.offset_x << ',' << frame_depth.offset_y << ',' << pose.keyframe_log_scale << ','
-              << pose.metric_scale << '\n';
+              << pose.metric_scale;
+        for (double g : pose.keyframe_scale_grid)
+          index << ',' << (pose.keyframe_scale_grid_valid ? g : std::numeric_limits<double>::quiet_NaN());
+        index << '\n';
       }
       vo_posed += pose.has_pose;
       vo_keyframes += pose.keyframe;
@@ -386,6 +437,27 @@ int main(int argc, char** argv) {
                 vo_losses, vo_relocalized, segment_poses.size(), largest, percentile(vo_inlier_ratio, 0.5),
                 percentile(vo_reprojection, 0.5), vo_ms / (processed + 1), vo_max_ms);
     std::printf("merged duplicate landmarks: %zu\n", merged_total);
+    if (dense_clouds) {
+      std::size_t points = 0, hidden = 0, confirmed = 0, unchecked = 0, settled = 0;
+      for (const auto& c : keyframe_depth.clouds()) {
+        settled += c.settled;
+        for (std::size_t i = 0; i < c.points.size(); ++i) {
+          ++points;
+          hidden += !c.shown[i];
+          confirmed += c.agree[i] > 0;
+          unchecked += c.agree[i] == 0 && c.disagree[i] == 0;
+        }
+      }
+      std::printf("dense clouds: %zu keyframes (%zu settled), %zu points: confirmed %.3f, hidden %.3f, unchecked %.3f\n",
+                  keyframe_depth.clouds().size(), settled, points, double(confirmed) / std::max<std::size_t>(1, points),
+                  double(hidden) / std::max<std::size_t>(1, points), double(unchecked) / std::max<std::size_t>(1, points));
+      const auto& difference = keyframe_depth.difference_model();
+      const auto& w = difference.weights();
+      std::printf("dense between-view model: %s, %zu refs, sigma at 2 m flat centre %.4f; weights bias %.2f edge %.2f "
+                  "log-depth %.2f radius %.2f angle %.2f\n",
+                  difference.fitted() ? "fitted" : "not fitted", difference.references(),
+                  difference.sigma({0, static_cast<float>(std::log(2.0)), 0, 0}), w[0], w[1], w[2], w[3], w[4]);
+    }
     if (depth) {
       // Per segment: fused scale, the network's relative error on reference landmarks (keyframe spreads),
       // scale drift (log-scale slope), and the implied camera speed (walking ~1.2-1.5 m/s).

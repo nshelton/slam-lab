@@ -43,6 +43,9 @@ class TrajectoryView {
   bool show_retired_{true};
   int color_mode_{1};            // PointColor: 0 plain, 1 image, 2 confidence
   float min_confidence_{0.0F};
+  bool uncertainty_shape_{false};  // map points as uncertainty ellipsoids
+  float sigma_scale_{1.0F};
+  float max_axis_fraction_{0.05F};  // of the trajectory radius
   bool dim_retired_{true};
   // World-space diameter of the map points. Segment units: the first
   // keyframe's median scene depth is 1.
@@ -53,6 +56,8 @@ class TrajectoryView {
   const KeyframeDepthStore* depth_store_{};
   bool show_dense_{true};
   float dense_point_pixels_{2.0F};
+  float dense_max_sigma_{1.0F};  // network depth sigma filter (log depth); >= 1 shows all
+  bool dense_consistent_only_{true};
 };
 
 }  // namespace slam_native

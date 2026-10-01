@@ -86,6 +86,33 @@ void distort_point(float& x, float& y, int width, int height, double k1) {
   y = static_cast<float>(cy + dy * rd / ru);
 }
 
+namespace {
+// Bilinear weights of the scale grid's nodes at a pixel.
+void scale_grid_weights(int width, int height, double x, double y, int index[4], double weight[4]) {
+  const double gx = std::clamp(x / std::max(width - 1, 1) * (kScaleGridX - 1), 0.0, kScaleGridX - 1 - 1e-9);
+  const double gy = std::clamp(y / std::max(height - 1, 1) * (kScaleGridY - 1), 0.0, kScaleGridY - 1 - 1e-9);
+  const int ix = static_cast<int>(gx), iy = static_cast<int>(gy);
+  const double fx = gx - ix, fy = gy - iy;
+  index[0] = iy * kScaleGridX + ix;
+  index[1] = index[0] + 1;
+  index[2] = index[0] + kScaleGridX;
+  index[3] = index[2] + 1;
+  weight[0] = (1 - fx) * (1 - fy);
+  weight[1] = fx * (1 - fy);
+  weight[2] = (1 - fx) * fy;
+  weight[3] = fx * fy;
+}
+}  // namespace
+
+double scale_grid_at(const ScaleGrid& grid, int width, int height, double x, double y) {
+  int index[4];
+  double weight[4];
+  scale_grid_weights(width, height, x, y, index, weight);
+  double value = 0;
+  for (int k = 0; k < 4; ++k) value += weight[k] * grid[static_cast<std::size_t>(index[k])];
+  return value;
+}
+
 TrackedFrame undistorted(const TrackedFrame& frame, double k1) {
   TrackedFrame result = frame;
   if (k1 != 0)
@@ -142,6 +169,7 @@ struct VisualOdometry::Impl {
     SE3 pose;
     std::unordered_map<std::uint64_t, Vec2> observations;
     std::unordered_map<std::uint64_t, double> sigmas;  // resolved pixel sigma (see sigma_map), by track
+    std::unordered_map<std::uint64_t, std::pair<double, double>> depths;  // network (depth, sigma) m, by track
   };
   // A landmark's observation in a keyframe. The sigma is stored with it, as
   // several tracks can observe one landmark over its life.
@@ -154,6 +182,8 @@ struct VisualOdometry::Impl {
     // so measuring them against the current point would penalise age, not
     // inconsistency. NaN until first measured.
     double error{std::numeric_limits<double>::quiet_NaN()};
+    // Network depth sampled at this keyframe observation (metres); 0 = none.
+    double depth{}, depth_sigma{};
   };
   struct Landmark {
     Vec3 X;
@@ -314,8 +344,13 @@ struct VisualOdometry::Impl {
   Sighting sighting(int kf, std::uint64_t track_id) const {
     const auto& keyframe = keyframes[kf];
     auto it = keyframe.sigmas.find(track_id);
-    return {kf, keyframe.observations.at(track_id),
-            it != keyframe.sigmas.end() ? it->second : config.observation_sigma_px};
+    Sighting result{kf, keyframe.observations.at(track_id),
+                    it != keyframe.sigmas.end() ? it->second : config.observation_sigma_px};
+    if (auto d = keyframe.depths.find(track_id); d != keyframe.depths.end()) {
+      result.depth = d->second.first;
+      result.depth_sigma = d->second.second;
+    }
+    return result;
   }
   Vec2 normalized(const Vec2& u) const { return K.unproject(u).head<2>(); }
   bool reprojects(const SE3& T, const Vec3& X, const Vec2& u, double threshold) const {
@@ -429,13 +464,13 @@ struct VisualOdometry::Impl {
     double squared = 0;
     int measured = 0;
     int latest = obs.front().keyframe;
-    for (const auto& [kf, u, sigma, error] : obs) {
-      views.push_back({keyframes[kf].pose, u, sigma});
-      if (std::isfinite(error)) {
-        squared += error * error;
+    for (const auto& o : obs) {
+      views.push_back({keyframes[o.keyframe].pose, o.u, o.sigma});
+      if (std::isfinite(o.error)) {
+        squared += o.error * o.error;
         ++measured;
       }
-      latest = std::max(latest, kf);
+      latest = std::max(latest, o.keyframe);
     }
     landmark.reprojection_rms = measured ? std::sqrt(squared / measured) : std::numeric_limits<double>::quiet_NaN();
     landmark.max_parallax = 0;
@@ -681,7 +716,8 @@ struct VisualOdometry::Impl {
     // Arbitrary monocular scale: median scene depth of the first keyframe = 1.
     const double scale = 1.0 / median(depths);
     second.t *= scale;
-    const int k0 = add_keyframe(reference->frame_index, first, observation_map(*reference), sigma_map(*reference));
+    const int k0 = add_keyframe(reference->frame_index, first, observation_map(*reference), sigma_map(*reference),
+                                false);
     const int k1 = add_keyframe(frame.frame_index, second, current, sigmas);
     const auto reference_colors = color_map(*reference);
     for (std::size_t i = 0; i < ids.size(); ++i) {
@@ -1105,40 +1141,110 @@ struct VisualOdometry::Impl {
                    " landmarks re-found (" + std::to_string(gap) + " frames after its last pose)" + (young_had_map ? "; segment " + std::to_string(young) + " retired" : "");
   }
 
-  // Per-segment metric scale from the network depth of reference landmarks
-  // observed at keyframe `id` (just refined by BA). See the config comment.
-  void update_depth_scale(int id, OdometryFrameResult& result) {
-    if (depths.empty()) return;
+  // Log scale (metres per unit) of keyframe `id` from the network depth stored
+  // with its sightings of reference landmarks (see the config comment), at the
+  // keyframe's and landmarks' current estimates: the median, its robust spread
+  // and a ScaleGrid. False (and samples = count) with too few samples.
+  struct ScaleFit {
+    int samples{};
+    double centre{}, spread{};
+    bool grid_valid{};
+    ScaleGrid grid{};
+  };
+  bool fit_scale(int id, ScaleFit& fit) const {
     const SE3& T = keyframes[id].pose;
     std::vector<double> r;
-    for (const auto& [landmark_id, landmark] : landmarks) {
-      if (static_cast<int>(landmark.observations.size()) < config.depth_scale_min_keyframes ||
-          landmark.max_parallax < config.depth_scale_min_parallax_degrees * kDegree ||
-          landmark.observations.back().keyframe != id)
-        continue;
-      auto it = depths.find(landmark.track);
-      if (it == depths.end() || it->second.second > config.depth_scale_max_relative_sigma * it->second.first) continue;
-      const double z = (T * landmark.X).z();
-      if (z > 1e-9) r.push_back(std::log(it->second.first) - std::log(z));
-    }
-    result.keyframe_scale_samples = static_cast<int>(r.size());
-    if (static_cast<int>(r.size()) < config.depth_scale_min_samples) return;
-    const double centre = median(r);
+    std::vector<Vec2> at;  // the samples' pixels, distorted (the depth map's coordinates)
+    const auto gather = [&](const std::unordered_map<std::uint64_t, Landmark>& source) {
+      for (const auto& [landmark_id, landmark] : source) {
+        if (static_cast<int>(landmark.observations.size()) < config.depth_scale_min_keyframes ||
+            landmark.max_parallax < config.depth_scale_min_parallax_degrees * kDegree)
+          continue;
+        for (const auto& o : landmark.observations) {
+          if (o.keyframe != id || !(o.depth > 0) || o.depth_sigma > config.depth_scale_max_relative_sigma * o.depth)
+            continue;
+          const double z = (T * landmark.X).z();
+          if (z <= 1e-9) break;
+          r.push_back(std::log(o.depth) - std::log(z));
+          float x = static_cast<float>(o.u.x()), y = static_cast<float>(o.u.y());
+          if (config.distortion_k1 != 0) distort_point(x, y, width, height, config.distortion_k1);
+          at.emplace_back(x, y);
+          break;
+        }
+      }
+    };
+    gather(landmarks);
+    gather(dormant);
+    fit.samples = static_cast<int>(r.size());
+    if (fit.samples < config.depth_scale_min_samples) return false;
+    fit.centre = median(r);
     std::vector<double> deviation;
-    for (double v : r) deviation.push_back(std::abs(v - centre));
-    const double spread = 1.4826 * median(deviation);
-    result.keyframe_log_scale = centre;
-    result.keyframe_scale_spread = spread;
+    for (double v : r) deviation.push_back(std::abs(v - fit.centre));
+    fit.spread = 1.4826 * median(deviation);
+    // Grid: Huber IRLS on r - centre with a ridge towards 0 (= the median)
+    // for nodes with few samples.
+    constexpr int n = kScaleGridX * kScaleGridY;
+    std::vector<std::array<int, 4>> index(r.size());
+    std::vector<std::array<double, 4>> weight(r.size());
+    for (std::size_t i = 0; i < r.size(); ++i)
+      scale_grid_weights(width, height, at[i].x(), at[i].y(), index[i].data(), weight[i].data());
+    Eigen::Matrix<double, n, 1> g = Eigen::Matrix<double, n, 1>::Zero();
+    std::vector<double> robust(r.size(), 1.0);
+    constexpr double kDelta = 0.05, kRidge = 2.0;
+    for (int iteration = 0; iteration < 10; ++iteration) {
+      Eigen::Matrix<double, n, n> A = kRidge * Eigen::Matrix<double, n, n>::Identity();
+      Eigen::Matrix<double, n, 1> b = Eigen::Matrix<double, n, 1>::Zero();
+      for (std::size_t i = 0; i < r.size(); ++i)
+        for (int a = 0; a < 4; ++a) {
+          b(index[i][a]) += robust[i] * weight[i][a] * (r[i] - fit.centre);
+          for (int c = 0; c < 4; ++c) A(index[i][a], index[i][c]) += robust[i] * weight[i][a] * weight[i][c];
+        }
+      g = A.ldlt().solve(b);
+      for (std::size_t i = 0; i < r.size(); ++i) {
+        double predicted = 0;
+        for (int a = 0; a < 4; ++a) predicted += weight[i][a] * g(index[i][a]);
+        const double residual = std::abs(r[i] - fit.centre - predicted);
+        robust[i] = residual <= kDelta ? 1.0 : kDelta / residual;
+      }
+    }
+    for (int k = 0; k < n; ++k) fit.grid[static_cast<std::size_t>(k)] = fit.centre + g(k);
+    fit.grid_valid = g.allFinite();
+    return true;
+  }
+
+  // At a new keyframe `id`: its provisional scale (and the segment filter),
+  // and the settled scale of the keyframe that just left the BA window (its
+  // pose and landmarks no longer change much, so its grid is final).
+  void update_depth_scale(int id, OdometryFrameResult& result) {
+    ScaleFit fit;
+    const bool fitted = fit_scale(id, fit);
+    result.keyframe_scale_samples = fit.samples;
+    if (const std::size_t w = static_cast<std::size_t>(config.window_keyframes);
+        segment_keyframes.size() > w) {
+      const int settled = segment_keyframes[segment_keyframes.size() - w - 1];
+      ScaleFit final_fit;
+      if (fit_scale(settled, final_fit)) {
+        result.settled_keyframe = static_cast<std::int64_t>(keyframes[settled].frame_index);
+        result.settled_log_scale = final_fit.centre;
+        result.settled_scale_grid_valid = final_fit.grid_valid;
+        result.settled_scale_grid = final_fit.grid;
+      }
+    }
+    if (!fitted) return;
+    result.keyframe_log_scale = fit.centre;
+    result.keyframe_scale_spread = fit.spread;
+    result.keyframe_scale_grid_valid = fit.grid_valid;
+    result.keyframe_scale_grid = fit.grid;
     const double measurement = config.depth_scale_floor_sigma * config.depth_scale_floor_sigma +
-                               spread * spread / static_cast<double>(r.size());
+                               fit.spread * fit.spread / static_cast<double>(fit.samples);
     auto& scale = depth_scales[segment];
     if (scale.keyframes == 0) {
-      scale.log_scale = centre;
+      scale.log_scale = fit.centre;
       scale.variance = measurement;
     } else {
       const double predicted = scale.variance + config.depth_scale_drift_sigma * config.depth_scale_drift_sigma;
       const double gain = predicted / (predicted + measurement);
-      scale.log_scale += gain * (centre - scale.log_scale);
+      scale.log_scale += gain * (fit.centre - scale.log_scale);
       scale.variance = (1 - gain) * predicted;
     }
     ++scale.keyframes;
@@ -1167,10 +1273,12 @@ struct VisualOdometry::Impl {
     reference = frame;  // reinitialize from here
   }
 
+  // `current`: the keyframe is this frame, so it takes this frame's depth samples.
   int add_keyframe(std::uint64_t frame_index, const SE3& pose, std::unordered_map<std::uint64_t, Vec2> observations,
-                   std::unordered_map<std::uint64_t, double> observation_sigmas) {
+                   std::unordered_map<std::uint64_t, double> observation_sigmas, bool current = true) {
     const int id = static_cast<int>(keyframes.size());
-    keyframes.push_back({id, frame_index, segment, pose, std::move(observations), std::move(observation_sigmas)});
+    keyframes.push_back({id, frame_index, segment, pose, std::move(observations), std::move(observation_sigmas), {}});
+    if (current) keyframes.back().depths = depths;
     segment_keyframes.push_back(id);
     return id;
   }

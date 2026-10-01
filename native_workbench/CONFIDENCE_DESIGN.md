@@ -343,6 +343,42 @@ covariance still holds the keyframes fixed. Next: marginal covariance with
 camera uncertainty from BA (Schur complement), or calibrate the covariance
 scale (actual / predicted error ≈ 1.37 on synthetic; σ ≈ 1.7× optimistic on TUM).
 
+### Covariance calibration (2026-09-30)
+
+`pose_landmark_covariance_scale` multiplies the landmark covariance used for
+the Phase 2 weights (the keyframes-fixed covariance is optimistic: actual /
+predicted error ≈ 1.37 on synthetic data, so the variance is off by ≈ 1.9).
+With anisotropic weights and stale culling:
+
+| scale | fr1_desk | fr1_room | fr1_xyz | fr2_desk | fr3_long | mean ATE | mean RPE | RPE° |
+|---|---|---|---|---|---|---|---|---|
+| default (off) | 2.42 | 26.2 | 3.94 ± 6.15 | **12.3** ± 2.25 | 5.19 ± 0.84 | 10.02 | 4.55 | 1.60 |
+| 1 | 2.29 | 27.4 | 1.89 | 12.8 | 6.04 ± 1.74 | 10.09 | 4.42 | 1.48 |
+| **2** | 2.31 | 24.6 | **1.79** | 14.3 ± 1.17 | 5.40 ± 0.36 | **9.69** | **4.16** | **1.39** |
+| 4 | 2.33 | 32.7 | 1.86 | 14.1 | **4.94** ± 0.29 | 11.18 | 5.58 | 1.54 |
+
+Scale 2 (the predicted calibration) is best on all three means: ATE −3 %,
+RPE −9 %, rotation drift −13 % vs the default. fr3 is now within its spread of
+the default, while fr2_desk is the one sequence that is worse (ATE +2 cm,
+RPE 1.69 → 1.80). fr1_room's spread is too large to judge. (Measured with
+the core-debug build, which reproduces the app-debug default exactly.)
+Candidate default: `pose_landmark_uncertainty = cull_stale_observations =
+true, pose_landmark_covariance_scale = 2`, not yet switched on (other
+sessions are running comparisons against the current defaults).
+
+### Uncertainty ellipsoids (2026-09-30)
+
+Trajectory view, map-points row: *Uncertainty* draws every point as its
+1σ ellipsoid (× the *sigma* slider), each half-axis clamped to *max* × the
+trajectory radius. `covariance_shape.hpp` turns `MapPoint::covariance` into
+principal axes `R·diag(√λ)` (Jacobi, header-only); the instanced shader maps the
+icosahedron through them (display rotation applied, 1 px floor kept), so the
+sliders are live without re-uploading. Points without a covariance keep the
+point size. Check (`reports_uncertainty`): the long axis lies along the viewing
+ray from the last observing camera (median |cos| = 0.99995 over 3002 points).
+On TUM fr3, confident points come out short, and low-parallax ones as long
+needles pointing back at the camera path.
+
 ### Consistency term (2026-09-30)
 
 `MapPoint::confidence` = precision × verification × **consistency**. For

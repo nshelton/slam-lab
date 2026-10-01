@@ -132,6 +132,20 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
     ImGui::SetNextItemWidth(110);
     ImGui::SliderFloat("Min confidence", &min_confidence_, 0.0F, 1.0F, "%.2f");
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hide points below this depth confidence (0 shows all).");
+    ImGui::Checkbox("Uncertainty", &uncertainty_shape_);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Draw each point as its uncertainty ellipsoid (geometry-only covariance,\n"
+                        "keyframes held fixed: optimistic). Long along the viewing ray = depth\n"
+                        "poorly constrained. Points without a covariance keep the point size.");
+    if (uncertainty_shape_) {
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(70);
+      ImGui::SliderFloat("sigma##ellipsoid", &sigma_scale_, 0.5F, 3.0F, "%.1fx");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(70);
+      ImGui::SliderFloat("max##ellipsoid", &max_axis_fraction_, 0.005F, 0.5F, "%.3f", ImGuiSliderFlags_Logarithmic);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Longest drawn half-axis, as a fraction of the trajectory's size.");
+    }
   }
   if (depth_store_ && !depth_store_->clouds().empty()) {
     ImGui::Checkbox("Dense depth", &show_dense_);
@@ -144,7 +158,24 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
       ImGui::SetNextItemWidth(90);
       ImGui::SliderFloat("Dense size", &dense_point_pixels_, 1.0F, 6.0F, "%.1f px");
       ImGui::SameLine();
+      ImGui::Checkbox("Consistent only", &dense_consistent_only_);
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Hide points that neighbouring keyframes' depth contradicts (they see through\n"
+                          "them); points no other keyframe could check stay visible.");
+      ImGui::SameLine();
       ImGui::TextDisabled("%zu keyframes", depth_store_->clouds().size());
+      // Network-depth confidence (DepthConfidenceModel, trained on landmarks).
+      ImGui::SetNextItemWidth(110);
+      ImGui::SliderFloat("Max depth sigma", &dense_max_sigma_, 0.02F, 1.0F, "%.2f", ImGuiSliderFlags_Logarithmic);
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Hide dense points whose predicted network depth error (log depth, ~relative)\n"
+                          "exceeds this. The model learns from well-triangulated landmarks at each\n"
+                          "keyframe (cues: depth edges, distance, image radius, landmark density).\n"
+                          "Colour mode 'Confidence' colours dense points by it too.");
+      const auto& model = depth_store_->confidence_model();
+      ImGui::SameLine();
+      if (model.fitted()) ImGui::TextDisabled("model: %zu refs", model.references());
+      else ImGui::TextDisabled("model: learning (%zu refs)", model.references());
     }
   }
 
@@ -307,8 +338,13 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
       if (!(scale > 0)) continue;
       DenseCloudDraw d;
       d.key = cloud.frame_index;
+      d.version = cloud.version;
       d.points = &cloud.points;
       d.colors = &cloud.colors;
+      if (dense_consistent_only_) d.shown = &cloud.shown;
+      d.sigma = &cloud.sigma;
+      d.max_sigma = dense_max_sigma_ >= 1.0F ? std::numeric_limits<float>::infinity() : dense_max_sigma_;
+      d.color_by_confidence = color_mode_ == 2;
       const auto& R = it->pose.rotation;  // world -> camera; cloud (camera) -> world is R^T
       for (int r = 0; r < 3; ++r)
         for (int c = 0; c < 3; ++c) d.rotation[r * 3 + c] = static_cast<float>(R[c * 3 + r]);
@@ -334,8 +370,11 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
     camera.rotation = rotation_;
     const int only = all_segments_ ? -1 : segment;
     const auto color = static_cast<PointColor>(color_mode_);
-    const PointCloudStyle retired{point_size_, dim_retired_ ? 0.6F : 1.0F, color, only, min_confidence_};
-    const PointCloudStyle active{point_size_, 1.0F, color, only, min_confidence_};
+    const float max_axis = max_axis_fraction_ * radius;
+    const PointCloudStyle retired{point_size_, dim_retired_ ? 0.6F : 1.0F, color, only, min_confidence_,
+                                  uncertainty_shape_, sigma_scale_, max_axis};
+    const PointCloudStyle active{point_size_, 1.0F, color, only, min_confidence_, uncertainty_shape_, sigma_scale_,
+                                 max_axis};
     points_renderer_.render(draw, {origin.x, origin.y}, {origin.x + size.x, origin.y + size.y},
                             io.DisplayFramebufferScale.x, camera,
                             show_points_ && show_retired_ ? &retired_ : nullptr, retired,

@@ -65,6 +65,15 @@ void undistort_point(float& x, float& y, int width, int height, double k1);
 void distort_point(float& x, float& y, int width, int height, double k1);
 TrackedFrame undistorted(const TrackedFrame& frame, double k1);
 
+// A smooth per-keyframe depth correction: log metres per VO unit on a
+// kScaleGridX x kScaleGridY grid of nodes spanning the image (node (0,0) at
+// pixel (0,0), the last at (width-1, height-1)), bilinear in between. Indexed
+// row-major (y * kScaleGridX + x), in the frame's own (distorted) pixels.
+inline constexpr int kScaleGridX = 4;
+inline constexpr int kScaleGridY = 3;
+using ScaleGrid = std::array<double, kScaleGridX * kScaleGridY>;
+double scale_grid_at(const ScaleGrid& grid, int width, int height, double x, double y);
+
 struct CameraIntrinsics {
   double fx{}, fy{}, cx{}, cy{};  // pixels of the tracked frames
   static CameraIntrinsics from_horizontal_fov(int width, int height, double degrees);
@@ -247,6 +256,19 @@ struct OdometryFrameResult {
   double keyframe_log_scale{std::numeric_limits<double>::quiet_NaN()};
   int keyframe_scale_samples{};
   double keyframe_scale_spread{std::numeric_limits<double>::quiet_NaN()};
+  // On keyframes with enough samples: the keyframe's log-scale grid, fitted
+  // robustly to the same reference landmarks (pulled towards
+  // keyframe_log_scale where they are sparse). Corrects the network's
+  // low-frequency shape errors as well as its scale (DEPTH_INTEGRATION.md).
+  bool keyframe_scale_grid_valid{};
+  ScaleGrid keyframe_scale_grid{};
+  // On keyframes: the keyframe that just left the bundle-adjustment window
+  // (-1 = none) and its scale refitted at its now-final pose and landmarks.
+  // Consumers should replace that keyframe's provisional scale with it.
+  std::int64_t settled_keyframe{-1};
+  double settled_log_scale{std::numeric_limits<double>::quiet_NaN()};
+  bool settled_scale_grid_valid{};
+  ScaleGrid settled_scale_grid{};
   int relocalization_candidates{};  // descriptor matches tried this frame (0 if no attempt)
   // Track IDs with a landmark this frame, split by the pose fit (sorted; for
   // display). Inliers reproject within reprojection_threshold_px.

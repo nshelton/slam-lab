@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstddef>
+#include <limits>
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
@@ -38,6 +39,12 @@ struct PointCloudStyle {
   PointColor color{PointColor::image};  // image: falls back to plain without a colour
   int segment{-1};      // only this segment's points; < 0 draws all
   float min_confidence{0};  // > 0 hides points below it, and those with unknown confidence
+  // Draw each point as its uncertainty ellipsoid (MapPoint::covariance), axes
+  // x sigma_scale, each clamped to max_axis world units; points without a
+  // covariance keep the plain size.
+  bool uncertainty_shape{false};
+  float sigma_scale{1};
+  float max_axis{1};
 };
 
 // A dense cloud (e.g. a keyframe's back-projected depth): points in its own
@@ -45,12 +52,21 @@ struct PointCloudStyle {
 // Buffers are uploaded once per key; the transform is applied every frame, so
 // the cloud follows its keyframe's pose without re-uploading.
 struct DenseCloudDraw {
-  std::uint64_t key{};  // stable id (keyframe frame index); content must not change under a key
+  std::uint64_t key{};  // stable id (keyframe frame index)
+  std::uint32_t version{};  // re-uploaded when it changes (points, colours or `shown` changed)
   const std::vector<std::array<float, 3>>* points{};
   const std::vector<std::array<std::uint8_t, 3>>* colors{};
+  const std::vector<std::uint8_t>* shown{};  // optional per-point mask: 0 = not drawn
   std::array<float, 9> rotation{1, 0, 0, 0, 1, 0, 0, 0, 1};  // cloud -> world, row-major
   std::array<float, 3> origin{};                              // cloud origin in world
   float units_per_point_unit{1};                              // e.g. 1 / (metres per VO unit)
+  // Optional per-point network depth sigma (log depth, KeyframeCloud::sigma):
+  // points above max_sigma are not drawn; color_by_confidence replaces the
+  // colour by 1 / (1 + (sigma / sigma_reference)^2) on the map points' ramp.
+  const std::vector<float>* sigma{};
+  float max_sigma{std::numeric_limits<float>::infinity()};
+  bool color_by_confidence{};
+  float sigma_reference{0.2F};
 };
 
 class PointCloudRenderer {
@@ -85,6 +101,8 @@ class PointCloudRenderer {
   struct CloudBuffer {
     unsigned int buffer{}, vao{};
     int count{};
+    std::uint32_t version{};
+    bool masked{};
   };
   bool ensure_gl();
   bool ensure_cloud_gl();
@@ -99,13 +117,14 @@ class PointCloudRenderer {
   unsigned int program_{}, mesh_{};
   int u_pivot_{-1}, u_right_{-1}, u_up_{-1}, u_toward_{-1}, u_eye_distance_{-1}, u_perspective_{-1},
       u_focal_{-1}, u_scale_{-1}, u_near_{-1}, u_far_{-1}, u_viewport_{-1}, u_rotation_{-1}, u_size_{-1},
-      u_brightness_{-1}, u_color_mode_{-1}, u_segment_{-1}, u_min_confidence_{-1};
+      u_brightness_{-1}, u_color_mode_{-1}, u_segment_{-1}, u_min_confidence_{-1}, u_shape_mode_{-1},
+      u_sigma_scale_{-1}, u_max_axis_{-1};
   unsigned int msaa_fbo_{}, msaa_color_{}, msaa_depth_{}, resolve_fbo_{}, texture_{};
   bool cloud_gl_ready_{}, cloud_gl_failed_{};
   unsigned int cloud_program_{};
   int c_pivot_{-1}, c_right_{-1}, c_up_{-1}, c_toward_{-1}, c_eye_distance_{-1}, c_perspective_{-1}, c_focal_{-1},
       c_scale_{-1}, c_near_{-1}, c_far_{-1}, c_viewport_{-1}, c_rotation_{-1}, c_model_{-1}, c_origin_{-1},
-      c_units_{-1}, c_point_size_{-1};
+      c_units_{-1}, c_point_size_{-1}, c_max_sigma_{-1}, c_sigma_reference_{-1}, c_color_by_confidence_{-1};
   std::unordered_map<std::uint64_t, CloudBuffer> clouds_;
   std::uint64_t cloud_generation_{};
   int width_{}, height_{};

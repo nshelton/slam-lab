@@ -80,6 +80,10 @@ if(BUILD_TESTING)
   target_link_libraries(slam-native-recents-test PRIVATE slam-native-recents)
   target_compile_options(slam-native-recents-test PRIVATE -Wall -Wextra -Wpedantic)
   add_test(NAME native_recent_sessions COMMAND slam-native-recents-test)
+  add_executable(slam-native-depth-confidence-test tests/test_depth_confidence.cpp src/depth_confidence.cpp)
+  target_include_directories(slam-native-depth-confidence-test PRIVATE include)
+  target_compile_options(slam-native-depth-confidence-test PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME native_depth_confidence COMMAND slam-native-depth-confidence-test)
   add_executable(slam-native-diagnostics-test
     tests/test_descriptor_projection.cpp
     src/descriptor_projection.cpp
@@ -143,6 +147,7 @@ if(SLAM_NATIVE_BUILD_APP)
     src/depth_estimator.cu
     src/depth_sampling.cpp
     src/keyframe_depth.cpp
+    src/depth_confidence.cpp
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
@@ -202,7 +207,7 @@ if(SLAM_NATIVE_BUILD_APP)
     add_test(NAME native_gpu_flow_tracker COMMAND slam-native-gpu-tracker-test)
     # Depth sampling and keyframe clouds on synthetic maps (no engine or video needed).
     add_executable(slam-native-depth-test tests/test_depth.cpp src/depth_estimator.cu src/depth_sampling.cpp
-      src/keyframe_depth.cpp)
+      src/keyframe_depth.cpp src/depth_confidence.cpp)
     target_include_directories(slam-native-depth-test PRIVATE include ${TENSORRT_INCLUDE_DIR})
     target_link_libraries(slam-native-depth-test PRIVATE slam-native-vo CUDA::cudart ${TENSORRT_LIBRARY}
       ${CMAKE_DL_LIBS})
@@ -235,6 +240,7 @@ if(SLAM_NATIVE_BUILD_APP)
       src/depth_estimator.cu
       src/depth_sampling.cpp
       src/keyframe_depth.cpp
+      src/depth_confidence.cpp
     )
     target_include_directories(slam-native-tracking-bench PRIVATE include third_party/nvof ${TENSORRT_INCLUDE_DIR})
     target_link_libraries(slam-native-tracking-bench PRIVATE slam-native-store slam-native-vo PkgConfig::FFMPEG

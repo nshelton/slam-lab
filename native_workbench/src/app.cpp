@@ -1028,13 +1028,49 @@ struct Session {
                                     runtime.odometry.event;
     }
     const auto& r = runtime.odometry;
+    if (r.settled_keyframe >= 0)  // that keyframe's scale from its final geometry
+      keyframe_depth.settle(static_cast<std::uint64_t>(r.settled_keyframe), r.settled_log_scale,
+                            r.settled_scale_grid_valid ? &r.settled_scale_grid : nullptr);
     if (map && r.keyframe && r.has_pose) {
-      // Local scale: this keyframe's own estimate (the VO's scale drifts within
-      // a segment), else the segment's filtered one, else unknown (0).
-      const double scale = std::isfinite(r.keyframe_log_scale) ? std::exp(r.keyframe_log_scale) : r.metric_scale;
+      // Local scale: this keyframe's own grid/estimate (the VO's scale drifts
+      // within a segment), else the segment's filtered one, else unknown.
+      KeyframeDepthInput input;
+      input.frame_index = r.frame_index;
+      input.segment = r.segment;
+      input.log_scale = std::isfinite(r.keyframe_log_scale) ? r.keyframe_log_scale :
+                        r.metric_scale > 0 ? std::log(r.metric_scale) : std::numeric_limits<double>::quiet_NaN();
+      input.grid = r.keyframe_scale_grid_valid ? &r.keyframe_scale_grid : nullptr;
+      input.pose = r.pose;
+      {
+        // References for the depth confidence model: this frame's observations
+        // of well-triangulated landmarks (geometry-only: >= 2 deg parallax,
+        // >= 3 keyframes; the circularity rule of DEPTH_INTEGRATION.md 0b).
+        const auto points = odometry->active_map();
+        std::unordered_map<std::uint64_t, const MapPoint*> by_landmark;
+        for (const auto& p : points) by_landmark.emplace(p.landmark_id, &p);
+        const auto& R = r.pose.rotation;
+        const auto& t = r.pose.translation;
+        for (const auto& o : tracked.observations) {
+          const auto id = odometry->landmark_id(o.track_id);
+          if (!id) continue;
+          const auto it = by_landmark.find(*id);
+          if (it == by_landmark.end()) continue;
+          const MapPoint& p = *it->second;
+          if (p.max_parallax_degrees < 2 || p.keyframe_observations < 3 || !std::isfinite(p.depth_sigma_ratio)) continue;
+          const double z = R[6] * p.position[0] + R[7] * p.position[1] + R[8] * p.position[2] + t[2];
+          if (z > 0) input.references.push_back({o.x, o.y, z, p.depth_sigma_ratio});
+        }
+      }
       const auto K = config.odometry.intrinsics ? *config.odometry.intrinsics :
           CameraIntrinsics::from_horizontal_fov(tracked.width, tracked.height, config.odometry.horizontal_fov_degrees);
-      keyframe_depth.add(r.frame_index, r.segment, scale, *map, grid_colors, K, config.odometry.distortion_k1);
+      const auto samples = odometry->trajectory();  // current (bundle-adjusted) keyframe poses
+      const auto pose_of = [&](std::uint64_t frame) -> std::optional<Pose> {
+        const auto it = std::lower_bound(samples.begin(), samples.end(), frame,
+                                         [](const TrajectorySample& s, std::uint64_t f) { return s.frame_index < f; });
+        if (it == samples.end() || it->frame_index != frame) return std::nullopt;
+        return it->pose;
+      };
+      keyframe_depth.add(input, *map, grid_colors, K, config.odometry.distortion_k1, pose_of);
     }
     trajectory_view.update(*odometry);
     focal.add(tracked);  // background thread
