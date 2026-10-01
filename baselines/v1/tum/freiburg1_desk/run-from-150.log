@@ -1,0 +1,22 @@
+  vo frame 340: loop closed: keyframe 340 with 182 (23 landmarks), 41 keyframes corrected, 23 merged [global]
+frames=463 start=0.0s mean_detections=1100
+continuation_rate=0.6429 (matched 297010 of 462000 previous live tracks)
+tracks=25939 mean_len=12.45 median_len=5 p90_len=33 >=10:9380 >=30:3043 >=100:124
+frame0_cohort=1000 survivors@10=697 @30=178 @60=10 @120=5 @300=0
+match_descriptor_cos median=0.958 p10=0.864 frac<0.7=0.0000
+correction px median=1.30 p90=3.30
+nearest-detection px from prev track: +flow median=2.06 p90=9.26 | -flow median=6.45 | zero median=5.36 p90=11.79
+lost tracks: no detection within 6px=15174, nearest taken by other track=1947, nearest left free=7818, bad flow=0; lost nearest px median=7.55 p75=13.24
+global loop search: 54 keyframes searched, database 1854 landmarks and 47.6 matches on average, matching 23.10 ms mean (max 64.9), P3P inliers median 0 p90 28, 4 verified, 1 loops detected
+camera pose: posed 459/463 frames, 83 keyframes, 0 losses, 0 relocalized, 1 segments (largest 460 poses), inlier ratio median 0.807, median reprojection 1.36 px, 7.08 ms/frame (max 104.0)
+merged duplicate landmarks: 930
+landmarks: 7103 (0 retired), re-associated 3008: next pose fit inlier 2415 / outlier 284 / unresolved 307; untracked landmarks in view 2075.8 per frame
+nearest raw detection (px) p25/p50/p75: untracked landmarks 4.0/6.5/10.5, random points 5.3/9.3/16.6
+untracked in view, what is within 3 px: nothing 0.83, raw detection only 0.06, track without landmark 0.04, track with another landmark 0.06
+  re-associated active , projection 0-1 px: inlier 467 outlier 46 unresolved 54
+  re-associated active , projection 1-2 px: inlier 1807 outlier 217 unresolved 174
+  re-associated dormant, projection 0-1 px: inlier 31 outlier 4 unresolved 2
+  re-associated dormant, projection 1-2 px: inlier 110 outlier 17 unresolved 8
+global bundle adjustment before export
+mean coasted tracks/frame=303.1
+ms/frame: superpoint=27.29 flow_gpu=2.94 tracking_wall=7.45 (incl. flow wait) tracking_gpu=1.409

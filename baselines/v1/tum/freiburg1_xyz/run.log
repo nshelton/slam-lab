@@ -1,0 +1,24 @@
+  vo frame 460: loop closed: keyframe 460 with 142 (25 landmarks), 60 keyframes corrected, 25 merged [global]
+  vo frame 637: loop closed: keyframe 637 with 231 (20 landmarks), 78 keyframes corrected, 20 merged [global]
+  vo frame 726: loop closed: keyframe 726 with 460 (53 landmarks), 90 keyframes corrected, 53 merged
+frames=798 start=0.0s mean_detections=1209
+continuation_rate=0.7519 (matched 599230 of 797000 previous live tracks)
+tracks=29807 mean_len=21.10 median_len=8 p90_len=61 >=10:13904 >=30:6902 >=100:852
+frame0_cohort=1000 survivors@10=821 @30=558 @60=434 @120=147 @300=2
+match_descriptor_cos median=0.968 p10=0.901 frac<0.7=0.0000
+correction px median=1.00 p90=2.65
+nearest-detection px from prev track: +flow median=1.38 p90=7.07 | -flow median=5.48 | zero median=4.56 p90=9.65
+lost tracks: no detection within 6px=16034, nearest taken by other track=3127, nearest left free=9646, bad flow=0; lost nearest px median=6.86 p75=12.23
+global loop search: 63 keyframes searched, database 1059 landmarks and 82.6 matches on average, matching 12.80 ms mean (max 43.6), P3P inliers median 0 p90 36, 10 verified, 2 loops detected
+camera pose: posed 792/798 frames, 92 keyframes, 0 losses, 0 relocalized, 1 segments (largest 793 poses), inlier ratio median 0.868, median reprojection 1.10 px, 5.29 ms/frame (max 439.3)
+merged duplicate landmarks: 3094
+landmarks: 4220 (0 retired), re-associated 10795: next pose fit inlier 9301 / outlier 688 / unresolved 795; untracked landmarks in view 1161.6 per frame
+nearest raw detection (px) p25/p50/p75: untracked landmarks 3.0/5.0/7.8, random points 5.1/9.1/16.6
+untracked in view, what is within 3 px: nothing 0.73, raw detection only 0.10, track without landmark 0.05, track with another landmark 0.12
+  re-associated active , projection 0-1 px: inlier 1660 outlier 69 unresolved 105
+  re-associated active , projection 1-2 px: inlier 5128 outlier 367 unresolved 297
+  re-associated dormant, projection 0-1 px: inlier 472 outlier 38 unresolved 46
+  re-associated dormant, projection 1-2 px: inlier 2041 outlier 214 unresolved 151
+global bundle adjustment before export
+mean coasted tracks/frame=212.0
+ms/frame: superpoint=16.70 flow_gpu=0.61 tracking_wall=3.51 (incl. flow wait) tracking_gpu=0.239

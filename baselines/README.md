@@ -1,0 +1,47 @@
+# Pipeline baselines
+
+Each folder is one snapshot of what the full pipeline (decode → SuperPoint → flow
+tracker → VO, `slam-native-tracking-bench`) produces, made with
+`native_workbench/tools/baseline.py --skips 0,150,300`: every sequence from
+three start frames, because monocular VO is chaotic (one keyframe decision can
+change a whole run). `manifest.json` has the commit, binary hash and exact
+command per run; runs are deterministic.
+
+- **v1**: commit `fdbdc89` (before the cleanup). VO with loop closure (spatial +
+  global appearance search), relocalization, dormant landmarks, re-association
+  and merging, uncertainty weighting, final global BA. Loops solved
+  synchronously (`loop-sync 1`); the bench was patched only to add `skip`.
+- **v2**: the minimal VO (two-view init, PnP tracking with P3P recovery,
+  keyframes, triangulation, 8-keyframe local BA, new segment on loss). Run with
+  the v3 binary and `reassoc-radius 0 local-map 8`, which reproduces it
+  byte for byte.
+- **v3**: commit `4bb589f`: v2 plus the local map (30 keyframes) with
+  re-association and merging.
+
+## ATE (cm, largest segment, sim3-aligned): mean ± range over the three starts
+
+| sequence        | v1            | v2            | v3            |
+|-----------------|--------------:|--------------:|--------------:|
+| fr1_desk        |  3.4 ±   2.4  |  8.9 ±   9.6  |  9.3 ±  12.5  |
+| fr1_room        | 33.6 ±  17.8  | 51.7 ±  54.1  | 43.2 ±  13.8  |
+| fr1_xyz         |  1.2 ±   0.1  |  6.7 ±  11.3  |  1.7 ±   0.2  |
+| fr2_desk        |  3.9 ±   6.9  | 14.6 ±   6.0  | 13.4 ±   5.1  |
+| fr3_long_office | 58.8 ± 170.1  | 63.4 ± 164.0  |  5.7 ±   1.5  |
+
+dreamworks (no ground truth), full run: v1 posed 831/882 frames in 4 segments
+(2 relocalized, largest 822), v2 847/882 in 6 (largest 557), v3 828/882 in 4
+(largest 557).
+
+## Reading
+
+- Re-association (v3) removes v2's blow-ups (fr1_xyz, fr3) and narrows the
+  spread; on fr3 it beats v1, which also blew up from one start.
+- The remaining gap to v1 (fr1_desk, fr1_room, fr2_desk) is loop closure and
+  global BA. Single-start attribution on fr1 (v1 with features switched off):
+  without loops fr1_desk 3.0 → 13.7, fr1_room 24.7 → 61.1; also without the
+  descriptor features 11.0 / 74.2; GBA + uncertainty weighting are the last
+  1–5 cm.
+- v2/v3 run 3–4× faster than v1 (which spent most of its time in the
+  brute-force global loop search).
+- v1 crashed once on fr2_desk (`double free or corruption`) and passed on the
+  rerun: an intermittent memory bug in code that was deleted.

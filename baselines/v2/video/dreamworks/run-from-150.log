@@ -1,0 +1,16 @@
+[mov,mp4,m4a,3gp,3g2,mj2 @ 0x5ee418ff8900] Could not find codec parameters for stream 2 (Audio: none (apac / 0x63617061), 48000 Hz, 4 channels, 393 kb/s): unknown codec
+Consider increasing the value for the 'analyzeduration' (0) and 'probesize' (5000000) options
+  vo frame 560: too few tracked landmarks
+  vo frame 566: pose optimization lost the map
+  vo frame 579: pose optimization lost the map
+  vo frame 668: too few tracked landmarks
+  vo frame 851: pose optimization lost the map
+frames=732 start=0.0s mean_detections=1986
+continuation_rate=0.6387 (matched 466885 of 731000 previous live tracks)
+tracks=44715 mean_len=11.44 median_len=2 p90_len=39 >=10:12945 >=30:6081 >=100:68
+frame0_cohort=1000 survivors@10=797 @30=321 @60=149 @120=0 @300=0
+match_descriptor_cos median=0.973 p10=0.925 frac<0.7=0.0000
+camera pose: posed 697/732 frames, 113 keyframes, 5 losses, 6 segments (largest 407 poses), inlier ratio median 0.898, median reprojection 1.17 px, 1.74 ms/frame (max 15.5)
+landmarks: 8714 (8648 retired), re-associated 0 (0 merged)
+mean coasted tracks/frame=301.5
+ms/frame: superpoint=25.89 flow_gpu=3.31 tracking_wall=8.33 (incl. flow wait) tracking_gpu=0.928

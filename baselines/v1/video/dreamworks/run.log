@@ -1,0 +1,29 @@
+[mov,mp4,m4a,3gp,3g2,mj2 @ 0x65421bf85d00] Could not find codec parameters for stream 2 (Audio: none (apac / 0x63617061), 48000 Hz, 4 channels, 393 kb/s): unknown codec
+Consider increasing the value for the 'analyzeduration' (0) and 'probesize' (5000000) options
+  vo frame 560: too few tracked landmarks
+  vo frame 566: pose optimization lost the map
+  vo frame 573: relocalized into segment 0: 35 landmarks re-found (14 frames after its last pose); segment 2 retired
+  vo frame 668: too few tracked landmarks
+  vo frame 680: relocalized into segment 0: 42 landmarks re-found (13 frames after its last pose); segment 3 retired
+  vo frame 850: too few tracked landmarks
+frames=882 start=0.0s mean_detections=1996
+continuation_rate=0.6669 (matched 587533 of 881000 previous live tracks)
+tracks=50844 mean_len=12.56 median_len=3 p90_len=41 >=10:15873 >=30:7833 >=100:252
+frame0_cohort=1000 survivors@10=857 @30=642 @60=412 @120=29 @300=0
+match_descriptor_cos median=0.974 p10=0.930 frac<0.7=0.0000
+correction px median=1.19 p90=3.15
+nearest-detection px from prev track: +flow median=1.84 p90=18.53 | -flow median=10.26 | zero median=8.77 p90=22.00
+lost tracks: no detection within 6px=44637, nearest taken by other track=257, nearest left free=4950, bad flow=0; lost nearest px median=19.44 p75=34.86
+global loop search: 90 keyframes searched, database 3541 landmarks and 49.2 matches on average, matching 39.90 ms mean (max 93.6), P3P inliers median 0 p90 0, 0 verified, 0 loops detected
+camera pose: posed 831/882 frames, 125 keyframes, 4 losses, 2 relocalized, 4 segments (largest 822 poses), inlier ratio median 0.906, median reprojection 1.17 px, 8.35 ms/frame (max 109.1)
+merged duplicate landmarks: 105
+landmarks: 9970 (622 retired), re-associated 984: next pose fit inlier 839 / outlier 60 / unresolved 85; untracked landmarks in view 305.8 per frame
+nearest raw detection (px) p25/p50/p75: untracked landmarks 6.3/11.1/20.3, random points 9.9/17.0/30.6
+untracked in view, what is within 3 px: nothing 0.92, raw detection only 0.05, track without landmark 0.02, track with another landmark 0.01
+  re-associated active , projection 0-1 px: inlier 165 outlier 7 unresolved 21
+  re-associated active , projection 1-2 px: inlier 634 outlier 52 unresolved 60
+  re-associated dormant, projection 0-1 px: inlier 6 outlier 0 unresolved 0
+  re-associated dormant, projection 1-2 px: inlier 34 outlier 1 unresolved 2
+global bundle adjustment before export
+mean coasted tracks/frame=276.5
+ms/frame: superpoint=16.31 flow_gpu=3.35 tracking_wall=6.78 (incl. flow wait) tracking_gpu=0.683

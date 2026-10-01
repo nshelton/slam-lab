@@ -1,0 +1,22 @@
+  vo frame 847: pose optimization lost the map
+frames=1062 start=0.0s mean_detections=1052
+continuation_rate=0.6121 (matched 649243 of 1060733 previous live tracks)
+tracks=67273 mean_len=10.65 median_len=4 p90_len=29 >=10:22204 >=30:6387 >=100:187
+frame0_cohort=902 survivors@10=394 @30=58 @60=0 @120=0 @300=0
+match_descriptor_cos median=0.958 p10=0.875 frac<0.7=0.0000
+correction px median=1.29 p90=3.23
+nearest-detection px from prev track: +flow median=2.14 p90=11.54 | -flow median=7.27 | zero median=6.09 p90=14.19
+lost tracks: no detection within 6px=45086, nearest taken by other track=4763, nearest left free=16424, bad flow=0; lost nearest px median=9.46 p75=17.19
+global loop search: 128 keyframes searched, database 2456 landmarks and 34.2 matches on average, matching 29.69 ms mean (max 78.3), P3P inliers median 0 p90 0, 0 verified, 0 loops detected
+camera pose: posed 1055/1062 frames, 186 keyframes, 1 losses, 0 relocalized, 2 segments (largest 543 poses), inlier ratio median 0.812, median reprojection 1.42 px, 7.66 ms/frame (max 114.6)
+merged duplicate landmarks: 1730
+landmarks: 16227 (8036 retired), re-associated 5552: next pose fit inlier 4421 / outlier 520 / unresolved 609; untracked landmarks in view 922.9 per frame
+nearest raw detection (px) p25/p50/p75: untracked landmarks 4.2/7.0/11.7, random points 5.2/8.9/15.4
+untracked in view, what is within 3 px: nothing 0.85, raw detection only 0.06, track without landmark 0.04, track with another landmark 0.06
+  re-associated active , projection 0-1 px: inlier 886 outlier 67 unresolved 122
+  re-associated active , projection 1-2 px: inlier 3260 outlier 416 unresolved 374
+  re-associated dormant, projection 0-1 px: inlier 47 outlier 7 unresolved 1
+  re-associated dormant, projection 1-2 px: inlier 228 outlier 30 unresolved 7
+global bundle adjustment before export
+mean coasted tracks/frame=325.4
+ms/frame: superpoint=27.06 flow_gpu=3.13 tracking_wall=7.71 (incl. flow wait) tracking_gpu=1.476

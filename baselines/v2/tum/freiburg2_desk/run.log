@@ -1,0 +1,9 @@
+frames=2965 start=0.0s mean_detections=1137
+continuation_rate=0.7728 (matched 2290528 of 2964000 previous live tracks)
+tracks=66585 mean_len=35.40 median_len=10 p90_len=99 >=10:33947 >=30:20609 >=100:6658
+frame0_cohort=1000 survivors@10=840 @30=652 @60=370 @120=201 @300=54
+match_descriptor_cos median=0.971 p10=0.916 frac<0.7=0.0000
+camera pose: posed 2955/2965 frames, 338 keyframes, 0 losses, 1 segments (largest 2956 poses), inlier ratio median 0.894, median reprojection 0.97 px, 1.71 ms/frame (max 15.1)
+landmarks: 25404 (24395 retired)
+mean coasted tracks/frame=205.1
+ms/frame: superpoint=17.34 flow_gpu=0.92 tracking_wall=4.90 (incl. flow wait) tracking_gpu=0.652

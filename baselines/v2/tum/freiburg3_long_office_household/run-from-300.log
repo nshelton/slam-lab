@@ -1,0 +1,11 @@
+  vo frame 684: pose re-estimated (P3P RANSAC)
+  vo frame 787: pose re-estimated (P3P RANSAC)
+frames=2285 start=0.0s mean_detections=876
+continuation_rate=0.6779 (matched 1546227 of 2280858 previous live tracks)
+tracks=76712 mean_len=21.16 median_len=6 p90_len=59 >=10:31175 >=30:15301 >=100:3423
+frame0_cohort=960 survivors@10=868 @30=602 @60=370 @120=127 @300=13
+match_descriptor_cos median=0.973 p10=0.918 frac<0.7=0.0000
+camera pose: posed 2277/2285 frames, 344 keyframes, 0 losses, 1 segments (largest 2278 poses), inlier ratio median 0.862, median reprojection 1.13 px, 1.78 ms/frame (max 14.0)
+landmarks: 22872 (21656 retired), re-associated 0 (0 merged)
+mean coasted tracks/frame=288.5
+ms/frame: superpoint=25.66 flow_gpu=1.31 tracking_wall=6.35 (incl. flow wait) tracking_gpu=0.903

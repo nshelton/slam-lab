@@ -1,0 +1,22 @@
+  vo frame 2513: loop closed: keyframe 2513 with 2219 (38 landmarks), 322 keyframes corrected, 38 merged
+frames=2285 start=0.0s mean_detections=876
+continuation_rate=0.6779 (matched 1546227 of 2280858 previous live tracks)
+tracks=76712 mean_len=21.16 median_len=6 p90_len=59 >=10:31175 >=30:15301 >=100:3423
+frame0_cohort=960 survivors@10=868 @30=602 @60=370 @120=127 @300=13
+match_descriptor_cos median=0.973 p10=0.918 frac<0.7=0.0000
+correction px median=1.08 p90=2.75
+nearest-detection px from prev track: +flow median=1.66 p90=8.28 | -flow median=4.89 | zero median=3.35 p90=9.00
+lost tracks: no detection within 6px=40842, nearest taken by other track=7533, nearest left free=27337, bad flow=0; lost nearest px median=6.52 p75=11.31
+global loop search: 297 keyframes searched, database 6048 landmarks and 69.6 matches on average, matching 71.98 ms mean (max 166.7), P3P inliers median 0 p90 0, 5 verified, 0 loops detected
+camera pose: posed 2277/2285 frames, 326 keyframes, 0 losses, 0 relocalized, 1 segments (largest 2278 poses), inlier ratio median 0.871, median reprojection 1.13 px, 16.48 ms/frame (max 7092.6)
+merged duplicate landmarks: 6622
+landmarks: 14527 (9458 retired), re-associated 21882: next pose fit inlier 17265 / outlier 1891 / unresolved 2700; untracked landmarks in view 3051.3 per frame
+nearest raw detection (px) p25/p50/p75: untracked landmarks 4.5/7.4/12.4, random points 6.3/11.8/22.8
+untracked in view, what is within 3 px: nothing 0.86, raw detection only 0.03, track without landmark 0.03, track with another landmark 0.08
+  re-associated active , projection 0-1 px: inlier 3856 outlier 347 unresolved 391
+  re-associated active , projection 1-2 px: inlier 12457 outlier 1453 unresolved 1220
+  re-associated dormant, projection 0-1 px: inlier 176 outlier 13 unresolved 19
+  re-associated dormant, projection 1-2 px: inlier 776 outlier 78 unresolved 56
+global bundle adjustment before export
+mean coasted tracks/frame=288.5
+ms/frame: superpoint=15.93 flow_gpu=0.55 tracking_wall=3.42 (incl. flow wait) tracking_gpu=0.177
