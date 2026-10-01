@@ -4,6 +4,8 @@
 // VOXEL_SIZE shows the voxel map instead of the map points ("points": both),
 // with this carve weight (1) and rays from all observers (1) or only each
 // landmark's first and last frames (0), and prints the voxel counts.
+// SLAM_SNAPSHOT_DEPTH=MODE in the environment turns the live depth overlay on
+// (0 keypoints only, 1 one measurement, 2 filter, 3 fused) and prints its statistics.
 #include "../src/app.cpp"
 #include <fstream>
 #include <iostream>
@@ -30,6 +32,10 @@ int main(int argc, char** argv) {
     config.database = root / "features.db";
     Session session(config);
     session.runtime.realtime_pacing = false;
+    if (const char* depth = std::getenv("SLAM_SNAPSHOT_DEPTH")) {
+      session.runtime.show_depth = true;
+      session.runtime.depth_mode = std::atoi(depth);
+    }
     if (std::stod(argv[3]) > 0) {
       session.runtime.seek_seconds = std::stod(argv[3]);
       session.runtime.seek_requested = true;
@@ -52,7 +58,8 @@ int main(int argc, char** argv) {
       DatabaseStats stats = database_summary.get(session.config.database, false);
       draw_sidebar(session.runtime, *session.decoder, *session.store, *session.flow_tracker, stats,
                    session.config.database);
-      draw_video(session.runtime, true, session.decoder->duration_ns(), session.decoder->start_time_ns());
+      draw_video(session.runtime, true, session.decoder->duration_ns(), session.decoder->start_time_ns(),
+                 session.live_depth.get());
       draw_flow_diagnostics(session.runtime, *session.flow_tracker);
       session.trajectory_view.draw(*session.odometry, &session.runtime.show_trajectory,
                                    session.runtime.frame_width, session.runtime.frame_height);
@@ -71,6 +78,13 @@ int main(int argc, char** argv) {
     for (int y = height - 1; y >= 0; --y)
       out.write(reinterpret_cast<const char*>(pixels.data() + static_cast<std::size_t>(y) * width * 3), width * 3);
     session.store->flush();
+    if (session.runtime.show_depth || !session.runtime.depth_error.empty()) {
+      const auto& d = session.runtime.depth_stats;
+      std::cout << "depth: " << 100.0 * double(d.estimated) / double(std::max<std::size_t>(1, d.pixels))
+                << "% of pixels, " << 100.0 * double(d.measured) / double(std::max<std::size_t>(1, d.pixels))
+                << "% measured in the last frame, " << d.ms << " ms"
+                << (session.runtime.depth_error.empty() ? "" : ", error: " + session.runtime.depth_error) << '\n';
+    }
     if (argc > 6) {
       const auto& voxels = session.trajectory_view.voxels();
       const auto stats = voxels.stats();

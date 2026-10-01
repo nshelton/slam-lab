@@ -4,8 +4,9 @@
 // visual odometry and only reads from it: the frame's pose, and the depths of
 // the landmarks the frame's tracks observe ("anchors").
 //
-// Built so far: the per-frame measurement (no memory between frames) and an
-// anchors-only estimate that serves as the floor to beat.
+// Built so far: the per-frame measurement, an anchors-only estimate that
+// serves as the floor to beat, and the filter that fuses the measurements
+// over time.
 #include "slam_native/optical_flow.hpp"
 #include "slam_native/types.hpp"
 #include "slam_native/visual_odometry.hpp"
@@ -43,6 +44,14 @@ enum class LiveDepthMode {
   // in between, where on that line to look, and a short search for the best
   // patch match along the line gives the disparity.
   measurement,
+  // The measurements of all frames so far in one estimate: carried into each
+  // new frame with the camera motion, rescaled to the anchors under it, and
+  // fused with the frame's measurement.
+  filter,
+  // The filter's image combined with the anchors' interpolation, which also
+  // fills the pixels the filter has nothing for. The anchors are not folded
+  // into the filter's state, so they are not counted again every frame.
+  fused,
 };
 
 struct LiveDepthConfig {
@@ -63,15 +72,24 @@ struct LiveDepthConfig {
   // Disparity noise (pixels): sigma^2 = floor^2 + 2 image_noise^2 / gradient^2.
   float disparity_floor_px{0.2F};
   float image_noise{3.0F};       // luma levels
-  // LiveDepthMode::anchors: relative sigma = base + per_px * distance to the nearest anchor.
-  float anchor_sigma{0.05F};
-  float anchor_sigma_per_px{0.004F};
+  // The anchors' interpolation: relative sigma = base + per_px * distance to the nearest anchor.
+  float anchor_sigma{0.03F};
+  float anchor_sigma_per_px{0.0025F};
+  // Filter. Sigmas are relative (of the inverse depth).
+  float process_sigma{0.003F};             // added per frame carried
+  float propagation_tolerance_px{1.5F};    // a carried point must land this close to its pixel
+  float measurement_sigma{0.06F};          // added to every measurement: pose and model error
+  float min_sigma{0.01F};                  // the fused estimate is never trusted beyond this
+  float outlier_sigmas{2.5F};              // estimates further apart than this are not averaged
+  bool scale_to_anchors{true};
 };
 
 // Why pixels got no measurement (LiveDepthMode::measurement), last frame.
 struct LiveDepthStats {
   std::size_t pixels{};
-  std::size_t measured{};
+  std::size_t estimated{};      // pixels with an estimate in the image
+  std::size_t measured{};       // pixels this frame's measurement gave
+  float scale{1.0F};            // filter: landmarks / state under them, before it was applied
   std::size_t outside{};        // ray, flow or patch leaves the image
   std::size_t off_line{};       // flow guess too far from the epipolar line
   std::size_t weak_gradient{};
@@ -91,6 +109,15 @@ struct LiveDepthImage {
   std::vector<float> variance;
 };
 
+// The image on the device (null when the last frame gave none), valid until
+// the next process(); the work that wrote it has finished.
+struct LiveDepthDevice {
+  const float* inverse_depth{};
+  const float* variance{};
+  int width{};
+  int height{};
+};
+
 class LiveDepth {
  public:
   explicit LiveDepth(const LiveDepthConfig& config = {});
@@ -98,7 +125,11 @@ class LiveDepth {
   LiveDepth(const LiveDepth&) = delete;
   LiveDepth& operator=(const LiveDepth&) = delete;
 
-  // Forgets the previous frame (seek, new segment, lens change).
+  // Forgets the earlier frames and the filter's state. Call it on a seek or a
+  // lens change, and when the odometry moved the segment's poses (loop
+  // correction, segments merged: OdometryFrameResult::loop_closed,
+  // segments_merged): the earlier frames' poses and the state's scale no
+  // longer fit the current ones.
   void reset();
 
   // One frame, after the odometry processed it. `flow` is the previous ->
@@ -114,6 +145,10 @@ class LiveDepth {
   // Frames back to the reference of the last measurement (0: none).
   [[nodiscard]] int reference_gap() const;
   [[nodiscard]] LiveDepthImage download() const;
+  [[nodiscard]] LiveDepthDevice device() const;
+  // One pixel of the image; false when it has no estimate there.
+  bool at(int x, int y, float* inverse_depth, float* variance) const;
+  [[nodiscard]] const LiveDepthConfig& config() const;
   [[nodiscard]] const LiveDepthStats& stats() const;
 
  private:

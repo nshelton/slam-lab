@@ -1,8 +1,10 @@
 # Live depth image: plan
 
-Status 2026-10-01: build-order steps 1 and 2 are done (the bench, the
-keypoints-only floor and the single measurement; see "Measured so far").
-Nothing is propagated or fused yet, and nothing is wired into the workbench.
+Status 2026-10-01: build-order steps 1 to 4 are done and measured (bench,
+keypoints-only floor, single measurement, propagation and fusion, keypoint
+scale and combination; see "Measured so far" and "The filter"), and the
+overlay (6) is in the workbench: *Depth* in the Pipeline panel. Not done:
+regularization, the voxel feed.
 
 A full-resolution inverse-depth and confidence image that runs beside the
 visual odometry, is carried forward every frame and refined by the camera
@@ -170,6 +172,92 @@ $B/slam-native-live-depth-bench $D/rgb.mp4 native_workbench/models/superpoint-10
 .venv-cuda/bin/python native_workbench/tools/depth_vs_gt.py $D OUT   # then delete OUT (2.4 MB per dumped frame)
 ```
 
+## The filter (steps 3 and 4)
+
+Two more modes of `LiveDepth`:
+
+- **filter**: the state is carried into each frame, rescaled to the
+  landmarks under it, and fused with the frame's measurement.
+- **fused**: the filter's image combined, per pixel, with the keypoints-only
+  interpolation, which also fills what the filter has nothing for. The
+  keypoints are not folded into the state, so they are not counted again
+  every frame.
+
+How it differs from the plan above:
+
+- **Propagation is a backward warp.** Each current pixel looks up where the
+  flow says it came from, takes the nearest estimate there, moves that point
+  with the camera, and shifts the lookup once so the point really lands on
+  the pixel. No scatter, no depth buffer, no holes; a point that still lands
+  more than 1.5 px away is dropped (disocclusion, or flow against pose).
+- **Every measurement gets 6% relative sigma added** for what the matching
+  noise does not cover (poses, model), and the fused sigma never goes below
+  1%. Disagreeing estimates (2.5 sigma) are not averaged: the more certain
+  one wins, and an estimate that keeps being contradicted loses certainty.
+
+TUM, first 800 frames, median depth error after one scale per frame:
+
+| Sequence | Keypoints only | Fused | Keypoints only, textured px | One measurement, same px | Fused, same px |
+| --- | --- | --- | --- | --- | --- |
+| fr1_desk | 4.6% | 4.7% | 2.5% | 3.4% | 2.5% |
+| fr2_desk | 6.1% | 4.7% | 3.5% | 4.0% | 2.7% |
+| fr3_long_office | 5.0% | 4.2% | 2.9% | 4.0% | 2.5% |
+
+("Textured px": the fifth of the image a single measurement covers. The
+first two columns are over every pixel with ground truth.)
+
+- Fusing over time works: on the same pixels the error falls from 3.4–4.0%
+  for one measurement to 2.5–2.7%.
+- Against the keypoints alone the gain is modest and uneven: clear on
+  fr2_desk and fr3, none on fr1_desk (fast motion; the filter holds an
+  estimate for only 50% of pixels there, against about 80% on the others).
+- The gain is away from the keypoints (fr3, pixels where the filter has an
+  estimate, keypoints only against fused): within 10 px of a keypoint 2.7%
+  against 2.7%; 10–30 px: 4.6% against 3.7%; 30–60 px: 8.5% against 5.3%;
+  beyond 60 px: 12.2% against 7.1%. Where neither texture nor a keypoint is
+  near, nothing helps: those pixels stay at the interpolation's error.
+- The pixels the filter is sure of are good: sigma below 2% holds for
+  16–21% of pixels, at 2.0–2.1% median error.
+- The variance is still optimistic by a factor of 1.5–2 (median error over
+  sigma), mostly because consecutive measurements share frames and poses and
+  are fused as if independent.
+- The parameters hardly matter (fr3, fused, textured pixels): measurement
+  sigma 3 / 6 / 10%: 2.63 / 2.48 / 2.46%; gap 5 / 10 / 20: 2.76 / 2.63 /
+  2.66%; no scale fit: 2.57%. The remaining error is not the filter's
+  tuning. The keypoints' own depths are about 3% off in the median, and the
+  filter uses the same poses.
+- Cost, measured while another job used the GPU, so upper bounds: 3.5–4.4 ms
+  per frame at 640×480, 5.9 ms (filter) and 9.7 ms (fused) at 1920×1080. The
+  keypoint interpolation is the expensive part of "fused" at 1080p: every
+  pixel visits every keypoint.
+
+## The overlay (step 6)
+
+*Depth* in the Pipeline panel draws the image over the video
+(`DepthOverlay`, `src/depth_overlay.cu`: coloured on the GPU into a GL pixel
+buffer). Red is near and blue far, between the 5th and 95th percentile of
+the landmarks' depths in view; opacity falls with the relative sigma, to
+nothing at *Max sigma*. The mode selector switches between keypoints only,
+one measurement, the filter and fused; hovering shows the depth and its
+sigma under the cursor. `LiveDepth` exists only while the box is ticked, so
+the pipeline costs nothing extra otherwise; it starts with the next frame
+and restarts on a seek, a lens change, a loop correction or a merge.
+
+The keypoint interpolation is now computed on a 4×4-pixel grid and
+upsampled, which is what made "fused" affordable at 1080p. On `disney_04`
+(600 frames, Debug build) the last frame took 7.2 ms fused and 3.1 ms for
+the filter alone, with 100% and 86% of pixels estimated and 14% measured in
+that frame.
+
+What the picture shows on `disney_04`: near and far are right at a glance
+(lamp and pillar against the back wall), edges and textured surfaces are
+clean, and the ceiling and floor are patchy: blobs of differing depth where
+single uncertain estimates were carried along. That is the regularization
+step's job.
+
+`SLAM_SNAPSHOT_DEPTH=3 slam-native-snapshot VIDEO ENGINE 0 600 OUT.ppm`
+renders it headlessly.
+
 ## Measuring it
 
 TUM RGB-D has ground-truth depth per frame (`data/datasets/tum`,
@@ -183,6 +271,12 @@ the overlay, the reprojection of the depth at tracked keypoints against
 their landmarks, and timing.
 
 ## Build order
+
+Steps 1 to 4 are done. What the measurements suggest for what is left: the
+regularization (5) should be aimed at the pixels far from keypoints, the
+keypoint interpolation needs a cheaper form before the overlay runs at 1080p
+(6), and choosing the reference by baseline rather than a fixed gap would
+help fr1_desk-like fast motion.
 
 1. **Bench and container.** `LiveDepth` class with the state, reset and
    export; the bench with ground-truth scoring; previous-luma copy. Scored

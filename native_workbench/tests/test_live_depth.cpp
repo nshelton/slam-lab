@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -24,6 +25,7 @@ constexpr int kWidth = 320, kHeight = 240;
 
 struct Scene {
   LiveDepthCamera camera{kWidth, kHeight, 250.0F, 250.0F, 159.5F, 119.5F, 0.0F};
+  double noise{};  // luma sigma added to every image (another draw per frame)
 
   // Camera k: world -> camera, x_c = R (X - c).
   static Pose pose(int k) {
@@ -73,10 +75,14 @@ struct Scene {
   }
   std::vector<std::uint8_t> image(int k) const {
     std::vector<std::uint8_t> out(kWidth * kHeight, 0);
+    std::mt19937 rng(1000 + k);
+    std::normal_distribution<double> random(0.0, 1.0);
     for (int v = 0; v < kHeight; ++v)
       for (int u = 0; u < kWidth; ++u) {
         double X[3], depth;
-        if (hit(k, u, v, X, &depth)) out[v * kWidth + u] = static_cast<std::uint8_t>(std::clamp(texture(X) + 0.5, 0.0, 255.0));
+        if (hit(k, u, v, X, &depth))
+          out[v * kWidth + u] =
+              static_cast<std::uint8_t>(std::clamp(texture(X) + noise * random(rng) + 0.5, 0.0, 255.0));
       }
     return out;
   }
@@ -102,11 +108,12 @@ template <class T> T* upload(const std::vector<T>& host) {
   return device;
 }
 
-// Feeds frames 0 .. count - 1; `posed` says which have a pose and `segment` their segment.
+// Feeds frames first .. count - 1 (frame 0 has no flow and starts a history);
+// `posed` says which have a pose and `segment` their segment.
 template <class Posed, class Segment>
 void run(LiveDepth& depth, const Scene& scene, int count, Posed posed, Segment segment,
-         const std::vector<DepthAnchor>& anchors = {}) {
-  for (int k = 0; k < count; ++k) {
+         const std::vector<DepthAnchor>& anchors = {}, int first = 0) {
+  for (int k = first; k < count; ++k) {
     auto* luma = upload(scene.image(k));
     FlowVector* field = k > 0 ? upload(scene.flow(k)) : nullptr;
     GpuFrame frame;
@@ -198,6 +205,84 @@ void history() {
   }
 }
 
+std::vector<DepthAnchor> grid_anchors(const Scene& scene, int frame) {
+  std::vector<DepthAnchor> points;
+  for (int v = 20; v < kHeight; v += 40)
+    for (int u = 20; u < kWidth; u += 40) {
+      double X[3], z;
+      if (scene.hit(frame, u, v, X, &z)) points.push_back({float(u), float(v), float(1.0 / z)});
+    }
+  return points;
+}
+
+// The filter carries the estimate from frame to frame and fuses each frame's
+// measurement into it.
+void filter() {
+  Scene scene;
+  scene.noise = 6.0;  // so that a single measurement is limited by noise, which fusing averages out
+  const auto all = [](int) { return true; };
+  const auto one = [](int) { return 0; };
+  LiveDepthConfig config;
+  config.reference_gap = 5;
+  config.mode = LiveDepthMode::measurement;
+  double single = 0;
+  {
+    LiveDepth depth(config);
+    run(depth, scene, 21, all, one);
+    single = errors(depth.download(), scene, 20).median;
+  }
+  config.mode = LiveDepthMode::filter;
+  {
+    LiveDepth depth(config);
+    run(depth, scene, 21, all, one);
+    require(depth.valid(), "The filter gives an image on a posed frame");
+    const auto e = errors(depth.download(), scene, 20);
+    require(e.coverage > 0.75 && double(depth.stats().estimated) / (kWidth * kHeight) > 0.75,
+            "The filter covers at least what the measurements did: " + std::to_string(e.coverage));
+    if (std::getenv("LIVE_DEPTH_TEST_LOG"))
+      std::cout << " filter: coverage " << e.coverage << ", median " << e.median << " (one measurement " << single
+                << "), p95 " << e.p95 << ", err/sigma " << e.calibration << '\n';
+    require(e.median < 0.6 * single, "Fusing frames beats one measurement: " + std::to_string(e.median) + " against " +
+                                     std::to_string(single));
+    require(e.p95 < 0.02 && e.calibration < 2.0, "The fused estimate is not badly optimistic");
+
+    // Two frames without a pose: no image (it would be in no known scale),
+    // but the state rides the flow and is there when the pose returns.
+    run(depth, scene, 23, [](int) { return false; }, one, {}, 21);
+    require(!depth.valid(), "No image without a pose");
+    run(depth, scene, 24, all, one, {}, 23);
+    const auto after = errors(depth.download(), scene, 23);
+    require(depth.valid() && after.coverage > 0.6 && after.median < 0.01,
+            "The state survives frames without a pose: " + std::to_string(after.coverage) + ", " +
+            std::to_string(after.median));
+
+    // Another segment: other frame, other scale. Nothing is carried over.
+    run(depth, scene, 25, all, [](int) { return 1; }, {}, 24);
+    require(depth.valid() && depth.stats().estimated == 0, "A new segment starts with an empty state");
+  }
+  // A state in the wrong scale is brought back to the landmarks under it.
+  {
+    LiveDepth depth(config);
+    run(depth, scene, 12, all, one);
+    // Scaling the scene would need new poses; scaling the anchors asks for the same correction.
+    auto anchors = grid_anchors(scene, 12);
+    for (auto& a : anchors) a.inverse_depth *= 1.25F;
+    run(depth, scene, 13, all, one, anchors, 12);
+    require(std::abs(depth.stats().scale - 1.25F) < 0.02F, "The scale between the landmarks and the state is found: " +
+                                                           std::to_string(depth.stats().scale));
+  }
+  // Fused with the anchors, every pixel has an estimate.
+  config.mode = LiveDepthMode::fused;
+  {
+    LiveDepth depth(config);
+    for (int k = 0; k < 21; ++k) run(depth, scene, k + 1, all, one, grid_anchors(scene, k), k);
+    const auto e = errors(depth.download(), scene, 20);
+    require(depth.stats().estimated == std::size_t(kWidth) * kHeight && e.coverage > 0.99,
+            "The fused image covers every pixel");
+    require(e.median < 0.004, "and keeps the filter's accuracy: " + std::to_string(e.median));
+  }
+}
+
 void anchors() {
   Scene scene;
   LiveDepthConfig config;
@@ -228,6 +313,7 @@ int main() {
     measurement(-0.08F, 5, 0.005);  // barrel distortion
     measurement(0.0F, 12, 0.003);
     history();
+    filter();
     anchors();
   } catch (const std::exception& error) {
     std::cerr << "live depth test failed: " << error.what() << '\n';

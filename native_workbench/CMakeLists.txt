@@ -154,6 +154,8 @@ if(SLAM_NATIVE_BUILD_APP)
     src/point_cloud_renderer.cpp
     src/voxel_hash.cu
     src/voxel_renderer.cpp
+    src/live_depth.cu
+    src/depth_overlay.cu
     src/fov_view.cpp
     src/color_sampler.cu
     ${imgui_SOURCE_DIR}/imgui.cpp

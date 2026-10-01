@@ -3,9 +3,11 @@
 
 #include "slam_native/calibration.hpp"
 #include "slam_native/cuda_frame_presenter.hpp"
+#include "slam_native/depth_overlay.hpp"
 #include "slam_native/display_environment.hpp"
 #include "slam_native/flow_tracker.hpp"
 #include "slam_native/launcher.hpp"
+#include "slam_native/live_depth.hpp"
 #include "slam_native/optical_flow.hpp"
 #include "slam_native/color_sampler.hpp"
 #include "slam_native/focal_estimation.hpp"
@@ -114,6 +116,16 @@ struct Runtime {
   bool show_diagnostics{true};
   bool show_trajectory{true};
   bool show_fov{true};
+  // Live depth image over the video (LIVE_DEPTH.md). Nothing runs while it is off.
+  bool show_depth{};
+  int depth_mode{3};             // LiveDepthMode: 0 keypoints only, 1 one measurement, 2 filter, 3 fused
+  int depth_color{};             // DepthOverlayColor: 0 depth, 1 uncertainty
+  float depth_opacity{0.7F};
+  float depth_max_sigma{0.3F};   // relative sigma at which the overlay has faded out
+  unsigned int depth_texture{};  // 0: no image for the shown frame
+  float depth_near{}, depth_far{};  // inverse depths at the ends of the colour ramp (from the landmarks)
+  LiveDepthStats depth_stats;
+  std::string depth_error;
   OdometryFrameResult odometry;
   std::string intrinsics_source;     // "calibration.json", "--intrinsics" or empty (hfov guess)
   bool export_requested{};
@@ -288,6 +300,42 @@ void draw_sidebar(Runtime& runtime,
   ImGui::Checkbox("Trajectory", &runtime.show_trajectory);
   ImGui::SameLine();
   ImGui::Checkbox("Lens", &runtime.show_fov);
+  ImGui::Checkbox("Depth", &runtime.show_depth);
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("A depth estimate for every pixel, drawn over the video: matched against the\n"
+                      "frame ten frames back along the camera motion, fused over time, and combined\n"
+                      "with the landmarks' depths. Display only. Starts with the next frame.");
+  if (runtime.show_depth) {
+    ImGui::SameLine();
+    const char* modes[] = {"Keypoints only", "One measurement", "Filter", "Fused"};
+    ImGui::SetNextItemWidth(130);
+    ImGui::Combo("##depth-mode", &runtime.depth_mode, modes, IM_ARRAYSIZE(modes));
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Keypoints only: the landmarks' depths, interpolated.\n"
+                        "One measurement: this frame against the one ten frames back, no memory.\n"
+                        "Filter: the measurements of all frames so far.\n"
+                        "Fused: the filter combined with the keypoints.");
+    ImGui::SetNextItemWidth(70);
+    ImGui::SliderFloat("Opacity", &runtime.depth_opacity, 0.0F, 1.0F, "%.2f");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(70);
+    ImGui::SliderFloat("Max sigma", &runtime.depth_max_sigma, 0.03F, 1.0F, "%.2f", ImGuiSliderFlags_Logarithmic);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Pixels fade out as their relative depth uncertainty approaches this.");
+    const char* colors[] = {"Depth", "Uncertainty"};
+    ImGui::SetNextItemWidth(110);
+    ImGui::Combo("Colour##depth", &runtime.depth_color, colors, IM_ARRAYSIZE(colors));
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Depth: red near, blue far (between the nearest and farthest landmarks in view).\n"
+                        "Uncertainty: blue 1%% or better, red 100%%.");
+    if (!runtime.depth_error.empty()) ImGui::TextColored({1, 0.4F, 0.3F, 1}, "Depth: %s", runtime.depth_error.c_str());
+    else if (!runtime.depth_texture) ImGui::TextDisabled("Depth: no image (needs a tracked pose)");
+    else
+      ImGui::TextDisabled("Depth: %.0f%% of pixels, %.0f%% measured now, %.1f ms",
+                          100.0 * double(runtime.depth_stats.estimated) / double(std::max<std::size_t>(1, runtime.depth_stats.pixels)),
+                          100.0 * double(runtime.depth_stats.measured) / double(std::max<std::size_t>(1, runtime.depth_stats.pixels)),
+                          runtime.depth_stats.ms);
+  }
   ImGui::Separator();
   ImGui::Text("Codec: %s", decoder.codec_name().c_str());
   ImGui::Text("Nominal FPS: %.2f", decoder.nominal_fps());
@@ -347,7 +395,7 @@ void draw_sidebar(Runtime& runtime,
 }
 
 void draw_video(Runtime& runtime, bool optical_flow, std::int64_t duration_ns,
-                std::int64_t start_time_ns) {
+                std::int64_t start_time_ns, const LiveDepth* depth = nullptr) {
   ImGui::SetNextWindowPos({326, 8}, ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowSize({755, 845}, ImGuiCond_FirstUseEver);
   ImGui::Begin(optical_flow ? "Video + optical flow" : "Video + SuperPoint");
@@ -380,6 +428,26 @@ void draw_video(Runtime& runtime, bool optical_flow, std::int64_t duration_ns,
     ImGui::GetWindowDrawList()->AddImageQuad(static_cast<ImTextureID>(runtime.texture), origin,
         {origin.x + size.x, origin.y}, {origin.x + size.x, origin.y + size.y}, {origin.x, origin.y + size.y},
         corners[first], corners[(first + 1) % 4], corners[(first + 2) % 4], corners[(first + 3) % 4]);
+    if (runtime.show_depth && runtime.depth_texture) {
+      // The depth image is in source orientation, like the video texture.
+      ImGui::GetWindowDrawList()->AddImageQuad(static_cast<ImTextureID>(runtime.depth_texture), origin,
+          {origin.x + size.x, origin.y}, {origin.x + size.x, origin.y + size.y}, {origin.x, origin.y + size.y},
+          corners[first], corners[(first + 1) % 4], corners[(first + 2) % 4], corners[(first + 3) % 4],
+          IM_COL32(255, 255, 255, static_cast<int>(255.0F * runtime.depth_opacity)));
+      if (depth && ImGui::IsItemHovered()) {
+        // Screen -> source pixel: the inverse of screen() above.
+        const ImVec2 mouse = ImGui::GetMousePos();
+        const float u = (mouse.x - origin.x) / scale, v = (mouse.y - origin.y) / scale;
+        float x = u, y = v;
+        if (rotation == 90) { x = v; y = height - u; }
+        else if (rotation == 180) { x = width - u; y = height - v; }
+        else if (rotation == 270) { x = width - v; y = u; }
+        float inverse_depth = 0, variance = 0;
+        if (depth->at(static_cast<int>(x), static_cast<int>(y), &inverse_depth, &variance) && inverse_depth > 0)
+          ImGui::SetTooltip("depth %.3f  (+/- %.0f%%)\nin map units: 1 = the first keyframe's median scene depth",
+                            1.0 / inverse_depth, 100.0 * std::sqrt(variance) / inverse_depth);
+      }
+    }
   }
   if (runtime.point_display_mode != 1 &&
       ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -637,6 +705,7 @@ struct Session {
     // Track IDs restart with the tracker, so the camera trajectory does too.
     odometry = std::make_unique<VisualOdometry>(config.odometry);
     trajectory_view.reset();
+    if (live_depth) live_depth->reset();
     focal.restart_tracks();
     runtime.odometry = {};
     runtime.trails.clear();
@@ -725,6 +794,7 @@ struct Session {
     TrackedFrame tracked = tracked_frame_from(features, color_sampler.sample(frame, features.keypoints));
     runtime.odometry = odometry->process(tracked);
     trajectory_view.update(*odometry);
+    update_depth(frame, field ? &*field : nullptr, tracked);
     focal.add(std::move(tracked));  // background thread
     runtime.points = features.keypoints;
     runtime.supported = features.superpoint_supported;
@@ -753,6 +823,66 @@ struct Session {
                                    std::chrono::duration<double>(fps > 0 ? 1.0 / fps : 0.0));
   }
 
+  // The live depth image of this frame, while its overlay is on. It only reads
+  // from the odometry.
+  void update_depth(const GpuFrame& frame, const DeviceFlowField* flow, const TrackedFrame& tracked) {
+    runtime.depth_texture = 0;
+    if (!runtime.show_depth) {
+      live_depth.reset();  // and its GPU memory
+      return;
+    }
+    try {
+      const auto mode = static_cast<LiveDepthMode>(runtime.depth_mode);
+      if (!live_depth || live_depth->config().mode != mode) {
+        LiveDepthConfig depth_config;
+        depth_config.mode = mode;
+        live_depth = std::make_unique<LiveDepth>(depth_config);
+      }
+      const auto& result = runtime.odometry;
+      // A loop correction or a merge moved the whole segment, scale included.
+      if (result.loop_closed || result.segments_merged) live_depth->reset();
+      const bool tracked_pose = result.has_pose && !result.predicted;  // a coasted pose is a prediction
+      const auto anchors = depth_anchors(tracked, *odometry, result);
+      live_depth->process(frame, flow, live_depth_camera(config.odometry, frame.width, frame.height),
+                          tracked_pose ? &result.pose : nullptr, result.segment, anchors);
+      runtime.depth_stats = live_depth->stats();
+      if (live_depth->valid() && anchors.size() >= 8) {
+        // Colour ramp between the nearest and farthest landmarks in view, eased so it does not flicker.
+        std::vector<float> depths;
+        for (const auto& a : anchors) depths.push_back(a.inverse_depth);
+        std::sort(depths.begin(), depths.end());
+        const float far = depths[depths.size() / 20], near = depths[depths.size() - 1 - depths.size() / 20];
+        const float ease = runtime.depth_near > 0 ? 0.1F : 1.0F;
+        runtime.depth_near += ease * (near - runtime.depth_near);
+        runtime.depth_far += ease * (far - runtime.depth_far);
+      }
+      present_depth(true);
+      runtime.depth_error.clear();
+    } catch (const std::exception& error) {
+      runtime.depth_error = error.what();
+      runtime.show_depth = false;
+      live_depth.reset();
+    }
+  }
+
+  // Colours the current depth image; without `always`, only when the display settings changed (paused).
+  void present_depth(bool always) {
+    if (!runtime.show_depth || !live_depth || !live_depth->valid() || !(runtime.depth_near > 0)) return;
+    DepthOverlayStyle style;
+    style.near_inverse_depth = runtime.depth_near;
+    style.far_inverse_depth = std::max(runtime.depth_far, 1e-6F);
+    style.color = static_cast<DepthOverlayColor>(runtime.depth_color);
+    style.max_sigma = std::max(runtime.depth_max_sigma, style.full_sigma + 1e-3F);
+    if (!always && style.color == depth_style.color && style.max_sigma == depth_style.max_sigma) return;
+    depth_style = style;
+    try {
+      runtime.depth_texture = depth_overlay.present(*live_depth, style);
+    } catch (const std::exception& error) {
+      runtime.depth_error = error.what();
+      runtime.depth_texture = 0;
+    }
+  }
+
   // Restart the camera pose from the current frame with a new lens model.
   void apply_lens(const LensChoice& lens) {
     config.odometry.intrinsics.reset();
@@ -762,6 +892,8 @@ struct Session {
     odometry = std::make_unique<VisualOdometry>(config.odometry);
     trajectory_view.reset();
     runtime.odometry = {};
+    if (live_depth) live_depth->reset();  // segment ids restart with the odometry
+    runtime.depth_texture = 0;
   }
 
   // trajectory.csv, map.csv and camera.txt (the intrinsics they were solved
@@ -806,6 +938,9 @@ struct Session {
   std::unique_ptr<FlowTracker> flow_tracker;
   std::unique_ptr<VisualOdometry> odometry;
   TrajectoryView trajectory_view;
+  std::unique_ptr<LiveDepth> live_depth;  // while the depth overlay is on
+  DepthOverlay depth_overlay;
+  DepthOverlayStyle depth_style;          // of the texture shown
   ColorSampler color_sampler;
   BackgroundFocalEstimator focal;
   FocalEstimate focal_estimate;  // latest copy from the worker
@@ -869,9 +1004,10 @@ int run_app(const AppConfig& config) {
         session->export_results(native_root.parent_path() / "out");
         session->runtime.export_requested = false;
       }
+      session->present_depth(false);
       draw_video(session->runtime, session->optical_flow != nullptr,
                  session->decoder->duration_ns(),
-                 session->decoder->start_time_ns());
+                 session->decoder->start_time_ns(), session->live_depth.get());
       if (session->flow_tracker) draw_flow_diagnostics(session->runtime, *session->flow_tracker);
       if (session->odometry) {
         session->trajectory_view.set_display_rotation(session->runtime.display_rotation);

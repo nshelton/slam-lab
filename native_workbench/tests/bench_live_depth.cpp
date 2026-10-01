@@ -2,10 +2,12 @@
 // bench plus LiveDepth, with the depth image dumped every few frames for
 // tools/depth_vs_gt.py. Not part of CTest.
 // usage: slam-native-live-depth-bench VIDEO ENGINE FRAMES OUT_DIR [KEY VALUE]...
-//   mode anchors|measurement   gap N (reference frames back)   dump-every N   skip N
+//   mode anchors|measurement|filter|fused   gap N (reference frames back)   dump-every N   skip N
 //   hfov, k1, fx fy cx cy      (camera, as the tracking bench)
 //   patch-length, patch-width, search-radius, search-step, max-epipolar,
-//   min-gradient, max-residual, disparity-floor, image-noise
+//   min-gradient, max-residual, disparity-floor, image-noise,
+//   process-sigma, propagation-tolerance, measurement-sigma, min-sigma,
+//   outlier-sigmas, scale-to-anchors, anchor-sigma, anchor-sigma-per-px
 // Dump: OUT_DIR/depth_<frame>.bin = int32 width, height; uint64 frame index;
 // float32 inverse depth [w*h]; float32 variance [w*h] (inf: no estimate).
 #include "slam_native/color_sampler.hpp"
@@ -35,6 +37,7 @@ int main(int argc, char** argv) {
     const std::filesystem::path out = argv[4];
     std::filesystem::create_directories(out);
     VisualOdometryConfig vo_config;
+    vo_config.place_synchronous = true;  // deterministic runs, as the tracking bench
     LiveDepthConfig config;
     int skip = 0, dump_every = 20;
     for (int a = 5; a + 1 < argc; a += 2) {
@@ -42,6 +45,8 @@ int main(int argc, char** argv) {
       if (key == "mode") {
         if (text == "anchors") config.mode = LiveDepthMode::anchors;
         else if (text == "measurement") config.mode = LiveDepthMode::measurement;
+        else if (text == "filter") config.mode = LiveDepthMode::filter;
+        else if (text == "fused") config.mode = LiveDepthMode::fused;
         else throw std::invalid_argument("unknown mode " + text);
         continue;
       }
@@ -65,6 +70,14 @@ int main(int argc, char** argv) {
       else if (key == "max-residual") config.max_residual = value;
       else if (key == "disparity-floor") config.disparity_floor_px = value;
       else if (key == "image-noise") config.image_noise = value;
+      else if (key == "process-sigma") config.process_sigma = value;
+      else if (key == "propagation-tolerance") config.propagation_tolerance_px = value;
+      else if (key == "measurement-sigma") config.measurement_sigma = value;
+      else if (key == "min-sigma") config.min_sigma = value;
+      else if (key == "outlier-sigmas") config.outlier_sigmas = value;
+      else if (key == "scale-to-anchors") config.scale_to_anchors = value != 0;
+      else if (key == "anchor-sigma") config.anchor_sigma = value;
+      else if (key == "anchor-sigma-per-px") config.anchor_sigma_per_px = value;
       else throw std::invalid_argument("unknown option " + key);
     }
     auto decoder = make_ffmpeg_cuda_decoder();
@@ -98,6 +111,9 @@ int main(int argc, char** argv) {
       posed += pose.has_pose && !pose.predicted;
       // Only tracked poses: a coasted one is a prediction.
       const bool usable = pose.has_pose && !pose.predicted;
+      // A loop correction or a merge moves the whole segment by a similarity
+      // (scale included): nothing carried with relative poses survives it.
+      if (pose.loop_closed || pose.segments_merged) depth.reset();
       depth.process(image, field ? &*field : nullptr, live_depth_camera(vo_config, image.width, image.height),
                     usable ? &pose.pose : nullptr, pose.segment, depth_anchors(tracked, odometry, pose));
       if (!depth.valid()) continue;
@@ -105,6 +121,7 @@ int main(int argc, char** argv) {
       ++images;
       ms += s.ms;
       total.pixels += s.pixels;
+      total.estimated += s.estimated;
       total.measured += s.measured;
       total.outside += s.outside;
       total.off_line += s.off_line;
@@ -128,6 +145,7 @@ int main(int argc, char** argv) {
     const auto share = [&](std::size_t n) { return 100.0 * double(n) / double(std::max<std::size_t>(1, total.pixels)); };
     std::printf("frames %d, tracked poses %d, depth images %d (%d dumped), %.2f ms per image\n", processed, posed,
                 images, dumps, ms / std::max(1, images));
+    std::printf("pixels with an estimate: %.1f%%\n", share(total.estimated));
     std::printf("pixels: measured %.1f%% | outside %.1f%% | off the epipolar line %.1f%% | weak gradient %.1f%% | "
                 "search edge %.1f%% | poor match %.1f%% | behind %.1f%%\n",
                 share(total.measured), share(total.outside), share(total.off_line), share(total.weak_gradient),

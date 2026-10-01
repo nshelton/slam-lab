@@ -17,6 +17,7 @@ namespace {
 constexpr int kMaxPatch = 45;       // (2 * 4 + 1) x (2 * 2 + 1)
 constexpr int kMaxCandidates = 65;  // search steps
 constexpr int kRing = 32;           // frames kept as possible references
+constexpr int kAnchorGrid = 4;      // pixels per cell of the anchors' interpolation
 
 enum Counter { measured, outside, off_line, weak_gradient, at_search_edge, poor_match, behind, counter_count };
 
@@ -288,15 +289,18 @@ __global__ void measure_kernel(Ring ring, int gap, Lens lens, Relative relative,
   atomicAdd(&counters[measured], 1U);
 }
 
-// Inverse distance weighting (power 4) of the anchors' inverse depths.
+// Inverse distance weighting (power 4) of the anchors' inverse depths, on a
+// grid of one value per kAnchorGrid x kAnchorGrid pixels (at their centre):
+// the result is smooth, and every cell visits every anchor.
 __global__ void anchors_kernel(const DepthAnchor* anchors, int count, int width, int height, float sigma,
                                float sigma_per_px, float* inverse_depth, float* variance) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
   const int y = blockIdx.y * blockDim.y + threadIdx.y;
   if (x >= width || y >= height) return;
+  const float centre_x = kAnchorGrid * x + 0.5F * (kAnchorGrid - 1), centre_y = kAnchorGrid * y + 0.5F * (kAnchorGrid - 1);
   float weights = 0.0F, sum = 0.0F, nearest = INFINITY;
   for (int k = 0; k < count; ++k) {
-    const float dx = anchors[k].x - x, dy = anchors[k].y - y;
+    const float dx = anchors[k].x - centre_x, dy = anchors[k].y - centre_y;
     const float d2 = dx * dx + dy * dy + 1.0F;
     const float w = 1.0F / (d2 * d2);
     weights += w;
@@ -307,6 +311,189 @@ __global__ void anchors_kernel(const DepthAnchor* anchors, int count, int width,
   const float relative = sigma + sigma_per_px * sqrtf(nearest);
   inverse_depth[y * width + x] = rho;
   variance[y * width + x] = relative * relative * rho * rho;
+}
+
+// The anchor grid at full resolution (bilinear between cell centres).
+__global__ void upsample_kernel(const float* coarse, const float* coarse_variance, int coarse_width, int coarse_height,
+                                int width, int height, float* inverse_depth, float* variance) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= width || y >= height) return;
+  const float half = 0.5F * (kAnchorGrid - 1);
+  const float gx = fminf(fmaxf((x - half) / kAnchorGrid, 0.0F), coarse_width - 1.0F);
+  const float gy = fminf(fmaxf((y - half) / kAnchorGrid, 0.0F), coarse_height - 1.0F);
+  const int x0 = min(static_cast<int>(gx), max(coarse_width - 2, 0)), y0 = min(static_cast<int>(gy), max(coarse_height - 2, 0));
+  const int x1 = min(x0 + 1, coarse_width - 1), y1 = min(y0 + 1, coarse_height - 1);
+  const float ax = gx - x0, ay = gy - y0;
+  const auto blend = [&](const float* image) {
+    return (1 - ay) * ((1 - ax) * image[y0 * coarse_width + x0] + ax * image[y0 * coarse_width + x1]) +
+           ay * ((1 - ax) * image[y1 * coarse_width + x0] + ax * image[y1 * coarse_width + x1]);
+  };
+  inverse_depth[y * width + x] = blend(coarse);
+  variance[y * width + x] = blend(coarse_variance);
+}
+
+__global__ void fill_kernel(float* inverse_depth, float* variance, int count) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= count) return;
+  inverse_depth[index] = 0.0F;
+  variance[index] = INFINITY;
+}
+
+// Carries the image of the previous frame into the current one. Each current
+// pixel looks up where the flow says it was, takes the nearest estimate
+// there, and, with a pose, moves that point by the camera motion. The lookup
+// is then shifted once so that the point taken really lands on this pixel:
+// the result follows the pose, the flow only starts it. `relative` maps the
+// current camera to the previous one.
+__global__ void propagate_kernel(const float* old_depth, const float* old_variance, const FlowVector* flow,
+                                 int flow_width, int flow_height, int flow_grid, Lens lens, Relative relative,
+                                 int posed, LiveDepthConfig config, float* inverse_depth, float* variance) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= lens.width || y >= lens.height) return;
+  const int index = y * lens.width + x;
+  inverse_depth[index] = 0.0F;
+  variance[index] = INFINITY;
+  FlowVector f = flow_at(flow, flow_width, flow_height, flow_grid, float(x), float(y));
+  f = flow_at(flow, flow_width, flow_height, flow_grid, x - f.dx, y - f.dy);
+  float qx = x - f.dx, qy = y - f.dy;
+  const float* R = relative.rotation;
+  const float* t = relative.translation;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    // The nearest pixel with an estimate among the four around (qx, qy).
+    const int x0 = static_cast<int>(floorf(qx)), y0 = static_cast<int>(floorf(qy));
+    int source = -1, sx = 0, sy = 0;
+    float nearest = INFINITY;
+    for (int j = 0; j < 2; ++j)
+      for (int i = 0; i < 2; ++i) {
+        const int px = x0 + i, py = y0 + j;
+        if (px < 0 || py < 0 || px >= lens.width || py >= lens.height) continue;
+        if (!(old_variance[py * lens.width + px] < INFINITY)) continue;
+        const float d = (px - qx) * (px - qx) + (py - qy) * (py - qy);
+        if (d < nearest) {
+          nearest = d;
+          source = py * lens.width + px;
+          sx = px;
+          sy = py;
+        }
+      }
+    if (source < 0) return;
+    const float rho = old_depth[source], var = old_variance[source];
+    if (!posed) {  // no camera motion known: the estimate rides the flow and ages faster
+      const float sigma = 4.0F * config.process_sigma * rho;
+      inverse_depth[index] = rho;
+      variance[index] = var + sigma * sigma;
+      return;
+    }
+    // The point in the previous camera, then in the current one: X_c = R^T (X_p - t).
+    float ux = float(sx), uy = float(sy);
+    lens.undistort(&ux, &uy);
+    const float p[3] = {(ux - lens.cx) / lens.fx / rho - t[0], (uy - lens.cy) / lens.fy / rho - t[1], 1.0F / rho - t[2]};
+    const float c[3] = {R[0] * p[0] + R[3] * p[1] + R[6] * p[2], R[1] * p[0] + R[4] * p[1] + R[7] * p[2],
+                        R[2] * p[0] + R[5] * p[1] + R[8] * p[2]};
+    if (!(c[2] > 1e-6F)) return;
+    float landed_x = lens.fx * c[0] / c[2] + lens.cx, landed_y = lens.fy * c[1] / c[2] + lens.cy;
+    lens.distort(&landed_x, &landed_y);
+    const float miss_x = x - landed_x, miss_y = y - landed_y;
+    const float miss = sqrtf(miss_x * miss_x + miss_y * miss_y);
+    if (attempt == 0 && miss > 0.6F) {  // look where a point landing here would have come from
+      qx = sx + miss_x;
+      qy = sy + miss_y;
+      continue;
+    }
+    if (miss > config.propagation_tolerance_px) return;  // disoccluded, or the flow and the pose disagree
+    const float moved = 1.0F / c[2];
+    const float ratio = moved / rho, sigma = config.process_sigma * moved;
+    inverse_depth[index] = moved;
+    variance[index] = var * ratio * ratio * ratio * ratio + sigma * sigma;
+    return;
+  }
+}
+
+// The state at the anchors' pixels (0 where it has none), for the scale fit.
+__global__ void gather_kernel(const DepthAnchor* anchors, int count, const float* inverse_depth, const float* variance,
+                              int width, int height, float* out) {
+  const int k = blockIdx.x * blockDim.x + threadIdx.x;
+  if (k >= count) return;
+  const int x = static_cast<int>(anchors[k].x + 0.5F), y = static_cast<int>(anchors[k].y + 0.5F);
+  out[k] = 0.0F;
+  if (x < 0 || y < 0 || x >= width || y >= height) return;
+  if (variance[y * width + x] < INFINITY) out[k] = inverse_depth[y * width + x];
+}
+
+__global__ void scale_kernel(float* inverse_depth, float* variance, int count, float scale) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= count || !(variance[index] < INFINITY)) return;
+  inverse_depth[index] *= scale;
+  variance[index] *= scale * scale;
+}
+
+// Product of two estimates of one inverse depth that agree; when they do not,
+// the more certain one.
+__device__ void combine(float a, float var_a, float b, float var_b, float sigmas, float* out, float* var_out) {
+  const float difference = a - b, sum = var_a + var_b;
+  if (difference * difference <= sigmas * sigmas * sum) {
+    *out = (a * var_b + b * var_a) / sum;
+    *var_out = var_a * var_b / sum;
+  } else if (var_a <= var_b) {
+    *out = a;
+    *var_out = var_a;
+  } else {
+    *out = b;
+    *var_out = var_b;
+  }
+}
+
+// Folds this frame's measurement into the state.
+__global__ void fuse_kernel(const float* measured, const float* measured_variance, LiveDepthConfig config,
+                            float* inverse_depth, float* variance, int count) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= count || !(measured_variance[index] < INFINITY)) return;
+  const float rho = measured[index];
+  // What the matching noise does not cover: the poses and the model.
+  const float extra = config.measurement_sigma * rho;
+  const float measured_var = measured_variance[index] + extra * extra;
+  if (!(variance[index] < INFINITY)) {
+    inverse_depth[index] = rho;
+    variance[index] = measured_var;
+    return;
+  }
+  const float state = inverse_depth[index], state_var = variance[index];
+  const float difference = rho - state;
+  float fused, fused_var;
+  if (difference * difference <= config.outlier_sigmas * config.outlier_sigmas * (state_var + measured_var)) {
+    fused = (state * measured_var + rho * state_var) / (state_var + measured_var);
+    fused_var = state_var * measured_var / (state_var + measured_var);
+  } else if (measured_var < state_var) {  // the newcomer is the better one
+    fused = rho;
+    fused_var = measured_var;
+  } else {  // doubt the estimate a little: repeated disagreement ends up replacing it
+    fused = state;
+    fused_var = state_var * 2.0F;
+  }
+  const float floor = config.min_sigma * fused;
+  inverse_depth[index] = fused;
+  variance[index] = fmaxf(fused_var, floor * floor);
+}
+
+// The image handed out: the state, or the state combined with the anchors' interpolation.
+__global__ void output_kernel(const float* state, const float* state_variance, const float* anchored,
+                              const float* anchored_variance, float sigmas, float* inverse_depth, float* variance,
+                              int count, unsigned* counters) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= count) return;
+  float rho = state[index], var = state_variance[index];
+  if (anchored) {
+    if (var < INFINITY) combine(rho, var, anchored[index], anchored_variance[index], sigmas, &rho, &var);
+    else {
+      rho = anchored[index];
+      var = anchored_variance[index];
+    }
+  }
+  inverse_depth[index] = rho;
+  variance[index] = var;
+  if (var < INFINITY) atomicAdd(&counters[measured], 1U);
 }
 
 }  // namespace
@@ -328,8 +515,22 @@ struct LiveDepth::Impl {
     int segment{-1};
   };
   Slot slots[kRing];
-  float* inverse_depth{};
+  float* inverse_depth{};  // the image handed out
   float* variance{};
+  // LiveDepthMode::filter / fused: the estimate carried from frame to frame
+  // (state[0], with state[1] as the propagation target), this frame's
+  // measurement, and the anchors' interpolation.
+  float* state[2]{};
+  float* state_variance[2]{};
+  float* measured{};
+  float* measured_variance{};
+  float* anchored{};
+  float* anchored_variance{};
+  float* coarse{};           // the anchors' interpolation on its grid
+  float* coarse_variance{};
+  float* gathered{};
+  bool state_filled{};
+  int state_segment{-1};
   DepthAnchor* anchors{};
   std::size_t anchor_capacity{};
   unsigned* counters{};
@@ -341,23 +542,58 @@ struct LiveDepth::Impl {
     if (stream) cudaStreamSynchronize(stream);
     release();
     cudaFree(anchors);
+    cudaFree(gathered);
     cudaFree(counters);
     if (stream) cudaStreamDestroy(stream);
   }
   void release() {
     cudaFree(luma);
     cudaFree(flow);
-    cudaFree(inverse_depth);
-    cudaFree(variance);
+    for (float** image : {&inverse_depth, &variance, &state[0], &state[1], &state_variance[0], &state_variance[1],
+                          &measured, &measured_variance, &anchored, &anchored_variance, &coarse, &coarse_variance}) {
+      cudaFree(*image);
+      *image = nullptr;
+    }
     luma = nullptr;
     flow = nullptr;
-    inverse_depth = variance = nullptr;
     width = height = flow_width = flow_height = 0;
   }
   void forget() {
     for (auto& slot : slots) slot = {};
     newest = -1;
     valid = false;
+    state_filled = false;
+  }
+  void upload(const std::vector<DepthAnchor>& points) {
+    if (points.size() > anchor_capacity) {
+      cudaFree(anchors);
+      cudaFree(gathered);
+      anchors = nullptr;
+      gathered = nullptr;
+      anchor_capacity = 0;
+      cuda_check(cudaMalloc(&anchors, 2 * points.size() * sizeof(DepthAnchor)), "allocate depth anchors");
+      cuda_check(cudaMalloc(&gathered, 2 * points.size() * sizeof(float)), "allocate depth anchor lookups");
+      anchor_capacity = 2 * points.size();
+    }
+    cuda_check(cudaMemcpyAsync(anchors, points.data(), points.size() * sizeof(DepthAnchor), cudaMemcpyHostToDevice,
+                               stream), "upload depth anchors");
+  }
+  // reference = R current + t, for points in the two camera frames.
+  static Relative relative(const Pose& reference, const Pose& current) {
+    Relative out{};
+    double R[9];
+    for (int i = 0; i < 3; ++i)
+      for (int j = 0; j < 3; ++j) {
+        R[i * 3 + j] = 0;
+        for (int k = 0; k < 3; ++k) R[i * 3 + j] += reference.rotation[i * 3 + k] * current.rotation[j * 3 + k];
+        out.rotation[i * 3 + j] = static_cast<float>(R[i * 3 + j]);
+      }
+    for (int i = 0; i < 3; ++i) {
+      double t = reference.translation[i];
+      for (int j = 0; j < 3; ++j) t -= R[i * 3 + j] * current.translation[j];
+      out.translation[i] = static_cast<float>(t);
+    }
+    return out;
   }
   void ensure(int w, int h) {
     if (!stream) {
@@ -369,8 +605,9 @@ struct LiveDepth::Impl {
     release();
     const std::size_t pixels = static_cast<std::size_t>(w) * h;
     cuda_check(cudaMalloc(&luma, kRing * pixels), "allocate live depth luma");
-    cuda_check(cudaMalloc(&inverse_depth, pixels * sizeof(float)), "allocate live depth image");
-    cuda_check(cudaMalloc(&variance, pixels * sizeof(float)), "allocate live depth variance");
+    for (float** image : {&inverse_depth, &variance, &state[0], &state[1], &state_variance[0], &state_variance[1],
+                          &measured, &measured_variance, &anchored, &anchored_variance, &coarse, &coarse_variance})
+      cuda_check(cudaMalloc(image, pixels * sizeof(float)), "allocate live depth image");
     width = w;
     height = h;
     forget();
@@ -390,6 +627,7 @@ void LiveDepth::reset() { impl_->forget(); }
 int LiveDepth::reference_gap() const { return impl_->gap; }
 
 bool LiveDepth::valid() const { return impl_->valid; }
+const LiveDepthConfig& LiveDepth::config() const { return impl_->config; }
 const LiveDepthStats& LiveDepth::stats() const { return impl_->stats; }
 
 void LiveDepth::process(const GpuFrame& frame, const DeviceFlowField* flow, const LiveDepthCamera& camera,
@@ -441,25 +679,16 @@ void LiveDepth::process(const GpuFrame& frame, const DeviceFlowField* flow, cons
   m.stats = {};
   m.stats.pixels = pixels;
   m.frame_index = frame.frame_index;
-  if (m.config.mode == LiveDepthMode::anchors) {
-    if (pose && anchors.size() >= 8) {
-      if (anchors.size() > m.anchor_capacity) {
-        cudaFree(m.anchors);
-        m.anchors = nullptr;
-        m.anchor_capacity = 0;
-        cuda_check(cudaMalloc(&m.anchors, 2 * anchors.size() * sizeof(DepthAnchor)), "allocate depth anchors");
-        m.anchor_capacity = 2 * anchors.size();
-      }
-      cuda_check(cudaMemcpyAsync(m.anchors, anchors.data(), anchors.size() * sizeof(DepthAnchor),
-                                 cudaMemcpyHostToDevice, m.stream), "upload depth anchors");
-      anchors_kernel<<<grid, block, 0, m.stream>>>(m.anchors, static_cast<int>(anchors.size()), m.width, m.height,
-                                                  m.config.anchor_sigma, m.config.anchor_sigma_per_px,
-                                                  m.inverse_depth, m.variance);
-      cuda_check(cudaGetLastError(), "interpolate depth anchors");
-      m.stats.measured = m.stats.pixels;
-      m.valid = true;
-    }
-  } else if (pose) {
+  const Lens lens{m.width, m.height, camera.fx, camera.fy, camera.cx, camera.cy, camera.k1};
+  const int count = static_cast<int>(pixels);
+  const unsigned strips = static_cast<unsigned>((pixels + 255) / 256);
+  const auto read_counters = [&](unsigned* host) {
+    cuda_check(cudaMemcpyAsync(host, m.counters, counter_count * sizeof(unsigned), cudaMemcpyDeviceToHost, m.stream),
+               "read live depth counters");
+    cuda_check(cudaStreamSynchronize(m.stream), "synchronize live depth");
+  };
+  // Matches the frame against an earlier one into the given image; false when no frame qualifies.
+  const auto measure = [&](float* out, float* out_variance) {
     // The reference: the frame reference_gap back, or the oldest one before
     // that which the flow chain reaches and which has a pose in this segment.
     int gap = 0;
@@ -469,48 +698,135 @@ void LiveDepth::process(const GpuFrame& frame, const DeviceFlowField* flow, cons
       if (!candidate.filled) break;
       if (candidate.posed && candidate.segment == segment) gap = k;
     }
-    if (gap > 0) {
-      // reference = R_r R_c^T current + (t_r - R_r R_c^T t_c)
-      const Pose& reference = m.slots[(m.newest - gap + kRing) % kRing].pose;
-      Relative relative{};
-      const auto& Rr = reference.rotation;
-      const auto& Rc = pose->rotation;
-      double R[9];
-      for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j) {
-          R[i * 3 + j] = 0;
-          for (int k = 0; k < 3; ++k) R[i * 3 + j] += Rr[i * 3 + k] * Rc[j * 3 + k];
-          relative.rotation[i * 3 + j] = static_cast<float>(R[i * 3 + j]);
+    if (gap == 0) return false;
+    const Ring ring{m.luma, m.flow, kRing, m.newest, m.flow_width, m.flow_height, m.flow_grid};
+    cuda_check(cudaMemsetAsync(m.counters, 0, counter_count * sizeof(unsigned), m.stream),
+               "clear live depth counters");
+    measure_kernel<<<grid, block, 0, m.stream>>>(ring, gap, lens,
+                                                Impl::relative(m.slots[(m.newest - gap + kRing) % kRing].pose, *pose),
+                                                m.config, out, out_variance, m.counters);
+    cuda_check(cudaGetLastError(), "measure depth");
+    unsigned host[counter_count]{};
+    read_counters(host);
+    m.stats.measured = host[measured];
+    m.stats.outside = host[outside];
+    m.stats.off_line = host[off_line];
+    m.stats.weak_gradient = host[weak_gradient];
+    m.stats.at_search_edge = host[at_search_edge];
+    m.stats.poor_match = host[poor_match];
+    m.stats.behind = host[behind];
+    m.gap = gap;
+    return true;
+  };
+  const auto interpolate_anchors = [&](float* out, float* out_variance) {
+    const int coarse_width = (m.width + kAnchorGrid - 1) / kAnchorGrid;
+    const int coarse_height = (m.height + kAnchorGrid - 1) / kAnchorGrid;
+    anchors_kernel<<<dim3((coarse_width + 15) / 16, (coarse_height + 15) / 16), block, 0, m.stream>>>(
+        m.anchors, static_cast<int>(anchors.size()), coarse_width, coarse_height, m.config.anchor_sigma,
+        m.config.anchor_sigma_per_px, m.coarse, m.coarse_variance);
+    upsample_kernel<<<grid, block, 0, m.stream>>>(m.coarse, m.coarse_variance, coarse_width, coarse_height, m.width,
+                                                 m.height, out, out_variance);
+    cuda_check(cudaGetLastError(), "interpolate depth anchors");
+  };
+  const bool enough_anchors = pose && anchors.size() >= 8;
+  if (enough_anchors) m.upload(anchors);
+
+  if (m.config.mode == LiveDepthMode::anchors) {
+    if (enough_anchors) {
+      interpolate_anchors(m.inverse_depth, m.variance);
+      m.stats.measured = m.stats.estimated = pixels;
+      m.valid = true;
+    }
+  } else if (m.config.mode == LiveDepthMode::measurement) {
+    if (pose && measure(m.inverse_depth, m.variance)) {
+      m.stats.estimated = m.stats.measured;
+      m.valid = true;
+    }
+  } else {
+    // 1. Carry the state into this frame. Another segment has another frame and scale.
+    if (pose && segment != m.state_segment) m.state_filled = false;
+    if (m.state_filled && continues) {
+      const auto& before = m.slots[(m.newest - 1 + kRing) % kRing];
+      const bool moved = pose && before.posed && before.segment == segment;
+      const std::size_t cells = static_cast<std::size_t>(m.flow_width) * m.flow_height;
+      propagate_kernel<<<grid, block, 0, m.stream>>>(m.state[0], m.state_variance[0], m.flow + m.newest * cells,
+                                                    m.flow_width, m.flow_height, m.flow_grid, lens,
+                                                    moved ? Impl::relative(before.pose, *pose) : Relative{}, moved ? 1 : 0,
+                                                    m.config, m.state[1], m.state_variance[1]);
+      cuda_check(cudaGetLastError(), "propagate depth");
+      std::swap(m.state[0], m.state[1]);
+      std::swap(m.state_variance[0], m.state_variance[1]);
+    } else {
+      fill_kernel<<<strips, 256, 0, m.stream>>>(m.state[0], m.state_variance[0], count);
+      cuda_check(cudaGetLastError(), "clear depth state");
+      m.state_filled = true;
+    }
+    if (pose) {
+      m.state_segment = segment;
+      // 2. One scale for the whole state, so that it agrees with the landmarks
+      // under it: it follows bundle adjustment and scale drift.
+      if (m.config.scale_to_anchors && anchors.size() >= 20) {
+        gather_kernel<<<static_cast<unsigned>((anchors.size() + 255) / 256), 256, 0, m.stream>>>(
+            m.anchors, static_cast<int>(anchors.size()), m.state[0], m.state_variance[0], m.width, m.height,
+            m.gathered);
+        cuda_check(cudaGetLastError(), "look up depth anchors");
+        std::vector<float> under(anchors.size());
+        cuda_check(cudaMemcpyAsync(under.data(), m.gathered, under.size() * sizeof(float), cudaMemcpyDeviceToHost,
+                                   m.stream), "read depth anchor lookups");
+        cuda_check(cudaStreamSynchronize(m.stream), "synchronize live depth");
+        std::vector<float> ratios;
+        for (std::size_t k = 0; k < under.size(); ++k)
+          if (under[k] > 0) ratios.push_back(anchors[k].inverse_depth / under[k]);
+        if (ratios.size() >= 20) {
+          std::nth_element(ratios.begin(), ratios.begin() + ratios.size() / 2, ratios.end());
+          const float scale = ratios[ratios.size() / 2];
+          m.stats.scale = scale;
+          if (scale > 0.5F && scale < 2.0F && std::abs(scale - 1.0F) > 1e-3F) {
+            scale_kernel<<<strips, 256, 0, m.stream>>>(m.state[0], m.state_variance[0], count, scale);
+            cuda_check(cudaGetLastError(), "scale depth state");
+          }
         }
-      for (int i = 0; i < 3; ++i) {
-        double t = reference.translation[i];
-        for (int j = 0; j < 3; ++j) t -= R[i * 3 + j] * pose->translation[j];
-        relative.translation[i] = static_cast<float>(t);
       }
-      const Lens lens{m.width, m.height, camera.fx, camera.fy, camera.cx, camera.cy, camera.k1};
-      const Ring ring{m.luma, m.flow, kRing, m.newest, m.flow_width, m.flow_height, m.flow_grid};
+      // 3. This frame's measurement.
+      if (measure(m.measured, m.measured_variance)) {
+        fuse_kernel<<<strips, 256, 0, m.stream>>>(m.measured, m.measured_variance, m.config, m.state[0],
+                                                 m.state_variance[0], count);
+        cuda_check(cudaGetLastError(), "fuse depth");
+      }
+      // 4. The image: the state, or the state combined with what the landmarks alone say.
+      const bool with_anchors = m.config.mode == LiveDepthMode::fused && enough_anchors;
+      if (with_anchors) interpolate_anchors(m.anchored, m.anchored_variance);
       cuda_check(cudaMemsetAsync(m.counters, 0, counter_count * sizeof(unsigned), m.stream),
                  "clear live depth counters");
-      measure_kernel<<<grid, block, 0, m.stream>>>(ring, gap, lens, relative, m.config, m.inverse_depth, m.variance,
-                                                  m.counters);
-      cuda_check(cudaGetLastError(), "measure depth");
+      output_kernel<<<strips, 256, 0, m.stream>>>(m.state[0], m.state_variance[0], with_anchors ? m.anchored : nullptr,
+                                                 m.anchored_variance, m.config.outlier_sigmas, m.inverse_depth,
+                                                 m.variance, count, m.counters);
+      cuda_check(cudaGetLastError(), "compose depth image");
       unsigned host[counter_count]{};
-      cuda_check(cudaMemcpyAsync(host, m.counters, sizeof(host), cudaMemcpyDeviceToHost, m.stream),
-                 "read live depth counters");
-      cuda_check(cudaStreamSynchronize(m.stream), "synchronize live depth");
-      m.stats.measured = host[measured];
-      m.stats.outside = host[outside];
-      m.stats.off_line = host[off_line];
-      m.stats.weak_gradient = host[weak_gradient];
-      m.stats.at_search_edge = host[at_search_edge];
-      m.stats.poor_match = host[poor_match];
-      m.stats.behind = host[behind];
-      m.gap = gap;
+      read_counters(host);
+      m.stats.estimated = host[measured];
       m.valid = true;
     }
   }
   cuda_check(cudaStreamSynchronize(m.stream), "synchronize live depth");
   m.stats.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+}
+
+LiveDepthDevice LiveDepth::device() const {
+  const auto& m = *impl_;
+  if (!m.valid) return {};
+  return {m.inverse_depth, m.variance, m.width, m.height};
+}
+
+bool LiveDepth::at(int x, int y, float* inverse_depth, float* variance) const {
+  const auto& m = *impl_;
+  if (!m.valid || x < 0 || y < 0 || x >= m.width || y >= m.height) return false;
+  const std::size_t index = static_cast<std::size_t>(y) * m.width + x;
+  cuda_check(cudaMemcpy(inverse_depth, m.inverse_depth + index, sizeof(float), cudaMemcpyDeviceToHost),
+             "read a live depth pixel");
+  cuda_check(cudaMemcpy(variance, m.variance + index, sizeof(float), cudaMemcpyDeviceToHost),
+             "read a live depth pixel");
+  return std::isfinite(*variance);
 }
 
 LiveDepthImage LiveDepth::download() const {
