@@ -45,6 +45,7 @@ int main(int argc, char** argv) {
     OpticalFlowConfig flow_config;
     SuperPointConfig sp_config;
     VisualOdometryConfig vo_config;
+    vo_config.place_synchronous = true;  // deterministic runs; "place-sync 0" uses the worker thread
     std::string export_tracks, export_trajectory, export_map, export_features;
     int skip = 0;  // frames decoded and dropped first (frame-exact, unlike a seek); indices count them
     for (int a = 5; a + 1 < argc; a += 2) {
@@ -72,6 +73,8 @@ int main(int argc, char** argv) {
       else if (key == "place-interval") vo_config.place_search_interval = static_cast<int>(value);
       else if (key == "place-ratio") vo_config.place_ratio = value;
       else if (key == "place-inliers") vo_config.place_min_inliers = static_cast<int>(value);
+      else if (key == "place-sync") vo_config.place_synchronous = value != 0;
+      else if (key == "place-correct") vo_config.place_correction = value != 0;
       else if (key == "vo-coast") vo_config.coast_max_frames = static_cast<int>(value);
       else if (key == "reloc-radius") vo_config.relocalization_radius_px = value;
       else if (key == "reloc-min-radius") vo_config.relocalization_min_radius_px = value;
@@ -106,7 +109,7 @@ int main(int argc, char** argv) {
     bool tracks_header = false;
 
     int vo_posed = 0, vo_keyframes = 0, vo_losses = 0, vo_reassociated = 0, vo_merged = 0, vo_coasted = 0,
-        vo_relocalized = 0, vo_place_reassociated = 0, vo_revisits = 0;
+        vo_relocalized = 0, vo_place_reassociated = 0, vo_revisits = 0, vo_loops = 0, vo_merges = 0;
     std::vector<float> vo_revisit_offset;
     std::vector<float> vo_confidence, vo_sigma;
     double vo_ms = 0, vo_max_ms = 0;
@@ -151,6 +154,11 @@ int main(int argc, char** argv) {
       vo_coasted += pose.predicted;
       vo_relocalized += pose.relocalized;
       vo_place_reassociated += pose.place_reassociated;
+      vo_loops += pose.loop_closed;
+      vo_merges += pose.segments_merged;
+      if (pose.loop_closed || pose.segments_merged || pose.event.rfind("revisit", 0) == 0 ||
+          pose.event.rfind("loop found", 0) == 0)
+        std::cout << "  vo frame " << pose.frame_index << ": " << pose.event << '\n';
       if (pose.place_inliers > 0 && !pose.relocalized) {  // a mapped place seen again while tracking
         ++vo_revisits;
         vo_revisit_offset.push_back(float(pose.place_offset_px));
@@ -240,8 +248,9 @@ int main(int argc, char** argv) {
     for (const auto& point : odometry.map()) local_landmarks += point.local;
     std::printf("landmarks: %zu (%zu in the local map), re-associated %d (%d merged; %d from outside the local map)\n",
                 odometry.map_size(), local_landmarks, vo_reassociated, vo_merged, vo_place_reassociated);
-    std::printf("places: %d revisits found without a pose prior while tracking (not corrected), median %.1f px from "
-                "the tracked pose\n", vo_revisits, percentile(vo_revisit_offset, 0.5));
+    std::printf("places: %d revisits found without a pose prior while tracking, median %.1f px from the tracked "
+                "pose; %d loops closed, %d segments merged\n",
+                vo_revisits, percentile(vo_revisit_offset, 0.5), vo_loops, vo_merges);
     if (!export_map.empty()) {
       std::ofstream out(export_map);
       write_map_csv(out, odometry);

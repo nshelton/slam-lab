@@ -40,12 +40,10 @@ void PlaceIndex::erase(std::uint64_t id) {
 }
 
 std::vector<PlaceIndex::Match> PlaceIndex::match(const float* queries, int count, double min_similarity, double ratio,
-                                                 const std::function<bool(std::uint64_t)>& accept) const {
+                                                 const std::vector<char>& accepted) const {
   std::vector<Match> matches;
   const std::size_t entries = ids_.size();
-  if (count <= 0 || entries == 0) return matches;
-  std::vector<char> accepted(entries);
-  for (std::size_t e = 0; e < entries; ++e) accepted[e] = accept(ids_[e]);
+  if (count <= 0 || entries == 0 || accepted.size() != entries) return matches;
   const Eigen::Map<const Rows> Q(queries, count, dimension_);
 
   // Per block of entries: each query's best two entries and each entry's best
@@ -116,7 +114,7 @@ std::vector<PlaceIndex::Match> PlaceIndex::match(const float* queries, int count
     }
     if (best < min_similarity || entry_query[entry] != q) continue;
     if (second > kNone && 1 - best > ratio * (1 - second)) continue;
-    matches.push_back({q, ids_[entry], best});
+    matches.push_back({q, entry, ids_[entry], best});
   }
   std::sort(matches.begin(), matches.end(), [](const Match& l, const Match& r) { return l.id < r.id; });
   return matches;

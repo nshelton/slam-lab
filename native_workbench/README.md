@@ -86,7 +86,7 @@ the tracks, poses and map. The trajectory CSV has one row per posed frame:
 (`cx,cy,cz`), the camera-to-world quaternion (`qw,qx,qy,qz`), `predicted`
 (1 for a coasted frame) and `confidence`. VO options
 on the bench: `hfov`, `k1`, `fx fy cx cy` (all four), `kf-min`, `kf-max`,
-`kf-emergency-ratio`, `window`, `local-map`, `reassoc-radius`, `place-interval`, `place-ratio`, `place-inliers`, `vo-coast`,
+`kf-emergency-ratio`, `window`, `local-map`, `reassoc-radius`, `place-interval`, `place-ratio`, `place-inliers`, `place-sync`, `place-correct`, `vo-coast`,
 `reloc-radius`, `reloc-min-radius` and `reloc-inliers`. See
 [ARCHITECTURE.md](ARCHITECTURE.md#camera-pose-live-monocular-visual-odometry--2026-09-24)
 for the algorithm, measurements and limitations.
@@ -95,10 +95,11 @@ The map keeps every landmark of the run, and none is final. The **local map**
 is the part being tracked and refined: landmarks with a live track or seen by
 the recent keyframes. A landmark that leaves it, or whose segment ends, stays
 in the map with its sightings and descriptor, and is found again by a
-descriptor search without a pose prior: a lost camera resumes the old segment
-instead of starting a new one, and while tracking, landmarks that still
-project where they are seen are re-associated. Revisits with drift are
-detected and reported but not corrected yet. Each landmark stores the mean
+descriptor search without a pose prior, which runs on a worker thread: a lost
+camera resumes the old map instead of starting a new segment, and while
+tracking, landmarks that still project where they are seen are re-associated.
+A revisit with drift closes a loop (Sim(3) pose graph over the segment's
+keyframes), and a place that belongs to another segment merges the two. Each landmark stores the mean
 image colour of its keyframe observations (sampled on the GPU with a 3×3
 mean), its track ID, and its first and last frames. The trajectory view draws
 points outside the local map dimmer, optionally in their image colour or

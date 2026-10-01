@@ -135,8 +135,15 @@ Evaluation evaluate(const Scene& scene, const std::vector<TrajectorySample>& tra
   return result;
 }
 
+// The place search on the calling thread, so runs are deterministic.
+VisualOdometryConfig synchronous() {
+  VisualOdometryConfig config;
+  config.place_synchronous = true;
+  return config;
+}
+
 std::vector<TrajectorySample> run(const std::vector<TrackedFrame>& frames, double* ms = nullptr,
-                                  VisualOdometryConfig config = {}) {
+                                  VisualOdometryConfig config = synchronous()) {
   VisualOdometry odometry(config);
   double total = 0;
   const bool verbose = std::getenv("SLAM_VO_VERBOSE") != nullptr;
@@ -283,7 +290,7 @@ void coasts_through_occlusion() {
     }
     for (auto& o : frame.observations) o.track_id += f < first + gap ? 2'000'000 : 1'000'000;
   }
-  VisualOdometry odometry;
+  VisualOdometry odometry(synchronous());
   int coasted = 0, relocalized = 0;
   double last_confidence = 1, last_sigma = 0, tracked_confidence = 1;
   for (const auto& frame : scene.frames) {
@@ -318,7 +325,7 @@ void coasts_through_occlusion() {
 
   // Never relocalized (the scene does not come back): the segment ends and
   // the unconfirmed coasted frames leave the trajectory.
-  VisualOdometryConfig config;
+  VisualOdometryConfig config = synchronous();
   config.coast_max_frames = 15;
   VisualOdometry bounded(config);
   std::uint64_t lost_at = 0;
@@ -345,7 +352,7 @@ void resumes_segment_without_prior() {
     }
     for (auto& o : frame.observations) o.track_id += f < first + gap ? 2'000'000 : 1'000'000;
   }
-  VisualOdometryConfig config;
+  VisualOdometryConfig config = synchronous();
   config.coast_max_frames = 5;
   {
     VisualOdometry odometry(config);
@@ -385,6 +392,24 @@ void resumes_segment_without_prior() {
     for (const auto& point : map)
       require(observers[point.landmark_id] == point.keyframe_observations, "landmark_observations() does not match the map");
   }
+  {
+    // The same on the worker thread: the result arrives a few frames later
+    // and is used through the tracks still observed then.
+    VisualOdometryConfig threaded = config;
+    threaded.place_synchronous = false;
+    VisualOdometry odometry(threaded);
+    std::uint64_t resumed_at = 0;
+    for (const auto& frame : scene.frames) {
+      const auto r = odometry.process(frame);
+      if (r.relocalized) resumed_at = r.frame_index;
+    }
+    const auto result = evaluate(scene, odometry.trajectory());
+    std::cout << "long occlusion, search on the worker: resumed at frame " << resumed_at << ", " << result.segments
+              << " segment(s), ATE " << 100 * result.ate_fraction << "% of path\n";
+    require(resumed_at >= first + gap && resumed_at < first + gap + 30 && result.segments == 1,
+            "the worker's search did not resume the segment");
+    require(result.ate_fraction < 2e-3, "trajectory error across the segment resumed from the worker");
+  }
   config.place_search_interval = -1;  // no search without a prior: a new segment
   VisualOdometry odometry(config);
   for (const auto& frame : scene.frames) odometry.process(frame);
@@ -400,13 +425,76 @@ void resumes_segment_without_prior() {
   require(kept > 300 && local == 0 && second > 100, "the ended segment's landmarks must stay, outside the local map");
 }
 
+// The camera loses the map while it looks at a part of the scene it has not
+// seen (a second segment starts there), then the first part comes back into
+// view. The search finds the first segment's landmarks from the second, and
+// the second is moved into the first's map: one segment, one consistent map.
+void merges_segments() {
+  auto scene = make_scene(true, 420, 5, {0, 0, 0, 0, 0});
+  add_descriptors(scene);
+  const std::size_t first = 120, second = 240;
+  constexpr std::size_t kSplit = 1500;  // points below: the first part of the scene
+  for (std::size_t f = 0; f < scene.frames.size(); ++f) {
+    auto& frame = scene.frames[f];
+    TrackedFrame kept = frame;
+    kept.observations.clear();
+    kept.descriptors.clear();
+    for (std::size_t i = 0; i < frame.observations.size(); ++i) {
+      auto o = frame.observations[i];
+      const std::size_t point = o.color[0] + 256U * o.color[1];
+      const bool shown = f < first ? point < kSplit : f < second ? point >= kSplit : true;
+      if (!shown) continue;
+      if (f >= second && point < kSplit) o.track_id += 1'000'000;  // the first part's tracks restart
+      kept.observations.push_back(o);
+      const auto row = frame.descriptors.begin() + static_cast<std::ptrdiff_t>(i * frame.descriptor_dimension);
+      kept.descriptors.insert(kept.descriptors.end(), row, row + frame.descriptor_dimension);
+    }
+    frame = std::move(kept);
+  }
+  VisualOdometryConfig config = synchronous();
+  config.coast_max_frames = 5;
+  config.place_search_interval = 10;
+  for (const bool correct : {false, true}) {
+    config.place_correction = correct;
+    VisualOdometry odometry(config);
+    int merged_at = -1, seen_from_other = 0;
+    for (const auto& frame : scene.frames) {
+      const auto r = odometry.process(frame);
+      seen_from_other += r.place_inliers > 0 && r.place_segment != r.segment;
+      if (r.segments_merged) {
+        std::cout << "two parts: frame " << r.frame_index << ' ' << r.event << '\n';
+        merged_at = static_cast<int>(r.frame_index);
+      }
+    }
+    const auto trajectory = odometry.trajectory();
+    const auto result = evaluate(scene, trajectory);
+    const auto map = odometry.map();
+    std::size_t in_first = 0;
+    for (const auto& point : map) in_first += point.segment == 0;
+    std::cout << "two parts, correction " << (correct ? "on" : "off") << ": " << result.segments << " segment(s), "
+              << trajectory.size() << " poses, ATE " << 100 * result.ate_fraction << "% of path, " << in_first
+              << " of " << map.size() << " landmarks in segment 0";
+    if (!correct) {
+      std::cout << ", the first segment seen " << seen_from_other << " times from the second\n";
+      require(result.segments == 2 && merged_at < 0 && seen_from_other > 0, "expected two segments, reported not merged");
+      continue;
+    }
+    const double worst = worst_point_error(scene, map);
+    std::cout << ", worst point error " << worst << '\n';
+    require(merged_at >= static_cast<int>(second) && result.segments == 1 && in_first == map.size(),
+            "the second segment was not merged into the first");
+    require(trajectory.size() > 360, "poses were lost in the merge");
+    require(result.ate_fraction < 2e-3 && worst < 5e-3, "the merged map does not match the scene");
+  }
+}
+
 // A landmark that left the local map is found again by descriptor when the
 // camera looks back at it, and re-associated only when it still projects where
 // it is seen: the colour-encoded map stays exact.
 void reassociates_outside_local_map() {
   auto scene = make_scene(true, 600, 5, {0, 0, 0, 0, 0});
   add_descriptors(scene);
-  VisualOdometryConfig config;
+  VisualOdometryConfig config = synchronous();
   config.local_map_keyframes = config.window_keyframes;  // landmarks leave the local map quickly
   VisualOdometry odometry(config);
   int reassociated = 0, from_outside = 0;
@@ -429,7 +517,7 @@ void reassociates_outside_local_map() {
 void reassociates_broken_tracks() {
   auto scene = make_scene(true, 240, 5, {0, 0, 0.02, 0, 0});
   add_descriptors(scene);
-  VisualOdometry odometry;
+  VisualOdometry odometry(synchronous());
   int reassociated = 0, merged = 0;
   for (const auto& frame : scene.frames) {
     const auto r = odometry.process(frame);
@@ -521,6 +609,7 @@ int main() {
     reassociates_broken_tracks();
     coasts_through_occlusion();
     resumes_segment_without_prior();
+    merges_segments();
     reassociates_outside_local_map();
     // Noise-free data must be reproduced essentially exactly (regression for
     // rotation drift off SO(3), which made poses diverge geometrically).
@@ -534,7 +623,7 @@ int main() {
       // Landmarks that left the local map are kept, carry their observations'
       // colour, and match the true points up to a similarity. (A local map
       // as short as the BA window, so the short walk leaves landmarks behind.)
-      VisualOdometryConfig config;
+      VisualOdometryConfig config = synchronous();
       config.local_map_keyframes = config.window_keyframes;
       VisualOdometry odometry(config);
       for (const auto& frame : clean.frames) odometry.process(frame);

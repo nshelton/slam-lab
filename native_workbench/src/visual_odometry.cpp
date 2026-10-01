@@ -1,12 +1,14 @@
 #include "slam_native/visual_odometry.hpp"
 
 #include "place_index.hpp"
+#include "pose_graph.hpp"
 #include "vo_geometry.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <future>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -116,7 +118,9 @@ void VisualOdometryConfig::validate() const {
       bundle_iterations >= 0 && local_map_keyframes >= window_keyframes && reassociation_radius_px >= 0 &&
       min_descriptor_similarity <= 1 && coast_max_frames >= 0 && relocalization_min_radius_px > 0 &&
       relocalization_radius_px >= relocalization_min_radius_px && relocalization_min_inliers >= 6 &&
-      place_ratio > 0 && place_ransac_iterations > 0 && place_min_inliers >= 6 && (!intrinsics || (intrinsics->fx > 0 && intrinsics->fy > 0));
+      place_ratio > 0 && place_ransac_iterations > 0 && place_min_inliers >= 6 && loop_scale_spread >= 1 &&
+      loop_min_pairs >= 3 && loop_min_keyframe_gap >= 1 && loop_covisibility_min >= 1 && loop_cooldown_keyframes >= 0 &&
+      loop_edge_weight > 0 && (!intrinsics || (intrinsics->fx > 0 && intrinsics->fy > 0));
   if (!ok) throw std::invalid_argument("Invalid visual odometry settings");
 }
 
@@ -137,6 +141,9 @@ struct VisualOdometry::Impl {
     int segment{};
     SE3 pose;
     std::unordered_map<std::uint64_t, Vec2> observations;  // by track
+    // No odometry ties it to the keyframe before it: the first keyframe of a
+    // segment, or one that resume() placed from the map (see `links`).
+    bool starts_stretch{};
   };
   struct Sighting {
     int keyframe;
@@ -185,6 +192,13 @@ struct VisualOdometry::Impl {
   std::unordered_set<std::uint64_t> local;
   PlaceIndex places;  // every landmark's latest descriptor
   int frames_since_place_search{};
+  // Keyframe pairs tied by a place match rather than by odometry: a resumed
+  // keyframe with the old keyframe that saw most of its landmarks, the two
+  // ends of a closed loop, the two segments of a merge. Edges of later pose graphs.
+  std::vector<std::pair<int, int>> links;
+  int keyframes_since_correction{1 << 30};
+  std::string note;            // this frame's correction, for the event text
+  std::size_t changed_from{std::numeric_limits<std::size_t>::max()};  // first frame record a correction moved this frame
   // Track -> the landmark it observes (one track per landmark). Kept while
   // the landmark is local: a track missing from a frame may resume.
   std::unordered_map<std::uint64_t, std::uint64_t> track_landmark;
@@ -232,14 +246,13 @@ struct VisualOdometry::Impl {
     auto it = descriptors.find(landmark.track);
     if (it == descriptors.end()) return;
     landmark.descriptor.assign(it->second, it->second + descriptor_dimension);
-    places.set(id, it->second, descriptor_dimension);
+    index_set(id, it->second);
   }
   // A new landmark, in the local map.
   void add_landmark(Landmark landmark) {
     const std::uint64_t id = next_landmark_id++;
     track_landmark[landmark.track] = id;
-    if (!landmark.descriptor.empty())
-      places.set(id, landmark.descriptor.data(), static_cast<int>(landmark.descriptor.size()));
+    if (!landmark.descriptor.empty()) index_set(id, landmark.descriptor.data());
     local.insert(id);
     landmarks.emplace(id, std::move(landmark));
   }
@@ -249,7 +262,7 @@ struct VisualOdometry::Impl {
     if (auto t = track_landmark.find(it->second.track); t != track_landmark.end() && t->second == id)
       track_landmark.erase(t);
     local.erase(id);
-    places.erase(id);
+    index_erase(id);
     landmarks.erase(it);
   }
   std::vector<std::uint64_t> sorted_local() const {  // deterministic order (the set's is not)
@@ -370,8 +383,12 @@ struct VisualOdometry::Impl {
     }
     OdometryFrameResult result;
     result.frame_index = frame.frame_index;
+    note.clear();
+    changed_from = std::numeric_limits<std::size_t>::max();
+    poll(frame, result);
     if (state == OdometryState::initializing) initialize(frame, result);
     else track(frame, result);
+    if (!note.empty()) result.event = result.event.empty() ? note : note + "; " + result.event;
     result.segment = segment;
     result.map_points = landmarks.size();
     result.keyframes = segment_keyframes.size();
@@ -384,10 +401,13 @@ struct VisualOdometry::Impl {
     state = OdometryState::initializing;
     result.state = state;
     // A place the map already has: tracking resumes there instead.
-    if (config.place_search_interval >= 0 && !landmarks.empty() &&
-        resume(frame, observation_map(frame), place_matches(frame, [](std::uint64_t) { return true; },
-                                                            [](std::uint64_t) { return true; }), result))
-      return;
+    {
+      std::vector<std::uint64_t> ids;
+      std::vector<PoseObservation> observations;
+      SE3 pose;
+      std::vector<char> inliers;
+      if (find_place(frame, observation_map(frame), nullptr, 0, ids, observations, pose, inliers, result) < 0) return;
+    }
     if (!reference) {
       reference = frame;
       reference_age = 0;
@@ -499,6 +519,7 @@ struct VisualOdometry::Impl {
     const double scale = 1.0 / median(depths);
     second.t *= scale;
     const int k0 = add_keyframe(reference->frame_index, first, observation_map(*reference));
+    keyframes[k0].starts_stretch = true;
     const int k1 = add_keyframe(frame.frame_index, second, current);
     const auto reference_colors = color_map(*reference);
     for (std::size_t i = 0; i < ids.size(); ++i) {
@@ -602,11 +623,11 @@ struct VisualOdometry::Impl {
     }
     if (count < config.min_tracked_points) {
       const double sigma = image_sigma(predicted, motion.pose, visible_landmarks(predicted));
-      Matches elsewhere;  // descriptor matches in other segments
-      count = relocalize(frame, current, predicted, sigma, ids, observations, pose, inliers, elsewhere, result);
+      count = relocalize(frame, current, predicted, sigma, nullptr, ids, observations, pose, inliers, result);
       if (count < config.min_tracked_points) {
-        if (resume(frame, current, elsewhere, result)) return;
-        return coast(frame, predicted, sigma, result);
+        count = find_place(frame, current, &predicted, sigma, ids, observations, pose, inliers, result);
+        if (count < 0) return;  // resumed in another segment
+        if (count < config.min_tracked_points) return coast(frame, predicted, sigma, result);
       }
     }
     std::vector<double> errors;
@@ -654,10 +675,12 @@ struct VisualOdometry::Impl {
     // Before the keyframe step, so a re-found landmark is not triangulated again.
     const std::unordered_set<std::uint64_t> inlier_tracks(inlier_ids.begin(), inlier_ids.end());
     reassociate(frame, pose, current, inlier_tracks, result);
-    if (config.place_search_interval > 0 && ++frames_since_place_search >= config.place_search_interval) {
-      frames_since_place_search = 0;
-      search_places(frame, pose, inlier_tracks, result);
+    if (place_ready) {
+      if (place_ready->tracking) use_places(frame, pose, current, inlier_tracks, result);
+      else place_ready.reset();  // made when there was no pose
+      pose = last_pose;  // a correction moves the map, and this pose with it
     }
+    ++frames_since_place_search;
     ++frames_since_keyframe;
     const bool emergency = count < config.keyframe_emergency_ratio * keyframe_landmarks;
     const bool keyframe = (frames_since_keyframe >= config.keyframe_min_interval &&
@@ -683,6 +706,13 @@ struct VisualOdometry::Impl {
       keyframe_landmarks = sightings_in(id);
       frames.push_back({frame.frame_index, frame.timestamp_ns, segment, id, SE3{}, true, false, result.confidence});
       result.keyframe = true;
+      // Look for places mapped before, among the landmarks outside the local map.
+      if (config.place_search_interval > 0 && frames_since_place_search >= config.place_search_interval &&
+          can_search()) {
+        frames_since_place_search = 0;
+        request_search(frame, id, [&](std::uint64_t landmark, const Landmark&) { return !local.count(landmark); },
+                       [](std::uint64_t) { return true; });
+      }
     } else {
       const int reference_keyframe = segment_keyframes.back();
       frames.push_back({frame.frame_index, frame.timestamp_ns, segment, reference_keyframe,
@@ -768,36 +798,66 @@ struct VisualOdometry::Impl {
     for (const auto& [id, i] : matches) associate(id, frame.observations[i].track_id, frame, result);
   }
 
-  // Search without a pose prior: this frame's `eligible` tracks against every
-  // landmark `accept` allows, by descriptor alone (PlaceIndex::match). Returns
-  // (landmark id, observation index), by landmark id.
-  using Matches = std::vector<std::pair<std::uint64_t, int>>;
-  template <typename Accept, typename Eligible>
-  Matches place_matches(const TrackedFrame& frame, Accept accept, Eligible eligible) const {
-    Matches matches;
-    if (descriptor_dimension == 0 || descriptor_dimension != places.dimension()) return matches;
-    std::vector<float> queries;
-    std::vector<int> rows;
-    for (int i = 0; i < static_cast<int>(frame.observations.size()); ++i) {
-      if (!eligible(frame.observations[i].track_id)) continue;
-      const float* d = frame.descriptors.data() + static_cast<std::size_t>(i) * descriptor_dimension;
-      queries.insert(queries.end(), d, d + descriptor_dimension);
-      rows.push_back(i);
-    }
-    for (const auto& m : places.match(queries.data(), static_cast<int>(rows.size()), config.min_descriptor_similarity,
-                                      config.place_ratio, accept))
-      matches.emplace_back(m.id, rows[m.query]);
-    return matches;
-  }
+  // ------------------------------------------------------------------------
+  // Search without a pose prior (place recognition). A search matches a
+  // frame's tracks to landmarks by descriptor alone and fits a P3P pose per
+  // segment. It works from a snapshot (PlaceQuery) on a worker thread, unless
+  // place_synchronous, and its result is used on a later frame through the
+  // tracks that are still observed then.
+  static constexpr std::uint64_t kNone = std::numeric_limits<std::uint64_t>::max();
+  struct PlaceQuery {
+    std::uint64_t frame_index{};
+    Intrinsics K;
+    VisualOdometryConfig config;
+    std::vector<float> descriptors;  // one row per track
+    std::vector<std::uint64_t> tracks;
+    std::vector<Vec2> pixels;
+    // A search made while tracking, at keyframe `keyframe` of `segment` with
+    // pose `pose`: per track, its landmark (kNone: none) and its position.
+    bool tracking{};
+    int segment{}, keyframe{-1};
+    SE3 pose;
+    std::vector<std::uint64_t> landmarks;
+    std::vector<Vec3> positions;
+    // Per index entry (PlaceIndex::ids() order): searched or not, its position and segment.
+    std::vector<char> accept;
+    std::vector<Vec3> X;
+    std::vector<int> segments;
+  };
+  struct PlaceMatch {
+    std::uint64_t landmark, track;
+    bool inlier;  // of the group's pose
+  };
+  using Pairs = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+  struct PlaceGroup {
+    int segment{};
+    std::vector<PlaceMatch> matches;  // by landmark id
+    int inliers{};                    // of the P3P pose; 0: none
+    SE3 pose;                         // the query frame in this segment's map
+    // Tracking only. offset_px: how far the tracked pose puts the inliers from
+    // their matches (median; this segment). S: the similarity taking the
+    // tracked map around the query frame onto this group's landmarks, and the
+    // (tracked, found) landmark pairs it rests on; no pairs: no alignment.
+    double offset_px{};
+    Sim3 S;
+    Pairs pairs;
+  };
+  struct PlaceResult {
+    std::uint64_t frame_index{};
+    bool tracking{};
+    int segment{}, keyframe{-1};
+    std::vector<PlaceGroup> groups;  // most matches first
+  };
 
   // P3P RANSAC and refinement over 2D-3D matches without a starting pose.
   // Returns the inlier count (0 below `needed`).
-  int fit_pose(const std::vector<PoseObservation>& all, std::uint32_t seed, int iterations, int needed, SE3& found,
-               std::vector<char>& fit) const {
+  static int fit_pose(const Intrinsics& K, const VisualOdometryConfig& config, const std::vector<PoseObservation>& all,
+                      std::uint32_t seed, int iterations, int needed, SE3& found, std::vector<char>& fit) {
     if (static_cast<int>(all.size()) < needed) return 0;
     if (ransac_pnp(K, all, config.recovery_threshold_px, iterations, seed, found, fit) < needed) return 0;
     // Refine on the inliers only, twice: most descriptor matches without a
     // prior are wrong, and a robust fit over all of them is pulled off the pose.
+    const double limit = config.reprojection_threshold_px * config.reprojection_threshold_px;
     int count = 0;
     for (int round = 0; round < 2; ++round) {
       std::vector<PoseObservation> kept;
@@ -806,61 +866,213 @@ struct VisualOdometry::Impl {
       std::vector<char> unused;
       optimize_pose(K, kept, found, config.reprojection_threshold_px, unused);
       count = 0;
-      for (std::size_t i = 0; i < all.size(); ++i)
-        count += fit[i] = reprojects(found, all[i].X, all[i].u, config.reprojection_threshold_px);
+      for (std::size_t i = 0; i < all.size(); ++i) {
+        const Vec3 xc = found * all[i].X;
+        count += fit[i] = xc.z() > 1e-6 && (K.project(xc) - all[i].u).squaredNorm() <= limit;
+      }
       if (count < needed) return 0;
     }
     return count;
   }
 
-  // The live tracks do not give a pose. Search the local map around the
-  // predicted pose, as wide as its uncertainty (`sigma`, pixels), among the
-  // tracks without a landmark; P3P RANSAC over those matches and the live
-  // correspondences. When that fails, the same over the descriptor matches
-  // without a pose prior to the segment's landmarks, local or not. On success
-  // the matched tracks take over their landmarks, the correspondences and
-  // `pose` describe the fit, and the inlier count is returned; otherwise 0,
-  // with nothing changed and `elsewhere` holding the prior-free matches to
-  // other segments.
+  // The similarity between the tracked map and a group's landmarks, from the
+  // group's pose and the depth ratio of the inliers whose track also has a
+  // tracked landmark (a 3D-3D fit is too noisy: young landmarks have poor
+  // depth). The ratio must be consistent: p75 <= loop_scale_spread x p25, and
+  // at least loop_min_pairs pairs within 25% of the median.
+  static void align(const PlaceQuery& q, const std::vector<std::pair<std::size_t, int>>& found,
+                    const std::vector<PoseObservation>& all, const std::vector<char>& fit, PlaceGroup& group) {
+    std::vector<double> ratios, offsets;
+    std::vector<std::size_t> used;
+    for (std::size_t m = 0; m < all.size(); ++m) {
+      if (!fit[m]) continue;
+      if (group.segment == q.segment)
+        if (const Vec3 xc = q.pose * all[m].X; xc.z() > 1e-6) offsets.push_back((q.K.project(xc) - all[m].u).norm());
+      const int query = found[m].second;
+      if (q.landmarks[query] == kNone) continue;
+      const double z_found = (group.pose * all[m].X).z(), z_tracked = (q.pose * q.positions[query]).z();
+      if (z_found <= 1e-9 || z_tracked <= 1e-9) continue;
+      ratios.push_back(z_found / z_tracked);
+      used.push_back(m);
+    }
+    group.offset_px = median(offsets);
+    const std::size_t needed = static_cast<std::size_t>(q.config.loop_min_pairs);
+    if (ratios.size() < needed) return;
+    std::vector<double> sorted = ratios;
+    std::sort(sorted.begin(), sorted.end());
+    if (sorted[3 * sorted.size() / 4] > q.config.loop_scale_spread * sorted[sorted.size() / 4]) return;
+    const double scale = sorted[sorted.size() / 2];  // found units per tracked unit
+    Pairs pairs;
+    for (std::size_t j = 0; j < used.size(); ++j)
+      if (std::abs(std::log(ratios[j] / scale)) < 0.25)
+        pairs.emplace_back(q.landmarks[found[used[j]].second], group.matches[used[j]].landmark);
+    if (pairs.size() < needed) return;
+    // Found map -> query camera in tracked units; S takes the tracked map onto the found one.
+    const Sim3 corrected = Sim3{1 / scale, Mat3::Identity(), Vec3::Zero()} * Sim3::from(group.pose);
+    group.S = corrected.inverse() * Sim3::from(q.pose);
+    group.pairs = std::move(pairs);
+  }
+
+  // The search itself: reads only its arguments (worker thread).
+  static PlaceResult search(const PlaceIndex& index, const PlaceQuery& q) {
+    PlaceResult result{q.frame_index, q.tracking, q.segment, q.keyframe, {}};
+    const auto& ids = index.ids();
+    std::map<int, std::vector<std::pair<std::size_t, int>>> by_segment;  // (index row, query)
+    for (const auto& m : index.match(q.descriptors.data(), static_cast<int>(q.tracks.size()),
+                                     q.config.min_descriptor_similarity, q.config.place_ratio, q.accept))
+      by_segment[q.segments[m.row]].emplace_back(m.row, m.query);
+    std::vector<int> order;
+    for (const auto& [id, found] : by_segment) order.push_back(id);
+    std::stable_sort(order.begin(), order.end(), [&](int l, int r) { return by_segment[l].size() > by_segment[r].size(); });
+    for (int id : order) {
+      const auto& found = by_segment[id];
+      PlaceGroup group;
+      group.segment = id;
+      std::vector<PoseObservation> all;
+      for (const auto& [row, query] : found) {
+        group.matches.push_back({ids[row], q.tracks[query], false});
+        all.push_back({q.X[row], q.pixels[query]});
+      }
+      std::vector<char> fit;
+      const std::uint32_t seed = static_cast<std::uint32_t>(q.frame_index * 2246822519U + 2 + id);
+      group.inliers = fit_pose(q.K, q.config, all, seed, q.config.place_ransac_iterations, q.config.place_min_inliers,
+                               group.pose, fit);
+      if (group.inliers > 0) {
+        for (std::size_t m = 0; m < fit.size(); ++m) group.matches[m].inlier = fit[m];
+        if (q.tracking) align(q, found, all, fit, group);
+      }
+      result.groups.push_back(std::move(group));
+    }
+    return result;
+  }
+
+  // The index is read by a running search: changes wait in a log until it finishes.
+  void index_set(std::uint64_t id, const float* descriptor) {
+    if (place_job.valid()) place_log.emplace_back(id, std::vector<float>(descriptor, descriptor + descriptor_dimension));
+    else places.set(id, descriptor, descriptor_dimension);
+  }
+  void index_erase(std::uint64_t id) {
+    if (place_job.valid()) place_log.emplace_back(id, std::vector<float>{});
+    else places.erase(id);
+  }
+  [[nodiscard]] bool can_search() const {
+    return config.place_search_interval >= 0 && !place_job.valid() && !place_ready && !correction &&
+           descriptor_dimension > 0 && descriptor_dimension == places.dimension() && places.size() > 0;
+  }
+
+  // Start a search for this frame's `eligible` tracks over the landmarks
+  // `accept` allows. `keyframe` >= 0: made while tracking, at that keyframe.
+  template <typename Accept, typename Eligible>
+  void request_search(const TrackedFrame& frame, int keyframe, Accept accept, Eligible eligible) {
+    PlaceQuery q;
+    q.frame_index = frame.frame_index;
+    q.K = K;
+    q.config = config;
+    q.tracking = keyframe >= 0;
+    q.segment = segment;
+    q.keyframe = keyframe;
+    if (q.tracking) q.pose = keyframes[keyframe].pose;
+    for (std::size_t i = 0; i < frame.observations.size(); ++i) {
+      const auto& o = frame.observations[i];
+      if (!eligible(o.track_id)) continue;
+      const float* d = frame.descriptors.data() + i * static_cast<std::size_t>(descriptor_dimension);
+      q.descriptors.insert(q.descriptors.end(), d, d + descriptor_dimension);
+      q.tracks.push_back(o.track_id);
+      q.pixels.emplace_back(o.x, o.y);
+      auto mapped = track_landmark.find(o.track_id);
+      q.landmarks.push_back(mapped == track_landmark.end() ? kNone : mapped->second);
+      q.positions.push_back(mapped == track_landmark.end() ? Vec3(Vec3::Zero()) : landmarks.at(mapped->second).X);
+    }
+    const auto& ids = places.ids();
+    q.accept.reserve(ids.size());
+    q.X.reserve(ids.size());
+    q.segments.reserve(ids.size());
+    for (auto id : ids) {
+      const Landmark& landmark = landmarks.at(id);
+      q.accept.push_back(accept(id, landmark));
+      q.X.push_back(landmark.X);
+      q.segments.push_back(landmark.segment);
+    }
+    if (config.place_synchronous) {
+      place_ready = search(places, q);
+      return;
+    }
+    place_job = std::async(std::launch::async, [this, q = std::move(q)] { return search(places, q); });
+  }
+
+  // Collect what the workers finished, at the start of a frame.
+  void poll(const TrackedFrame& frame, OdometryFrameResult& result) {
+    using namespace std::chrono_literals;
+    if (place_job.valid() && place_job.wait_for(0s) == std::future_status::ready) {
+      place_ready = place_job.get();
+      for (const auto& [id, descriptor] : place_log) {
+        if (descriptor.empty()) places.erase(id);
+        else places.set(id, descriptor.data(), static_cast<int>(descriptor.size()));
+      }
+      place_log.clear();
+    }
+    // Its tracks are gone after a while.
+    if (place_ready && frame.frame_index > place_ready->frame_index + 30) place_ready.reset();
+    if (correction && correction->solution.wait_for(0s) == std::future_status::ready) apply_correction(frame, result);
+  }
+
+  // A finished search's inlier matches of `group` that still hold on this
+  // frame: the landmark exists and the track is observed (and `eligible`).
+  // (landmark id, observation index), by landmark id.
+  using Matches = std::vector<std::pair<std::uint64_t, int>>;
+  template <typename Eligible>
+  Matches hits(const TrackedFrame& frame, const PlaceGroup& group, Eligible eligible) const {
+    std::unordered_map<std::uint64_t, int> index_of;
+    for (int i = 0; i < static_cast<int>(frame.observations.size()); ++i) index_of.emplace(frame.observations[i].track_id, i);
+    Matches found;
+    for (const auto& m : group.matches) {
+      if (!m.inlier || !landmarks.count(m.landmark)) continue;
+      auto it = index_of.find(m.track);
+      if (it != index_of.end() && eligible(m.track)) found.emplace_back(m.landmark, it->second);
+    }
+    return found;
+  }
+
+  // The live tracks do not give a pose. `place` null: search the local map
+  // around the predicted pose, as wide as its uncertainty (`sigma`, pixels),
+  // among the tracks without a landmark. Otherwise: take a finished search
+  // without a pose prior, whose matches in this segment are `place`, as far
+  // as they are in the local map. P3P
+  // RANSAC over those matches and the live correspondences. On success the
+  // matched tracks take over their landmarks, the correspondences and `pose`
+  // describe the fit, and the inlier count is returned; otherwise 0, with
+  // nothing changed.
   int relocalize(const TrackedFrame& frame, const std::unordered_map<std::uint64_t, Vec2>& current,
-                 const SE3& predicted, double sigma, std::vector<std::uint64_t>& ids,
+                 const SE3& predicted, double sigma, const PlaceGroup* place, std::vector<std::uint64_t>& ids,
                  std::vector<PoseObservation>& observations, SE3& pose, std::vector<char>& inliers,
-                 Matches& elsewhere, OdometryFrameResult& result) {
+                 OdometryFrameResult& result) {
     const double radius = std::clamp(3 * sigma, config.relocalization_min_radius_px, config.relocalization_radius_px);
     const auto unmapped = [&](std::uint64_t track) { return !track_landmark.count(track); };
     // A landmark in view may be predicted outside the image, by as much as the search is wide.
-    Matches matches = match_local(frame, predicted, radius, radius, current, unmapped);
-    const auto with_live = [&] {
-      std::vector<PoseObservation> all = observations;
-      for (const auto& [id, i] : matches)
-        all.push_back({landmarks.at(id).X, Vec2(frame.observations[i].x, frame.observations[i].y)});
-      return all;
-    };
-    std::vector<PoseObservation> all = with_live();
+    Matches matches = place ? hits(frame, *place, unmapped) :
+                              match_local(frame, predicted, radius, radius, current, unmapped);
+    // An old part of the segment may have drifted from here: that is resume()'s case.
+    if (place)
+      matches.erase(std::remove_if(matches.begin(), matches.end(),
+                                   [&](const auto& match) { return !local.count(match.first); }),
+                    matches.end());
+    std::vector<PoseObservation> all = observations;
+    for (const auto& [id, i] : matches)
+      all.push_back({landmarks.at(id).X, Vec2(frame.observations[i].x, frame.observations[i].y)});
+    const std::size_t live = observations.size();
     SE3 found = predicted;
     std::vector<char> fit;
     const std::uint32_t seed = static_cast<std::uint32_t>(frame.frame_index * 2246822519U);
-    int count = fit_pose(all, seed, config.ransac_iterations, config.relocalization_min_inliers, found, fit);
-    bool prior = true;
-    if (count == 0 && config.place_search_interval >= 0) {
-      prior = false;
-      matches.clear();
-      for (const auto& match : place_matches(frame, [&](std::uint64_t id) {
-             return !current.count(landmarks.at(id).track) || !local.count(id);
-           }, unmapped))
-        (landmarks.at(match.first).segment == segment ? matches : elsewhere).push_back(match);
-      all = with_live();
-      found = predicted;
-      count = fit_pose(all, seed + 1, config.place_ransac_iterations, config.place_min_inliers, found, fit);
-      // The evidence has to come from the descriptor matches: the live
-      // correspondences agree with any pose near the last one.
-      if (count > 0 && std::count(fit.begin() + static_cast<std::ptrdiff_t>(observations.size()), fit.end(), 1) <
-                           config.place_min_inliers)
-        count = 0;
-    }
+    const int count = place ? fit_pose(K, config, all, seed + 1, config.place_ransac_iterations,
+                                       config.place_min_inliers, found, fit) :
+                              fit_pose(K, config, all, seed, config.ransac_iterations,
+                                       config.relocalization_min_inliers, found, fit);
     if (count == 0) return 0;
+    // Without a prior the evidence has to come from the descriptor matches:
+    // the live correspondences agree with any pose near the last one.
+    if (place && std::count(fit.begin() + static_cast<std::ptrdiff_t>(live), fit.end(), 1) < config.place_min_inliers)
+      return 0;
     std::vector<double> offsets;  // how far the prediction was, in the image
-    const std::size_t live = observations.size();
     for (std::size_t m = 0; m < matches.size(); ++m) {
       if (!fit[live + m]) continue;
       const auto& [id, i] = matches[m];
@@ -876,20 +1088,55 @@ struct VisualOdometry::Impl {
     result.correspondences = static_cast<int>(all.size());
     result.relocalized = true;
     char text[240];
-    if (prior)
-      std::snprintf(text, sizeof text,
-                    "relocalized after %d coasted frames: %d inliers of %zu matches within %.0f px; prediction was off "
-                    "by %.1f px (median), sigma %.1f px",
-                    coasted, count, all.size(), radius, median(offsets), sigma);
-    else
+    if (place)
       std::snprintf(text, sizeof text,
                     "relocalized after %d coasted frames by descriptor, without the predicted pose: %d inliers of %zu "
                     "matches; prediction was off by %.1f px (median), sigma %.1f px",
                     coasted, count, all.size(), median(offsets), sigma);
+    else
+      std::snprintf(text, sizeof text,
+                    "relocalized after %d coasted frames: %d inliers of %zu matches within %.0f px; prediction was off "
+                    "by %.1f px (median), sigma %.1f px",
+                    coasted, count, all.size(), radius, median(offsets), sigma);
     result.event = text;
-    result.place_segment = prior ? -1 : segment;
-    result.place_inliers = prior ? 0 : count;
+    if (place) {
+      result.place_segment = segment;
+      result.place_inliers = count;
+    }
     return count;
+  }
+
+  // A frame without a pose from its tracks or from the search around the
+  // predicted pose (`predicted` set), or without a map at all (initializing):
+  // use a finished search without a pose prior, or start one. Returns the
+  // relocalized inlier count (in the local map), or -1 when tracking resumed
+  // elsewhere in the map (the frame is done), or 0.
+  int find_place(const TrackedFrame& frame, const std::unordered_map<std::uint64_t, Vec2>& current,
+                 const SE3* predicted, double sigma, std::vector<std::uint64_t>& ids,
+                 std::vector<PoseObservation>& observations, SE3& pose, std::vector<char>& inliers,
+                 OdometryFrameResult& result) {
+    if (config.place_search_interval < 0 || landmarks.empty()) return 0;
+    if (place_ready && place_ready->tracking) place_ready.reset();  // made for a pose that is gone
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      if (place_ready) {
+        const PlaceResult ready = std::move(*place_ready);
+        place_ready.reset();
+        if (predicted)
+          for (const auto& group : ready.groups)
+            if (group.segment == segment && group.inliers > 0)
+              if (const int count = relocalize(frame, current, *predicted, sigma, &group, ids, observations, pose,
+                                               inliers, result))
+                return count;
+        if (resume(frame, current, ready, result)) return -1;
+      }
+      if (attempt == 1 || !can_search()) break;
+      // Landmarks a live track observes are already correspondences.
+      request_search(frame, -1, [&](std::uint64_t id, const Landmark& landmark) {
+        return !(local.count(id) && current.count(landmark.track));
+      }, [&](std::uint64_t track) { return !track_landmark.count(track); });
+      if (!place_ready) break;  // running on the worker: a later frame takes it
+    }
+    return 0;
   }
 
   int sightings_in(int keyframe) const {
@@ -899,34 +1146,35 @@ struct VisualOdometry::Impl {
     return count;
   }
 
-  // Tracking continues, from this frame, in the segment that most of the
-  // descriptor `matches` belong to and that gives a P3P pose (another segment
-  // than the one being tracked, or any segment when there is none). The
-  // current segment ends; the frame becomes a keyframe of the resumed one,
+  // Tracking continues, from this frame, at a place mapped before: in the
+  // segment with the most matches in the finished search `ready` whose inlier
+  // matches still give a P3P pose on this frame (another segment, or an old
+  // part of this one). The local map is dropped; the frame becomes a keyframe
   // whose local keyframes are the old keyframes that saw the landmarks found.
-  // Returns false, with nothing changed, when no segment gives a pose.
+  // It is tied to the most covisible of them (`links`), not to the keyframe
+  // before it: the camera's motion in between is unknown. Returns false, with
+  // nothing changed, when no segment gives a pose.
   bool resume(const TrackedFrame& frame, const std::unordered_map<std::uint64_t, Vec2>& current,
-              const Matches& matches, OdometryFrameResult& result) {
-    std::map<int, Matches> by_segment;
-    for (const auto& match : matches) by_segment[landmarks.at(match.first).segment].push_back(match);
-    std::vector<int> order;
-    for (const auto& [id, group] : by_segment) order.push_back(id);
-    std::stable_sort(order.begin(), order.end(),
-                     [&](int l, int r) { return by_segment[l].size() > by_segment[r].size(); });
+              const PlaceResult& ready, OdometryFrameResult& result) {
     int target = -1, count = 0;
     SE3 pose;
     std::vector<char> fit;
     std::vector<PoseObservation> all;
-    for (int id : order) {
+    Matches group;
+    for (const auto& candidate : ready.groups) {
+      if (candidate.inliers == 0) continue;
+      group = hits(frame, candidate, [](std::uint64_t) { return true; });
       all.clear();
-      for (const auto& [landmark, i] : by_segment[id])
+      for (const auto& [landmark, i] : group)
         all.push_back({landmarks.at(landmark).X, Vec2(frame.observations[i].x, frame.observations[i].y)});
-      const std::uint32_t seed = static_cast<std::uint32_t>(frame.frame_index * 2246822519U + 2 + id);
-      count = fit_pose(all, seed, config.place_ransac_iterations, config.place_min_inliers, pose, fit);
-      if (count > 0) { target = id; break; }
+      const std::uint32_t seed = static_cast<std::uint32_t>(frame.frame_index * 2246822519U + 2 + candidate.segment);
+      count = fit_pose(K, config, all, seed, config.place_ransac_iterations, config.place_min_inliers, pose, fit);
+      if (count > 0) {
+        target = candidate.segment;
+        break;
+      }
     }
     if (target < 0) return false;
-    const Matches& group = by_segment[target];
     const std::size_t matched = group.size();
 
     if (state == OdometryState::coasting) frames.resize(frames.size() - coasted);  // never confirmed
@@ -969,6 +1217,8 @@ struct VisualOdometry::Impl {
     motion.reset(pose_covariance(K, observations, pose, std::vector<char>(observations.size(), 1)), 1);
     report_uncertainty(image_sigma(pose, motion.pose, points), result);
     const int id = add_keyframe(frame.frame_index, pose, current);
+    keyframes[id].starts_stretch = true;
+    links.emplace_back(id, ranked.back().second);
     for (auto track : tracks) {
       auto& landmark = landmarks.at(track_landmark.at(track));
       landmark.observations.push_back(sighting(id, track));
@@ -994,54 +1244,346 @@ struct VisualOdometry::Impl {
     result.pose_inliers = tracks;
     result.place_segment = segment;
     result.place_inliers = count;
-    result.event = "resumed segment " + std::to_string(segment) + " by descriptor, without a pose prior: " +
+    result.event = "resumed segment " + std::to_string(segment) + " at keyframe " +
+                   std::to_string(keyframes[ranked.back().second].frame_index) +
+                   " by descriptor, without a pose prior: " +
                    std::to_string(count) + " inliers of " + std::to_string(matched) + " matches";
     return true;
   }
 
-  // While tracking: look, without a pose prior, for landmarks outside the
-  // local map. Those of this segment that project within
-  // reassociation_radius_px of their match under the tracked pose are
-  // re-associated like local ones. A P3P pose from the others means the place
-  // was mapped before, in this segment with drift or in another segment;
-  // that is reported (place_*), not corrected.
-  void search_places(const TrackedFrame& frame, const SE3& pose,
-                     const std::unordered_set<std::uint64_t>& inlier_tracks, OdometryFrameResult& result) {
-    std::map<int, Matches> by_segment;
-    for (const auto& match : place_matches(frame, [&](std::uint64_t id) { return !local.count(id); },
-                                           [](std::uint64_t) { return true; })) {
-      const auto& [id, i] = match;
-      const auto& o = frame.observations[i];
-      const Landmark& landmark = landmarks.at(id);
-      if (landmark.segment == segment && config.reassociation_radius_px > 0 &&
-          reprojects(pose, landmark.X, Vec2(o.x, o.y), config.reassociation_radius_px)) {
-        if (!track_landmark.count(o.track_id) || inlier_tracks.count(o.track_id)) {
-          associate(id, o.track_id, frame, result);
+  // While tracking: use a finished search (made at a keyframe of this segment,
+  // over the landmarks outside the local map). Matches in this segment that
+  // project within reassociation_radius_px of their track under the tracked
+  // pose are re-associated like local ones. A group with an alignment is a
+  // place mapped before: with drift in this segment (a loop, corrected by a
+  // pose graph, see close_loop()), or in another segment (merged, see
+  // merge_segments()).
+  void use_places(const TrackedFrame& frame, const SE3& pose, const std::unordered_map<std::uint64_t, Vec2>& current,
+                  const std::unordered_set<std::uint64_t>& inlier_tracks, OdometryFrameResult& result) {
+    const PlaceResult ready = std::move(*place_ready);
+    place_ready.reset();
+    if (ready.segment != segment) return;  // the segment changed meanwhile
+    for (const auto& group : ready.groups) {
+      if (group.segment == segment && config.reassociation_radius_px > 0)
+        for (const auto& m : group.matches) {
+          auto landmark = landmarks.find(m.landmark);
+          auto u = current.find(m.track);
+          if (landmark == landmarks.end() || u == current.end() || local.count(m.landmark)) continue;
+          if (!reprojects(pose, landmark->second.X, u->second, config.reassociation_radius_px)) continue;
+          if (track_landmark.count(m.track) && !inlier_tracks.count(m.track)) continue;
+          associate(m.landmark, m.track, frame, result);
           ++result.place_reassociated;
         }
-        continue;
+      if (group.inliers > result.place_inliers) {
+        result.place_segment = group.segment;
+        result.place_inliers = group.inliers;
+        result.place_offset_px = group.offset_px;
       }
-      by_segment[landmark.segment].push_back(match);
     }
-    for (const auto& [id, group] : by_segment) {
-      std::vector<PoseObservation> all;
-      for (const auto& [landmark, i] : group)
-        all.push_back({landmarks.at(landmark).X, Vec2(frame.observations[i].x, frame.observations[i].y)});
-      SE3 found;
-      std::vector<char> fit;
-      const std::uint32_t seed = static_cast<std::uint32_t>(frame.frame_index * 2246822519U + 2 + id);
-      const int count = fit_pose(all, seed, config.place_ransac_iterations, config.place_min_inliers, found, fit);
-      if (count <= result.place_inliers) continue;
-      result.place_segment = id;
-      result.place_inliers = count;
-      result.place_offset_px = 0;
-      if (id != segment) continue;
-      std::vector<double> offsets;  // drift: how far the tracked pose puts these landmarks from where they are seen
-      for (std::size_t m = 0; m < all.size(); ++m)
-        if (fit[m] && (pose * all[m].X).z() > 1e-6) offsets.push_back((K.project(pose * all[m].X) - all[m].u).norm());
-      result.place_offset_px = median(offsets);
+    if (!config.place_correction || correction || keyframes_since_correction < config.loop_cooldown_keyframes) return;
+    for (const auto& group : ready.groups) {
+      if (group.pairs.empty()) continue;
+      if (group.segment != segment) merge_segments(frame, ready, group, result);
+      else if (!close_loop(frame, ready, group, result)) continue;
+      break;
     }
   }
+
+  // Absorb landmark `absorbed` into `kept` (the same point): sightings of
+  // keyframes both saw keep `kept`'s.
+  void merge_landmarks(std::uint64_t kept, std::uint64_t absorbed) {
+    auto node = landmarks.extract(absorbed);
+    Landmark& gone = node.mapped();
+    if (auto t = track_landmark.find(gone.track); t != track_landmark.end() && t->second == absorbed)
+      track_landmark.erase(t);
+    local.erase(absorbed);
+    index_erase(absorbed);
+    Landmark& survivor = landmarks.at(kept);
+    for (const auto& o : gone.observations)
+      if (std::none_of(survivor.observations.begin(), survivor.observations.end(),
+                       [&](const Sighting& k) { return k.keyframe == o.keyframe; }))
+        survivor.observations.push_back(o);
+    std::sort(survivor.observations.begin(), survivor.observations.end(),
+              [](const Sighting& l, const Sighting& r) { return l.keyframe < r.keyframe; });
+    for (int c = 0; c < 3; ++c) survivor.color_sum[c] += gone.color_sum[c];
+    survivor.color_count += gone.color_count;
+    survivor.first_frame = std::min(survivor.first_frame, gone.first_frame);
+  }
+
+  // Each (tracked, found) pair of a correction is one point: merge them, the
+  // live track observing the survivor. Returns the number merged.
+  int merge_pairs(const Pairs& pairs, const TrackedFrame& frame, OdometryFrameResult& result) {
+    int merged = 0;
+    for (const auto& [tracked, found] : pairs) {
+      if (tracked == found || !landmarks.count(tracked) || !landmarks.count(found)) continue;
+      const std::uint64_t track = landmarks.at(tracked).track;
+      auto live = track_landmark.find(track);
+      if (live != track_landmark.end() && live->second == tracked && descriptors.count(track)) {
+        associate(found, track, frame, result);  // merges, and keeps the track on the survivor
+      } else {
+        const bool keep_found = landmarks.at(found).observations.size() >= landmarks.at(tracked).observations.size();
+        const bool mapped = live != track_landmark.end() && live->second == tracked;
+        const std::uint64_t kept = keep_found ? found : tracked;
+        merge_landmarks(kept, keep_found ? tracked : found);
+        if (mapped) {
+          landmarks.at(kept).track = track;
+          track_landmark[track] = kept;
+        }
+        local.insert(kept);
+        ++result.merged;
+      }
+      ++merged;
+    }
+    return merged;
+  }
+
+  // The old keyframes that saw the landmarks a correction found join the
+  // local keyframes, behind the bundle-adjustment window, with what they saw:
+  // now that the map agrees there, those landmarks re-associate at a pose.
+  void extend_local(const Pairs& pairs) {
+    std::map<int, int> votes;
+    for (const auto& [tracked, found] : pairs)
+      if (auto it = landmarks.find(found); it != landmarks.end())
+        for (const auto& o : it->second.observations) ++votes[o.keyframe];
+    const std::unordered_set<int> present(local_keyframes.begin(), local_keyframes.end());
+    std::vector<std::pair<int, int>> ranked;  // (votes, keyframe)
+    for (const auto& [keyframe, n] : votes)
+      if (!present.count(keyframe) && keyframes[keyframe].segment == segment) ranked.emplace_back(n, keyframe);
+    std::sort(ranked.begin(), ranked.end());
+    const std::size_t room = static_cast<std::size_t>(config.local_map_keyframes - config.window_keyframes);
+    if (ranked.size() > room) ranked.erase(ranked.begin(), ranked.end() - static_cast<std::ptrdiff_t>(room));
+    std::unordered_set<int> added;
+    std::vector<int> block;
+    for (const auto& [n, keyframe] : ranked) {
+      block.push_back(keyframe);
+      added.insert(keyframe);
+    }
+    const std::size_t window = std::min<std::size_t>(config.window_keyframes, local_keyframes.size());
+    local_keyframes.insert(local_keyframes.end() - static_cast<std::ptrdiff_t>(window), block.begin(), block.end());
+    for (const auto& [id, landmark] : landmarks)
+      if (landmark.segment == segment &&
+          std::any_of(landmark.observations.begin(), landmark.observations.end(),
+                      [&](const Sighting& o) { return added.count(o.keyframe) > 0; }))
+        local.insert(id);
+  }
+
+  // Move segment `seg` by `correction(keyframe)`: the similarity (old map ->
+  // new map) of whatever is anchored at that keyframe. Keyframes become rigid
+  // poses in the new units, landmarks move with their latest keyframe, and
+  // the frames stored relative to a keyframe are rescaled to its new units.
+  template <typename Correction>
+  void move_segment(int seg, Correction correction) {
+    std::unordered_map<int, double> unit_scale;
+    int newest = -1;
+    for (auto& kf : keyframes) {
+      if (kf.segment != seg) continue;
+      const Sim3 corrected = Sim3::from(kf.pose) * correction(kf.id).inverse();
+      kf.pose = corrected.rigid();
+      unit_scale[kf.id] = corrected.s;
+      newest = kf.id;
+    }
+    if (newest < 0) return;
+    for (auto& [id, landmark] : landmarks)
+      if (landmark.segment == seg)
+        landmark.X = correction(landmark.observations.empty() ? newest : landmark.observations.back().keyframe) *
+                     landmark.X;
+    for (std::size_t i = 0; i < frames.size(); ++i) {
+      if (frames[i].segment != seg) continue;
+      frames[i].relative.t /= unit_scale.at(frames[i].keyframe);
+      changed_from = std::min(changed_from, i);
+    }
+    if (seg == segment)
+      for (SE3* pose : {&last_pose, &previous_pose, &coast_origin})
+        *pose = (Sim3::from(*pose) * correction(newest).inverse()).rigid();
+  }
+
+  // A loop being corrected: the pose graph over the segment's keyframes is
+  // solved on a worker (unless place_synchronous) and applied as a delta.
+  struct Correction {
+    int segment{};
+    std::vector<int> nodes;     // keyframe ids, as in the problem
+    std::vector<Sim3> before;
+    std::future<PoseGraphProblem> solution;
+    Pairs pairs;
+    int keyframe{}, candidate{};  // the loop's two ends
+  };
+
+  // The place found is in this segment: the tracked map has drifted from it.
+  // The alignment becomes an edge between the search's keyframe and the old
+  // keyframe that saw most of the landmarks found, in a pose graph over the
+  // segment's keyframes (consecutive ones, and pairs sharing >=
+  // loop_covisibility_min landmarks). Returns false when the old keyframe is
+  // not at least loop_min_keyframe_gap keyframes back.
+  bool close_loop(const TrackedFrame& frame, const PlaceResult& ready, const PlaceGroup& group,
+                  OdometryFrameResult& result) {
+    const int k = ready.keyframe;
+    std::unordered_map<int, int> node_of;
+    for (std::size_t i = 0; i < segment_keyframes.size(); ++i) node_of[segment_keyframes[i]] = static_cast<int>(i);
+    if (!node_of.count(k)) return false;
+    std::map<int, int> votes;
+    for (const auto& [tracked, found] : group.pairs)
+      if (auto it = landmarks.find(found); it != landmarks.end())
+        for (const auto& o : it->second.observations) ++votes[o.keyframe];
+    int c = -1, most = 0;
+    for (const auto& [keyframe, n] : votes) {
+      auto node = node_of.find(keyframe);
+      if (node == node_of.end() || node->second > node_of.at(k) - config.loop_min_keyframe_gap) continue;
+      if (n > most) {
+        most = n;
+        c = keyframe;
+      }
+    }
+    if (c < 0) return false;
+    const SE3& Tk = keyframes[k].pose;
+    result.loop_keyframe = static_cast<std::int64_t>(keyframes[k].frame_index);
+    result.loop_candidate = static_cast<std::int64_t>(keyframes[c].frame_index);
+    keyframes_since_correction = 0;
+    // The map already agrees there: only join the duplicates.
+    std::vector<double> depths;
+    for (const auto& [tracked, found] : group.pairs)
+      if (auto it = landmarks.find(tracked); it != landmarks.end()) depths.push_back((Tk * it->second.X).z());
+    const double shift = (group.S * Tk.center() - Tk.center()).norm();
+    if (std::abs(std::log(group.S.s)) < 0.005 && log_so3(group.S.R).norm() < 0.2 * kDegree &&
+        shift < 0.005 * median(depths)) {
+      extend_local(group.pairs);
+      const int merged = merge_pairs(group.pairs, frame, result);
+      note = "revisit of keyframe " + std::to_string(keyframes[c].frame_index) + ": the map agrees, " +
+             std::to_string(merged) + " landmarks merged";
+      return true;
+    }
+    Correction job;
+    job.segment = segment;
+    job.pairs = group.pairs;
+    job.keyframe = k;
+    job.candidate = c;
+    PoseGraphProblem problem;
+    for (int id : segment_keyframes) {
+      job.nodes.push_back(id);
+      job.before.push_back(Sim3::from(keyframes[id].pose));
+      problem.nodes.push_back(job.before.back());
+      problem.fixed.push_back(id == c);
+    }
+    const auto add_edge = [&](int a, int b, const Sim3& measured, double weight) {
+      PoseGraphEdge edge;
+      edge.a = a;
+      edge.b = b;
+      edge.measured = measured;
+      edge.weight = weight;
+      problem.edges.push_back(edge);
+    };
+    const auto relative = [&](int a, int b) { return problem.nodes[a] * problem.nodes[b].inverse(); };
+    for (int i = 1; i < static_cast<int>(job.nodes.size()); ++i)
+      if (!keyframes[job.nodes[i]].starts_stretch) add_edge(i, i - 1, relative(i, i - 1), 1.0);
+    for (const auto& [a, b] : links)
+      if (node_of.count(a) && node_of.count(b))
+        add_edge(node_of.at(a), node_of.at(b), relative(node_of.at(a), node_of.at(b)), config.loop_edge_weight);
+    std::map<std::pair<int, int>, int> shared;
+    for (const auto& [id, landmark] : landmarks) {
+      if (landmark.segment != segment) continue;
+      std::vector<int> seen;
+      for (const auto& o : landmark.observations)
+        if (auto it = node_of.find(o.keyframe); it != node_of.end()) seen.push_back(it->second);
+      std::sort(seen.begin(), seen.end());
+      seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
+      for (std::size_t a = 0; a < seen.size(); ++a)
+        for (std::size_t b = a + 1; b < seen.size(); ++b)
+          if (seen[b] - seen[a] > 1) ++shared[{seen[b], seen[a]}];
+    }
+    for (const auto& [edge, n] : shared)
+      if (n >= config.loop_covisibility_min) add_edge(edge.first, edge.second, relative(edge.first, edge.second), 1.0);
+    // The search's keyframe as the found map sees it, against the old keyframe.
+    const Sim3 k_corrected = Sim3::from(Tk) * group.S.inverse();
+    add_edge(node_of.at(k), node_of.at(c), k_corrected * problem.nodes[node_of.at(c)].inverse(),
+             config.loop_edge_weight);
+    if (config.place_synchronous) {
+      std::promise<PoseGraphProblem> done;
+      optimize_pose_graph(problem);
+      done.set_value(std::move(problem));
+      job.solution = done.get_future();
+      correction = std::move(job);
+      apply_correction(frame, result);
+    } else {
+      job.solution = std::async(std::launch::async, [problem = std::move(problem)]() mutable {
+        optimize_pose_graph(problem);
+        return problem;
+      });
+      correction = std::move(job);
+      note = "loop found with keyframe " + std::to_string(keyframes[c].frame_index) + " (" +
+             std::to_string(group.pairs.size()) + " landmarks); correcting on the worker";
+    }
+    return true;
+  }
+
+  // A solved loop correction, applied as a delta to the current estimates
+  // (bundle adjustment may have moved the window meanwhile; keyframes added
+  // since take the newest node's correction).
+  void apply_correction(const TrackedFrame& frame, OdometryFrameResult& result) {
+    Correction job = std::move(*correction);
+    correction.reset();
+    const PoseGraphProblem solved = job.solution.get();
+    if (job.segment != segment || state == OdometryState::initializing) return;  // the segment ended meanwhile
+    std::unordered_map<int, Sim3> W;  // old map -> new map, for what is anchored at each keyframe
+    for (std::size_t i = 0; i < job.nodes.size(); ++i) W[job.nodes[i]] = solved.nodes[i].inverse() * job.before[i];
+    const Sim3 newest = W.at(job.nodes.back());
+    move_segment(segment, [&](int keyframe) -> const Sim3& {
+      auto it = W.find(keyframe);
+      return it != W.end() ? it->second : newest;
+    });
+    extend_local(job.pairs);
+    const int merged = merge_pairs(job.pairs, frame, result);
+    links.emplace_back(job.keyframe, job.candidate);
+    keyframes_since_correction = 0;
+    result.loop_closed = true;
+    result.loop_keyframe = static_cast<std::int64_t>(keyframes[job.keyframe].frame_index);
+    result.loop_candidate = static_cast<std::int64_t>(keyframes[job.candidate].frame_index);
+    note = "loop closed: keyframe " + std::to_string(keyframes[job.keyframe].frame_index) + " with " +
+           std::to_string(keyframes[job.candidate].frame_index) + ", " + std::to_string(job.nodes.size()) +
+           " keyframes corrected, " + std::to_string(merged) + " landmarks merged";
+  }
+
+  // The place found belongs to another segment: the tracked segment is moved
+  // into that segment's map by the alignment and becomes part of it.
+  void merge_segments(const TrackedFrame& frame, const PlaceResult& ready, const PlaceGroup& group,
+                      OdometryFrameResult& result) {
+    const int from = segment, into = group.segment;
+    std::map<int, int> votes;  // the found segment's keyframes, by sightings of the paired landmarks
+    for (const auto& [tracked, found] : group.pairs)
+      if (auto it = landmarks.find(found); it != landmarks.end())
+        for (const auto& o : it->second.observations) ++votes[o.keyframe];
+    int anchor = -1, most = 0;
+    for (const auto& [keyframe, n] : votes)
+      if (n > most && keyframes[keyframe].segment == into) {
+        most = n;
+        anchor = keyframe;
+      }
+    if (anchor < 0) return;
+    links.emplace_back(ready.keyframe, anchor);
+    const Sim3 S = group.S;
+    move_segment(from, [&](int) -> const Sim3& { return S; });
+    for (auto& kf : keyframes)
+      if (kf.segment == from) kf.segment = into;
+    for (auto& [id, landmark] : landmarks)
+      if (landmark.segment == from) landmark.segment = into;
+    for (auto& record : frames)
+      if (record.segment == from) record.segment = into;  // move_segment() marked them changed
+    segment = into;
+    segment_keyframes.clear();
+    for (const auto& kf : keyframes)
+      if (kf.segment == segment) segment_keyframes.push_back(kf.id);
+    extend_local(group.pairs);
+    const int merged = merge_pairs(group.pairs, frame, result);
+    keyframes_since_correction = 0;
+    result.segments_merged = true;
+    note = "segment " + std::to_string(from) + " merged into segment " + std::to_string(into) + ": scale " +
+           std::to_string(S.s).substr(0, 5) + ", " + std::to_string(merged) + " landmarks merged";
+  }
+
+  // Declared after `places`, which a running search reads: destroyed (and
+  // so waited for) first.
+  std::future<PlaceResult> place_job;
+  std::vector<std::pair<std::uint64_t, std::vector<float>>> place_log;  // index changes; empty descriptor: erase
+  std::optional<PlaceResult> place_ready;  // a finished search, not used yet
+  std::optional<Correction> correction;
 
   // No pose from the map this frame: report the motion model's prediction
   // with its uncertainty and keep the local map for relocalize(). The segment
@@ -1076,25 +1618,10 @@ struct VisualOdometry::Impl {
   // survivor's sighting). BA and cull() then refine the survivor.
   void associate(std::uint64_t id, std::uint64_t track, const TrackedFrame& frame, OdometryFrameResult& result) {
     std::uint64_t kept = id;
-    if (auto it = track_landmark.find(track); it != track_landmark.end()) {
+    if (auto it = track_landmark.find(track); it != track_landmark.end() && it->second != id) {
       std::uint64_t other = it->second;
       if (landmarks.at(other).observations.size() > landmarks.at(id).observations.size()) std::swap(kept, other);
-      auto node = landmarks.extract(other);
-      Landmark& absorbed = node.mapped();
-      if (auto t = track_landmark.find(absorbed.track); t != track_landmark.end() && t->second == other)
-        track_landmark.erase(t);
-      local.erase(other);
-      places.erase(other);
-      Landmark& survivor = landmarks.at(kept);
-      for (const auto& o : absorbed.observations)
-        if (std::none_of(survivor.observations.begin(), survivor.observations.end(),
-                         [&](const Sighting& k) { return k.keyframe == o.keyframe; }))
-          survivor.observations.push_back(o);
-      std::sort(survivor.observations.begin(), survivor.observations.end(),
-                [](const Sighting& l, const Sighting& r) { return l.keyframe < r.keyframe; });
-      for (int c = 0; c < 3; ++c) survivor.color_sum[c] += absorbed.color_sum[c];
-      survivor.color_count += absorbed.color_count;
-      survivor.first_frame = std::min(survivor.first_frame, absorbed.first_frame);
+      merge_landmarks(kept, other);
       ++result.merged;
     }
     Landmark& landmark = landmarks.at(kept);
@@ -1124,6 +1651,7 @@ struct VisualOdometry::Impl {
     keyframes.push_back({id, frame_index, segment, pose, std::move(observations)});
     segment_keyframes.push_back(id);
     local_keyframes.push_back(id);
+    ++keyframes_since_correction;
     return id;
   }
 
@@ -1256,14 +1784,14 @@ std::vector<TrajectorySample> VisualOdometry::trajectory(std::size_t first) cons
 
 std::size_t VisualOdometry::stable_prefix() const {
   const auto& frames = impl_->frames;
-  if (impl_->state == OdometryState::initializing) return frames.size();
+  if (impl_->state == OdometryState::initializing) return std::min(frames.size(), impl_->changed_from);
   const auto window = impl_->window();
-  if (window.empty()) return frames.size();
+  if (window.empty()) return std::min(frames.size(), impl_->changed_from);
   // Reference keyframe ids are non-decreasing along the frame records.
   const int oldest = *std::min_element(window.begin(), window.end());
   std::size_t prefix = frames.size();
   while (prefix > 0 && frames[prefix - 1].keyframe >= oldest) --prefix;
-  return prefix;
+  return std::min(prefix, impl_->changed_from);
 }
 
 std::size_t VisualOdometry::trajectory_size() const { return impl_->frames.size(); }

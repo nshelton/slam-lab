@@ -30,6 +30,7 @@ add_library(slam-native-vo STATIC
   src/visual_odometry.cpp
   src/vo_geometry.cpp
   src/place_index.cpp
+  src/pose_graph.cpp
   src/track_io.cpp
   src/focal_estimation.cpp
 )
@@ -56,7 +57,6 @@ add_library(slam-native-lsd STATIC
   src/lsd/sim3_tracker.cpp
   src/lsd/keyframe_graph.cpp
   src/lsd/place_recognition.cpp
-  src/pose_graph.cpp
 )
 target_include_directories(slam-native-lsd PUBLIC include src)
 target_include_directories(slam-native-lsd SYSTEM PUBLIC ${eigen_SOURCE_DIR})

@@ -138,30 +138,58 @@ struct VisualOdometryConfig {
   double relocalization_radius_px{256.0};
   int relocalization_min_inliers{30};
 
-  // Search without a pose prior. The frame's tracks are matched to landmarks
+  // Search without a pose prior. A frame's tracks are matched to landmarks
   // by descriptor alone, over the whole map (mutual best, cosine >=
   // min_descriptor_similarity, cosine distance <= place_ratio x the
   // runner-up's), then P3P RANSAC (place_ransac_iterations) refined on its
   // inliers, which needs place_min_inliers. Measured on fr1_room, 30
   // searches before the camera returns to the start and 12 after: 3-7
   // inliers when the place is new, 14-95 on the revisit (20 or more in 9 of
-  // the 12). It runs
-  // - on a frame without a pose from its tracks: after the search around the
-  //   predicted pose fails, and on every frame while a new segment
-  //   initializes. A pose in the current segment resumes it as above (the
-  //   inliers counted are the descriptor matches, not the live tracks); a pose
-  //   in another segment ends the current one and resumes that one (the frame
-  //   becomes a keyframe tied to the old keyframes that saw those landmarks);
-  // - every place_search_interval frames while tracking, over the landmarks
-  //   outside the local map. Those of this segment that project within
-  //   reassociation_radius_px of their match are re-associated like local
-  //   ones. A pose from the rest is a revisit with drift, or another segment's
-  //   place: reported (OdometryFrameResult::place_*), not corrected yet.
+  // the 12). It is requested
+  // - for a frame without a pose from its tracks, after the search around
+  //   the predicted pose fails, and while a new segment initializes. A pose
+  //   in the local map relocalizes as above (the inliers counted are the
+  //   descriptor matches, not the live tracks). A pose elsewhere, in another
+  //   segment or an old part of this one, resumes there: the frame becomes a
+  //   keyframe tied to the old keyframes that saw those landmarks;
+  // - at a keyframe while tracking, when place_search_interval frames have
+  //   passed since the last one, over the landmarks outside the local map.
+  //   Those of this segment that project within reassociation_radius_px of
+  //   their match are re-associated like local ones. The rest are corrected,
+  //   see place_correction.
   // 0: only without a pose; < 0: never.
   int place_search_interval{30};
   double place_ratio{0.9};
   int place_ransac_iterations{1000};
   int place_min_inliers{20};
+  // The search and the loop correction below run on a worker thread: process()
+  // starts them and a later frame uses the result, through the tracks that
+  // are still observed then. true: on the calling thread, used on the same or
+  // the next frame (deterministic: bench, tests).
+  bool place_synchronous{false};
+
+  // Correcting what the search finds while tracking. The found landmarks give
+  // a pose in their own map; with the depth ratio of the tracks that also
+  // have a tracked landmark it becomes a similarity between the tracked map
+  // and the found one (accepted when p75 <= loop_scale_spread x p25 of the
+  // ratios and >= loop_min_pairs pairs lie within 25% of their median).
+  // - In the same segment the map has drifted (a loop): a Sim(3) pose graph
+  //   over the segment's keyframes (consecutive ones, pairs sharing >=
+  //   loop_covisibility_min landmarks, and the loop edge to the old keyframe
+  //   that saw most of the found landmarks, >= loop_min_keyframe_gap
+  //   keyframes back, weight loop_edge_weight) is solved and applied.
+  // - In another segment: the tracked segment is moved into that segment's
+  //   map and becomes part of it.
+  // Either way the paired landmarks are merged, the old keyframes around the
+  // place join the local map, and loop_cooldown_keyframes keyframes pass
+  // before the next correction. false: revisits are only reported.
+  bool place_correction{true};
+  double loop_scale_spread{1.3};
+  int loop_min_pairs{20};
+  int loop_min_keyframe_gap{30};
+  int loop_covisibility_min{30};
+  int loop_cooldown_keyframes{10};
+  double loop_edge_weight{10.0};
 
   void validate() const;
 };
@@ -187,14 +215,20 @@ struct OdometryFrameResult {
   int merged{};              // of those, duplicates folded into the older landmark
   bool predicted{};          // coasting: the pose is the motion model's prediction
   bool relocalized{};        // the map was found again by descriptor search
-  // Search without a pose prior (see place_search_interval), when it gave a
-  // P3P pose: the segment of the landmarks found (-1: none), its inliers, and
-  // while tracking in that same segment the median distance in the image
-  // between those landmarks under the tracked pose and their matches (drift).
+  // Search without a pose prior (see place_search_interval), when a result
+  // with a P3P pose was used this frame: the segment of the landmarks found
+  // (-1: none), its inliers, and while tracking in that same segment the
+  // median distance in the image between those landmarks under the tracked
+  // pose and their matches (drift).
   int place_segment{-1};
   int place_inliers{};
   double place_offset_px{};
   int place_reassociated{};  // of `reassociated`: landmarks from outside the local map, found by that search
+  // A correction was applied this frame (see place_correction). The trajectory
+  // and map of the segment changed as a whole: stable_prefix() covers it.
+  bool loop_closed{};
+  bool segments_merged{};
+  std::int64_t loop_keyframe{-1}, loop_candidate{-1};  // frame indices of the loop's two keyframes
   // Pose uncertainty, when has_pose. The error is the perturbation delta =
   // (omega, v) with T_true = exp(delta) * T: omega (radians) rotates about the
   // camera centre, v (map units) moves the camera, both in camera axes.

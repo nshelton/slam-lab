@@ -30,7 +30,8 @@ NVDEC frame (native orientation, source px, lens-distorted)
     / constant position; P3P RANSAC recovery) → keyframes (incl. emergency): triangulate,
     sliding-window BA (8 KF), cull (landmarks leave the local map, never the map); no pose →
     coast on the motion model + relocalize in the local map, then by descriptor over the whole
-    map (PlaceIndex) → resume that segment; nothing found → new segment
+    map (PlaceIndex, worker thread) → resume that segment; nothing found → new segment;
+    revisits while tracking → Sim(3) pose graph (loop) or segment merge
             ▼
   OdometryFrameResult (pose, covariance, confidence, inlier/outlier track IDs), trajectory, map
             ▼
@@ -184,11 +185,12 @@ Added 2026-10-01 (`track()`, `relocalize()`, `coast()` in
   acceleration (the synthetic occlusion test: 14.8 px off at σ = 4.3 px after
   20 frames; the 16 px floor covers it).
 
-### Search without a pose prior (place recognition)
+### Search without a pose prior, loop correction and segment merging
 
-Added 2026-10-01 (`src/place_index.*`; `place_matches()`, `resume()`,
-`search_places()` and the second half of `relocalize()` in
-`src/visual_odometry.cpp`).
+Added 2026-10-01 (`src/place_index.*`, `src/pose_graph.*`; in
+`src/visual_odometry.cpp`: `search()`, `request_search()`, `poll()`,
+`find_place()`, `resume()`, `use_places()`, `close_loop()`,
+`apply_correction()`, `merge_segments()`, `move_segment()`).
 
 - **`PlaceIndex`** holds the latest descriptor of every landmark (updated
   whenever its track is a pose inlier). `match()` is brute force and exact:
@@ -196,63 +198,111 @@ Added 2026-10-01 (`src/place_index.*`; `place_matches()`, `resume()`,
   mutual best, cosine ≥ `min_descriptor_similarity`, cosine distance ≤
   `place_ratio` × the runner-up's. It is the seam for an approximate index or
   a different descriptor.
-- **A pose from matches alone**: P3P RANSAC (`place_ransac_iterations`, 4 px)
-  per segment, most matches first, refined by `optimize_pose` on the RANSAC
-  inliers only (over all matches the robust fit is pulled off: 95 raw inliers
-  became 48); accepted with ≥ `place_min_inliers` (20). On fr1_room the
-  count is 3–7 where the place is new and 14–95 on the revisit.
-- **Frame without a pose from its tracks** (`track()` → `relocalize()`): the
-  search around the predicted pose runs first, as before. When it fails, the
-  frame's tracks without a landmark are matched against the whole map. A pose
-  in the current segment relocalizes as the prior-gated search does, but the
-  ≥ 20 inliers must be descriptor matches: the live correspondences agree with
-  any pose near the last one (fr1_room frame 848 passed with 22 inliers
-  counting them, kept one segment and doubled the ATE). A pose in another
-  segment ends the current one and calls `resume()`.
-- **While a new segment initializes** (`initialize()`): the same search on
-  every frame, over all landmarks; a pose resumes that segment instead of
-  starting another.
-- **`resume()`**: the frame becomes a keyframe of the old segment. The local
-  keyframes become the old keyframes with the most sightings of the landmarks
-  found (up to `local_map_keyframes`, most last), so the bundle-adjustment
-  window ties the new keyframe to keyframes that share landmarks with it, and
-  the local map is what those keyframes saw. The matched tracks take over
-  their landmarks; the motion model restarts with zero velocity.
-- **While tracking** (`search_places()`, every `place_search_interval`
-  frames): all tracks against the landmarks outside the local map. Matches in
-  this segment that project within `reassociation_radius_px` of the track
-  under the tracked pose are re-associated like local ones
-  (`place_reassociated`). A P3P pose from the remaining matches means the
-  place was mapped before, in this segment with drift or in another segment.
-  It is reported (`place_segment`, `place_inliers`, `place_offset_px`) and
-  **not corrected**: that needs a pose graph or a wider bundle adjustment,
-  and segment merging (next step).
+- **A search** (`search()`, a static function of a snapshot) matches a frame's
+  tracks against the accepted landmarks and fits a pose per segment, most
+  matches first: P3P RANSAC (`place_ransac_iterations`, 4 px) refined by
+  `optimize_pose` on the RANSAC inliers only (over all matches the robust fit
+  is pulled off: 95 raw inliers became 48), accepted with ≥
+  `place_min_inliers` (20). On fr1_room the count is 3–7 where the place is
+  new and 14–95 on the revisit.
+- **Worker thread.** `request_search()` copies what the search needs (the
+  frame's descriptors and pixels, each track's landmark, every landmark's
+  position and segment) and starts it with `std::async`; the index itself is
+  not copied: while a search runs, index changes wait in `place_log`. `poll()`
+  collects the result at the start of a later frame. The result is used
+  through the tracks that are still observed on that frame, never through the
+  search frame's pixels, so its age does not matter. One job at a time (a
+  search or a loop correction). `place_synchronous` runs everything on the
+  calling thread, which the bench and the tests use to stay deterministic.
+- **Frame without a pose from its tracks** (`track()` → `find_place()`): the
+  search around the predicted pose runs first, as before. When it fails, a
+  search over the whole map is requested for the tracks without a landmark,
+  and the frame coasts. When its result is in: matches to this segment's
+  local map relocalize like the prior-gated search, but the ≥ 20 inliers must
+  be descriptor matches (the live correspondences agree with any pose near
+  the last one: fr1_room frame 848 passed with 22 inliers counting them and
+  doubled the ATE). Otherwise `resume()`.
+- **While a new segment initializes** (`initialize()` → `find_place()`): the
+  same, over all landmarks; a pose resumes the old map instead.
+- **`resume()`**: tracking continues at a place mapped before, in another
+  segment or in an old part of this one. The local map is dropped; the frame
+  becomes a keyframe whose local keyframes are the old keyframes with the
+  most sightings of the landmarks found (up to `local_map_keyframes`, most
+  last), so the bundle-adjustment window ties it to keyframes that share
+  landmarks with it. The matched tracks take over their landmarks; the motion
+  model restarts with zero velocity. The keyframe `starts_stretch`: nothing
+  ties it to the keyframe before it (the motion in between is unknown), and a
+  `links` entry ties it to the most covisible old keyframe.
+- **While tracking** (a search requested at a keyframe, at least
+  `place_search_interval` frames after the last, over the landmarks outside
+  the local map; `use_places()`): matches in this segment that project within
+  `reassociation_radius_px` of the track under the tracked pose are
+  re-associated like local ones (`place_reassociated`). For the rest the
+  search also returns an **alignment** (`align()`): the similarity from the
+  tracked map to the found one, from the P3P pose and the depth ratio of the
+  tracks that have both a tracked and a found landmark. A 3D–3D fit is too
+  noisy (young landmarks), so only the scale comes from depths: p75 ≤
+  `loop_scale_spread` × p25 and ≥ `loop_min_pairs` pairs within 25% of the
+  median, or no alignment.
+- **Loop** (`close_loop()`, the found landmarks are in this segment): a Sim(3)
+  pose graph over the segment's keyframes, solved on the worker
+  (`optimize_pose_graph`, sparse). Edges: consecutive keyframes of a stretch,
+  pairs sharing ≥ `loop_covisibility_min` landmarks, earlier `links`
+  (weight `loop_edge_weight`), and the new loop edge between the search's
+  keyframe and the old keyframe that saw most of the found landmarks (≥
+  `loop_min_keyframe_gap` keyframes back, weight `loop_edge_weight`).
+  `apply_correction()` applies the solution as a delta (`move_segment()`):
+  keyframes become rigid poses in new units, landmarks move with their latest
+  keyframe, frame records are rescaled with their keyframe, and bundle
+  adjustment done meanwhile is kept. When the alignment is already the
+  identity only the pairs are merged.
+- **Segment merge** (`merge_segments()`, the found landmarks are in another
+  segment): the tracked segment is moved into the found one's map by the
+  alignment and takes its id; a `links` entry joins the two.
+- After either: the paired landmarks are merged (`merge_pairs()`), the old
+  keyframes around the place join the local keyframes behind the
+  bundle-adjustment window with their landmarks (`extend_local()`), so they
+  re-associate at a pose from then on, and `loop_cooldown_keyframes`
+  keyframes pass before the next correction. `stable_prefix()` drops to the
+  first frame a correction moved, so viewers re-read the whole segment.
 
-Measured 2026-10-01 (TUM + dreamworks, three start frames each, against
-`baselines/v4`; scratch run, not yet a saved baseline):
+Measured 2026-10-01, ATE in cm, mean ± range over three start frames (scratch
+runs; `baselines/README.md` has the saved numbers):
+
+| sequence        | v4            | search only   | + correction  |
+|-----------------|--------------:|--------------:|--------------:|
+| fr1_desk        |  9.3 ± 12.5   |  9.3 ± 12.5   |  3.2 ±  0.8   |
+| fr1_room        | 43.2 ± 13.8   | 43.2 ± 13.8   | 39.3 ± 19.5   |
+| fr1_xyz         |  1.7 ±  0.2   |  1.8 ±  0.3   |  1.5 ±  0.3   |
+| fr2_desk        | 13.4 ±  5.1   | 13.4 ±  5.1   |  5.0 ±  8.4   |
+| fr3_long_office |  5.3 ±  2.4   |  6.0 ±  1.4   |  3.9 ±  0.7   |
 
 - With the search off (`place-interval -1`) the trajectories are byte-identical
-  to v4 in all 12 runs compared, and the VO costs the same: keeping every
-  landmark is free.
-- TUM ATE is unchanged within the spread (fr3 5.3 ± 2.4 → 6.0 ± 1.4 cm,
-  fr1_xyz 1.7 → 1.8, the others equal): nothing is corrected yet.
-- dreamworks from frame 300: 2 segments → 1. The loss at frame 675 is now a
-  relocalization at 679 by descriptor (25 inliers of 86 matches). The
-  relocalizations after the columns come 2 frames earlier (571 instead of 573).
-- Landmarks re-associated from outside the local map: 0–51 per run (most on
-  fr1_xyz and fr3). Drift is usually above the 2 px gate.
-- Revisits found while tracking: fr1_room 7 (segment 0 seen from segment 1),
-  fr3 2–13, fr2_desk 0–9, fr1_xyz 5–11, at a median 7–114 px from where the
-  tracked pose puts those landmarks. That offset is the drift a correction
-  step would remove.
-- Cost: one search is about 50 ms at 20,000 landmarks (800 queries, 8
-  threads). The VO goes from 2.1 to 3.5 ms/frame on TUM, with a 30–100 ms
-  frame every `place_search_interval` frames on the UI thread.
+  to v4 in all 12 runs compared: keeping every landmark is free.
+- Loops closed per run: fr1_desk 0–2, fr1_xyz 2, fr2_desk 0–3, fr3 1–4. Where
+  none is found the run is unchanged (fr2_desk from frame 300: 10.5 cm, which
+  is the range above).
+- fr1_room: the second segment is merged into the first from two starts
+  (scale 0.78 and 0.68; 36–40 landmarks merged), so one segment covers the run at
+  32–34 cm, where v4 had two segments at 31–34 cm aligned separately. The
+  joint between the two parts shows in the relative error (RPE 3.3° → 7.2°).
+  From frame 300 nothing is found and it stays two segments.
+- dreamworks: one segment from all three starts (v4: two from frame 300).
+- Cost, search and correction on the calling thread (bench): 3.1–3.9
+  ms/frame against 2.1 in v4, worst frame 40–170 ms. On the worker thread
+  (`place-sync 0`): fr2_desk 2.5 ms/frame with a worst frame of 18 ms, same
+  loops, 1.6 cm; fr1_desk 3.4 ms/frame, worst 35 ms, 3.3 cm. One search is
+  about 50 ms at 20,000 landmarks (800 queries, 8 threads).
 
 Not done:
 
-- **Loop correction and segment merging.** `search_places()` finds revisits
-  and reports them; nothing moves the old keyframes or joins two segments.
+- **Global bundle adjustment after a correction.** The pose graph moves
+  keyframes as rigid blocks; v1 followed it with a bundle adjustment over the
+  whole segment (fr1_room 37.7 → 24.7 cm there).
+- **A lost-and-found frame as a loop.** `resume()` into an old part of the
+  same segment leaves the stretch before it uncorrected.
+- **Merging when the alignment fails.** A segment with too few paired
+  landmarks for a consistent scale stays separate (fr1_room from frame 300).
 - **Feeding the pose back to the tracker.** For tracks with landmarks, the
   predicted pose gives a predicted pixel (`K.project(T_pred * X)`, then
   *distort* with k1, since the tracker works in distorted pixels). The
@@ -261,9 +311,8 @@ Not done:
   usually better than a pose prediction, so treat the pose as a fallback.
 - **Outlier feedback.** The tracker never learns that the VO rejected a
   track (`pose_outliers`).
-- Threading: the VO, keyframe BA (≈10–12 ms) and the place search (≈50 ms
-  every 30 frames) run synchronously on the UI thread; the lens estimator shows the worker pattern
-  (`BackgroundFocalEstimator`).
+- Threading: the VO and keyframe BA (≈10–12 ms) run synchronously on the UI
+  thread; the place search and the loop correction have a worker.
 
 ### Lens model
 
@@ -323,15 +372,16 @@ ORB-SLAM3 is the independent reference (`scripts/run_orbslam3.sh`); on
 - `slam-native-focal`: FOV + k1 estimate from a tracks CSV.
 - Bench keys: `flow-sigma`, `det-sigma`, `hfov`, `k1`, `fx fy cx cy`,
   `kf-min`, `kf-max`, `kf-emergency-ratio`, `window`, `place-interval`,
-  `place-ratio`, `place-inliers`, `export-map`,
+  `place-ratio`, `place-inliers`, `place-sync`, `place-correct`, `export-map`,
   `export-features PATH` (raw detections + descriptors in the feature-cache
   format).
 - Tracks CSV: `frame_index,timestamp_ns,track_id,x,y[,r,g,b]`. Map CSV:
   `track_id,segment,x,y,z,r,g,b,has_color,keyframe_observations,first_frame,last_frame,local,landmark_id`
   (`track_io.hpp`).
 - CTest: `native_focal_estimation` (synthetic FOV/k1 recovery, background
-  worker parity), map + colour check, segment resume without a pose prior,
-  re-association outside the local map and P3P checks (exact
+  worker parity), map + colour check, segment resume without a pose prior
+  (on the calling thread and on the worker), segment merge, re-association
+  outside the local map and P3P checks (exact
   recovery, RANSAC with 60% outliers) in `native_visual_odometry`, Kalman
   fusion and per-track descriptor checks in `native_gpu_flow_tracker`.
 
