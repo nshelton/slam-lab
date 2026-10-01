@@ -54,6 +54,22 @@ target_include_directories(slam-native-two-view PRIVATE src)
 target_include_directories(slam-native-two-view SYSTEM PRIVATE ${eigen_SOURCE_DIR})
 target_compile_options(slam-native-two-view PRIVATE -Wall -Wextra -Wpedantic -O2)
 
+# Direct monocular SLAM after LSD-SLAM (LSD_SLAM.md): CPU core, shares vo_geometry.
+add_library(slam-native-lsd STATIC
+  src/lsd/image.cpp
+  src/lsd/se3_tracker.cpp
+  src/lsd/odometry.cpp
+  src/lsd/semi_dense_depth.cpp
+  src/lsd/undistort.cpp
+  src/lsd/sim3_tracker.cpp
+  src/lsd/keyframe_graph.cpp
+  src/lsd/place_recognition.cpp
+)
+target_include_directories(slam-native-lsd PUBLIC include src)
+target_include_directories(slam-native-lsd SYSTEM PUBLIC ${eigen_SOURCE_DIR})
+target_link_libraries(slam-native-lsd PUBLIC slam-native-vo)
+target_compile_options(slam-native-lsd PRIVATE -Wall -Wextra -Wpedantic -O2)
+
 add_library(slam-native-recents STATIC src/recent_sessions.cpp)
 target_include_directories(slam-native-recents PUBLIC include)
 target_compile_options(slam-native-recents PRIVATE -Wall -Wextra -Wpedantic)
@@ -81,6 +97,18 @@ if(BUILD_TESTING)
   target_link_libraries(slam-native-recents-test PRIVATE slam-native-recents)
   target_compile_options(slam-native-recents-test PRIVATE -Wall -Wextra -Wpedantic)
   add_test(NAME native_recent_sessions COMMAND slam-native-recents-test)
+  add_executable(slam-native-lsd-tracker-test tests/test_lsd_tracker.cpp)
+  target_link_libraries(slam-native-lsd-tracker-test PRIVATE slam-native-lsd)
+  target_compile_options(slam-native-lsd-tracker-test PRIVATE -Wall -Wextra -Wpedantic -O2)
+  add_test(NAME native_lsd_tracker COMMAND slam-native-lsd-tracker-test)
+  add_executable(slam-native-lsd-depth-filter-test tests/test_lsd_depth_filter.cpp)
+  target_link_libraries(slam-native-lsd-depth-filter-test PRIVATE slam-native-lsd)
+  target_compile_options(slam-native-lsd-depth-filter-test PRIVATE -Wall -Wextra -Wpedantic -O2)
+  add_test(NAME native_lsd_depth_filter COMMAND slam-native-lsd-depth-filter-test)
+  add_executable(slam-native-lsd-sim3-test tests/test_lsd_sim3.cpp)
+  target_link_libraries(slam-native-lsd-sim3-test PRIVATE slam-native-lsd)
+  target_compile_options(slam-native-lsd-sim3-test PRIVATE -Wall -Wextra -Wpedantic -O2)
+  add_test(NAME native_lsd_sim3 COMMAND slam-native-lsd-sim3-test)
   add_executable(slam-native-depth-confidence-test tests/test_depth_confidence.cpp src/depth_confidence.cpp)
   target_include_directories(slam-native-depth-confidence-test PRIVATE include)
   target_compile_options(slam-native-depth-confidence-test PRIVATE -Wall -Wextra -Wpedantic)
@@ -194,6 +222,51 @@ if(SLAM_NATIVE_BUILD_APP)
     CUDA_SEPARABLE_COMPILATION ON
   )
 
+  # The LSD workbench (LSD_SLAM.md): same launcher, decoder and 3D renderer, direct pipeline.
+  add_executable(slam-native-lsd-workbench
+    src/lsd_main.cpp
+    src/lsd_app.cpp
+    src/lsd_graph_view.cpp
+    src/launcher.cpp
+    src/video_thumbnail.cpp
+    src/ffmpeg_cuda_decoder.cpp
+    src/cuda_frame_presenter.cu
+    src/point_cloud_renderer.cpp
+    src/depth_estimator.cu
+    src/tensorrt_superpoint.cu
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/misc/cpp/imgui_stdlib.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+  )
+  target_include_directories(slam-native-lsd-workbench PRIVATE
+    include
+    src
+    ${imgui_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}/backends
+    ${TENSORRT_INCLUDE_DIR}
+  )
+  target_link_libraries(slam-native-lsd-workbench PRIVATE
+    slam-native-lsd
+    slam-native-store
+    slam-native-recents
+    CUDA::cudart
+    CUDA::cublas
+    CUDA::cuda_driver
+    OpenGL::GL
+    PkgConfig::FFMPEG
+    glfw
+    ${CMAKE_DL_LIBS}
+    ${TENSORRT_LIBRARY}
+  )
+  target_compile_options(slam-native-lsd-workbench PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic>)
+  # The tracker runs per pixel on the UI thread: optimised even in Debug builds.
+  set_source_files_properties(src/lsd_app.cpp src/lsd_graph_view.cpp TARGET_DIRECTORY slam-native-lsd-workbench
+    PROPERTIES COMPILE_OPTIONS "-O2")
+
   if(BUILD_TESTING)
     # Optional desktop/GPU transport integration test, using the real Session.
     get_target_property(transport_sources slam-native-workbench SOURCES)
@@ -207,6 +280,14 @@ if(SLAM_NATIVE_BUILD_APP)
     add_executable(slam-native-snapshot tests/snapshot_app.cpp ${transport_sources})
     target_include_directories(slam-native-snapshot PRIVATE ${transport_includes})
     target_link_libraries(slam-native-snapshot PRIVATE ${transport_libraries})
+    get_target_property(lsd_sources slam-native-lsd-workbench SOURCES)
+    list(REMOVE_ITEM lsd_sources src/lsd_main.cpp src/lsd_app.cpp)
+    add_executable(slam-native-lsd-snapshot tests/snapshot_lsd.cpp ${lsd_sources})
+    get_target_property(lsd_includes slam-native-lsd-workbench INCLUDE_DIRECTORIES)
+    get_target_property(lsd_libraries slam-native-lsd-workbench LINK_LIBRARIES)
+    target_include_directories(slam-native-lsd-snapshot PRIVATE ${lsd_includes})
+    target_link_libraries(slam-native-lsd-snapshot PRIVATE ${lsd_libraries})
+    target_compile_options(slam-native-lsd-snapshot PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O2>)
     add_executable(slam-native-snapshot-launcher tests/snapshot_launcher.cpp ${transport_sources})
     target_include_directories(slam-native-snapshot-launcher PRIVATE ${transport_includes})
     target_link_libraries(slam-native-snapshot-launcher PRIVATE ${transport_libraries})

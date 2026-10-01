@@ -70,6 +70,9 @@ class Launcher {
   bool draw(AppConfig& selected, DatabaseSummary& database_summary);
   void set_error(std::string error);
   void record_recent(const AppConfig& config);
+  // Pipelines without SuperPoint: hide the engine and point cache; only the
+  // video is chosen. `description` replaces the SuperPoint tracking text.
+  void set_video_only(std::string description) { video_only_ = std::move(description); }
 
  private:
   enum class Target { video, engine };
@@ -91,6 +94,7 @@ class Launcher {
   void thumbnail_worker();
 
   AppConfig initial_;
+  std::optional<std::string> video_only_;
   RecentSessions recents_;
   std::filesystem::path repository_root_;
   std::string video_;

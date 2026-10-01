@@ -35,11 +35,13 @@ int ransac_similarity(const std::vector<Vec3>& X, const std::vector<Vec3>& Y, co
 
 // Nodes are world -> camera similarities. An edge (a, b) measures
 // S_a * S_b^-1; its residual is the error transform's
-// (log R, t, log s), weighted by sqrt(weight).
+// (log R, t, log s), weighted by sqrt(weight) * sqrt_information
+// (U with U^T U = the measurement's information matrix; default identity).
 struct PoseGraphEdge {
   int a{}, b{};
   Sim3 measured;
   double weight{1};
+  Eigen::Matrix<double, 7, 7> sqrt_information{Eigen::Matrix<double, 7, 7>::Identity()};
 };
 struct PoseGraphProblem {
   std::vector<Sim3> nodes;

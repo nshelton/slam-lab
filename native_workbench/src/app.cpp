@@ -1,6 +1,7 @@
 #define GL_GLEXT_PROTOTYPES
 #include "slam_native/app.hpp"
 
+#include "slam_native/calibration.hpp"
 #include "slam_native/cuda_frame_presenter.hpp"
 #include "slam_native/display_environment.hpp"
 #include "slam_native/descriptor_projection.hpp"
@@ -49,26 +50,6 @@
 
 namespace slam_native {
 namespace {
-// Intrinsics from a calibration.json next to the video (the TUM and KITTI
-// conversions write one: "fx", "fy", "cx", "cy" in source-video pixels).
-std::optional<CameraIntrinsics> read_calibration(const std::filesystem::path& video) {
-  std::ifstream in(video.parent_path() / "calibration.json");
-  if (!in) return std::nullopt;
-  std::stringstream text;
-  text << in.rdbuf();
-  const std::string json = text.str();
-  const auto number = [&](const char* key) -> std::optional<double> {
-    std::smatch match;
-    if (!std::regex_search(json, match, std::regex(std::string("\"") + key + "\"\\s*:\\s*([-+0-9.eE]+)")))
-      return std::nullopt;
-    return std::stod(match[1]);
-  };
-  const auto fx = number("fx"), fy = number("fy"), cx = number("cx"), cy = number("cy");
-  if (!fx || !fy || !cx || !cy || *fx <= 0 || *fy <= 0) return std::nullopt;
-  return CameraIntrinsics{*fx, *fy, *cx, *cy};
-}
-
-
 using Clock = std::chrono::steady_clock;
 
 class GlfwLifetime {

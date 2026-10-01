@@ -522,9 +522,14 @@ bool Launcher::draw(AppConfig& selected, DatabaseSummary& database_summary) {
   ImGui::SetNextWindowSize({900, 840}, ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowSizeConstraints({700, 780}, {100000, 100000});  // room for the 4x4 grid
   ImGui::Begin("Open SLAM session");
-  ImGui::TextWrapped("SuperPoint detections are cached. Tracks are rebuilt in memory on each run using optical flow.");
-  ImGui::Separator();
-  ImGui::TextUnformatted("Tracking: SuperPoint + NVIDIA optical flow");
+  if (video_only_) {
+    ImGui::TextWrapped("%s", video_only_->c_str());
+    ImGui::Separator();
+  } else {
+    ImGui::TextWrapped("SuperPoint detections are cached. Tracks are rebuilt in memory on each run using optical flow.");
+    ImGui::Separator();
+    ImGui::TextUnformatted("Tracking: SuperPoint + NVIDIA optical flow");
+  }
   ImGui::TextUnformatted("Recent videos");
   const bool open_recent = draw_recent_grid();
   ImGui::Spacing();
@@ -533,6 +538,26 @@ bool Launcher::draw(AppConfig& selected, DatabaseSummary& database_summary) {
   ImGui::InputText("##video", &video_);
   ImGui::SameLine();
   if (ImGui::Button("Load new sequence...")) open_browser(Target::video);
+  if (video_only_) {
+    AppConfig session = initial_;
+    session.video = absolute_path(video_);
+    ImGui::Separator();
+    if (!error_.empty()) ImGui::TextColored({1, 0.5F, 0.4F, 1}, "%s", error_.c_str());
+    ImGui::Spacing();
+    std::error_code video_error;
+    const bool valid = fs::is_regular_file(session.video, video_error);
+    ImGui::BeginDisabled(!valid);
+    const bool start = ImGui::Button("Start session", {160, 34}) || (open_recent && valid);
+    ImGui::EndDisabled();
+    if (!valid) ImGui::TextDisabled("Select an existing video.");
+    if (start) {
+      selected = std::move(session);
+      error_.clear();
+    }
+    ImGui::End();
+    draw_browser();
+    return start;
+  }
   ImGui::TextUnformatted("TensorRT engine");
   ImGui::SetNextItemWidth(-95);
   ImGui::InputText("##engine", &engine_);

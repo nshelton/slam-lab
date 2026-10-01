@@ -22,7 +22,7 @@ Vec7 residual(const PoseGraphEdge& e, const Sim3& a, const Sim3& b) {
   r.head<3>() = log_so3(error.R);
   r.segment<3>(3) = error.t;
   r(6) = std::log(error.s);
-  return std::sqrt(e.weight) * r;
+  return std::sqrt(e.weight) * (e.sqrt_information * r);
 }
 
 double cost(const PoseGraphProblem& p) {
