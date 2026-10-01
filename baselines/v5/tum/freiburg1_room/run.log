@@ -1,0 +1,14 @@
+  vo frame 848: tracking lost
+  vo frame 1078: segment 1 merged into segment 0: scale 0.777, 36 landmarks merged
+  vo frame 1217: resumed segment 0 at keyframe 217 by descriptor, without a pose prior: 31 inliers of 31 matches
+frames=1362 start=0.0s mean_detections=1032
+continuation_rate=0.6052 (matched 823575 of 1360831 previous live tracks)
+tracks=88003 mean_len=10.36 median_len=4 p90_len=28 >=10:28561 >=30:8036 >=100:187
+frame0_cohort=1000 survivors@10=657 @30=180 @60=2 @120=0 @300=0
+match_descriptor_cos median=0.958 p10=0.874 frac<0.7=0.0000
+camera pose: posed 1352/1362 frames, 245 keyframes, 1 losses, 1 segments (largest 1354 poses), inlier ratio median 0.806, median reprojection 1.46 px, 4.15 ms/frame (max 121.5)
+coasting: 0 frames predicted (kept in the trajectory when relocalized), 1 relocalizations; tracked pose sigma median 0.14 px (p90 0.23), confidence p10 1.000
+landmarks: 20363 (3623 in the local map), re-associated 7296 (2241 merged; 1 from outside the local map)
+places: 5 revisits found without a pose prior while tracking, median 20.6 px from the tracked pose; 0 loops closed, 1 segments merged
+mean coasted tracks/frame=330.8
+ms/frame: superpoint=14.43 flow_gpu=0.53 tracking_wall=3.95 (incl. flow wait) tracking_gpu=0.203

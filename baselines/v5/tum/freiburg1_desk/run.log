@@ -1,0 +1,14 @@
+  vo frame 201: pose re-estimated (P3P RANSAC)
+  vo frame 354: loop closed: keyframe 353 with 162, 70 keyframes corrected, 63 landmarks merged
+  vo frame 478: loop closed: keyframe 477 with 48, 92 keyframes corrected, 20 landmarks merged
+frames=613 start=0.0s mean_detections=1114
+continuation_rate=0.6499 (matched 397704 of 611929 previous live tracks)
+tracks=32526 mean_len=13.23 median_len=5 p90_len=36 >=10:12015 >=30:4288 >=100:236
+frame0_cohort=929 survivors@10=576 @30=265 @60=13 @120=6 @300=0
+match_descriptor_cos median=0.959 p10=0.867 frac<0.7=0.0000
+camera pose: posed 605/613 frames, 108 keyframes, 0 losses, 1 segments (largest 606 poses), inlier ratio median 0.800, median reprojection 1.39 px, 2.88 ms/frame (max 32.2)
+coasting: 0 frames predicted (kept in the trajectory when relocalized), 0 relocalizations; tracked pose sigma median 0.12 px (p90 0.18), confidence p10 1.000
+landmarks: 8866 (3056 in the local map), re-associated 3776 (1238 merged; 8 from outside the local map)
+places: 5 revisits found without a pose prior while tracking, median 26.1 px from the tracked pose; 2 loops closed, 0 segments merged
+mean coasted tracks/frame=298.5
+ms/frame: superpoint=13.78 flow_gpu=0.46 tracking_wall=3.28 (incl. flow wait) tracking_gpu=0.191

@@ -1,0 +1,14 @@
+  vo frame 2302: loop closed: keyframe 2301 with 150, 304 keyframes corrected, 29 landmarks merged
+  vo frame 2453: loop closed: keyframe 2452 with 167, 315 keyframes corrected, 21 landmarks merged
+  vo frame 2553: loop closed: keyframe 2552 with 2178, 325 keyframes corrected, 37 landmarks merged
+frames=2435 start=0.0s mean_detections=884
+continuation_rate=0.6824 (matched 1658828 of 2430848 previous live tracks)
+tracks=80051 mean_len=21.72 median_len=6 p90_len=61 >=10:32964 >=30:16374 >=100:3797
+frame0_cohort=952 survivors@10=780 @30=552 @60=361 @120=186 @300=7
+match_descriptor_cos median=0.973 p10=0.918 frac<0.7=0.0000
+camera pose: posed 2426/2435 frames, 326 keyframes, 0 losses, 1 segments (largest 2427 poses), inlier ratio median 0.885, median reprojection 1.04 px, 3.12 ms/frame (max 126.4)
+coasting: 0 frames predicted (kept in the trajectory when relocalized), 0 relocalizations; tracked pose sigma median 0.08 px (p90 0.11), confidence p10 1.000
+landmarks: 16754 (1865 in the local map), re-associated 25190 (7607 merged; 41 from outside the local map)
+places: 8 revisits found without a pose prior while tracking, median 6.4 px from the tracked pose; 3 loops closed, 0 segments merged
+mean coasted tracks/frame=284.7
+ms/frame: superpoint=14.10 flow_gpu=0.48 tracking_wall=3.38 (incl. flow wait) tracking_gpu=0.164

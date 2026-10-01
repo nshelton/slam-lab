@@ -1,0 +1,11 @@
+frames=313 start=0.0s mean_detections=1111
+continuation_rate=0.6647 (matched 206949 of 311346 previous live tracks)
+tracks=15679 mean_len=14.20 median_len=6 p90_len=38 >=10:6366 >=30:2247 >=100:94
+frame0_cohort=589 survivors@10=364 @30=169 @60=31 @120=6 @300=0
+match_descriptor_cos median=0.961 p10=0.875 frac<0.7=0.0000
+camera pose: posed 311/313 frames, 51 keyframes, 0 losses, 1 segments (largest 312 poses), inlier ratio median 0.813, median reprojection 1.38 px, 6.78 ms/frame (max 86.2)
+coasting: 0 frames predicted (kept in the trajectory when relocalized), 0 relocalizations; tracked pose sigma median 0.11 px (p90 0.17), confidence p10 1.000
+landmarks: 4725 (3066 in the local map), re-associated 1807 (577 merged; 0 from outside the local map)
+places: 0 revisits found without a pose prior while tracking, median nan px from the tracked pose; 0 loops closed, 0 segments merged
+mean coasted tracks/frame=287.6
+ms/frame: superpoint=14.96 flow_gpu=0.57 tracking_wall=6.20 (incl. flow wait) tracking_gpu=0.228

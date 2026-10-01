@@ -1,0 +1,15 @@
+[mov,mp4,m4a,3gp,3g2,mj2 @ 0x6433dc67c900] Could not find codec parameters for stream 2 (Audio: none (apac / 0x63617061), 48000 Hz, 4 channels, 393 kb/s): unknown codec
+Consider increasing the value for the 'analyzeduration' (0) and 'probesize' (5000000) options
+  vo frame 572: relocalized after 12 coasted frames by descriptor, without the predicted pose: 24 inliers of 27 matches; prediction was off by 28.3 px (median), sigma 47.1 px
+  vo frame 678: relocalized after 10 coasted frames by descriptor, without the predicted pose: 22 inliers of 22 matches; prediction was off by 31.1 px (median), sigma 58.8 px
+frames=882 start=0.0s mean_detections=1996
+continuation_rate=0.6669 (matched 587533 of 881000 previous live tracks)
+tracks=50844 mean_len=12.56 median_len=3 p90_len=41 >=10:15873 >=30:7833 >=100:252
+frame0_cohort=1000 survivors@10=857 @30=642 @60=412 @120=29 @300=0
+match_descriptor_cos median=0.974 p10=0.930 frac<0.7=0.0000
+camera pose: posed 878/882 frames, 128 keyframes, 0 losses, 1 segments (largest 879 poses), inlier ratio median 0.893, median reprojection 1.22 px, 3.77 ms/frame (max 33.0)
+coasting: 22 frames predicted (kept in the trajectory when relocalized), 2 relocalizations; tracked pose sigma median 0.11 px (p90 0.21), confidence p10 1.000
+landmarks: 9746 (2044 in the local map), re-associated 990 (101 merged; 0 from outside the local map)
+places: 0 revisits found without a pose prior while tracking, median nan px from the tracked pose; 0 loops closed, 0 segments merged
+mean coasted tracks/frame=276.5
+ms/frame: superpoint=14.45 flow_gpu=2.68 tracking_wall=5.96 (incl. flow wait) tracking_gpu=0.349

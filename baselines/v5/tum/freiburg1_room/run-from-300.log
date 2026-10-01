@@ -1,0 +1,12 @@
+  vo frame 853: tracking lost
+frames=1062 start=0.0s mean_detections=1052
+continuation_rate=0.6121 (matched 649243 of 1060733 previous live tracks)
+tracks=67273 mean_len=10.65 median_len=4 p90_len=29 >=10:22204 >=30:6387 >=100:187
+frame0_cohort=902 survivors@10=394 @30=58 @60=0 @120=0 @300=0
+match_descriptor_cos median=0.958 p10=0.875 frac<0.7=0.0000
+camera pose: posed 1054/1062 frames, 187 keyframes, 1 losses, 2 segments (largest 549 poses), inlier ratio median 0.800, median reprojection 1.48 px, 2.81 ms/frame (max 46.9)
+coasting: 0 frames predicted (kept in the trajectory when relocalized), 0 relocalizations; tracked pose sigma median 0.14 px (p90 0.24), confidence p10 1.000
+landmarks: 15098 (2717 in the local map), re-associated 4995 (1508 merged; 0 from outside the local map)
+places: 0 revisits found without a pose prior while tracking, median nan px from the tracked pose; 0 loops closed, 0 segments merged
+mean coasted tracks/frame=325.4
+ms/frame: superpoint=13.88 flow_gpu=0.48 tracking_wall=3.42 (incl. flow wait) tracking_gpu=0.195
