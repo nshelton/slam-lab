@@ -1,0 +1,14 @@
+[mov,mp4,m4a,3gp,3g2,mj2 @ 0x5d105c968900] Could not find codec parameters for stream 2 (Audio: none (apac / 0x63617061), 48000 Hz, 4 channels, 393 kb/s): unknown codec
+Consider increasing the value for the 'analyzeduration' (0) and 'probesize' (5000000) options
+  vo frame 573: relocalized after 13 coasted frames: 32 inliers of 106 matches within 256 px; prediction was off by 13.4 px (median), sigma 142.7 px
+  vo frame 675: tracking lost: not relocalized in 7 coasted frames
+frames=582 start=0.0s mean_detections=1970
+continuation_rate=0.6111 (matched 355049 of 581000 previous live tracks)
+tracks=38201 mean_len=10.29 median_len=2 p90_len=35 >=10:9368 >=30:4492 >=100:72
+frame0_cohort=1000 survivors@10=720 @30=288 @60=110 @120=0 @300=0
+match_descriptor_cos median=0.975 p10=0.926 frac<0.7=0.0000
+camera pose: posed 576/582 frames, 86 keyframes, 1 losses, 2 segments (largest 365 poses), inlier ratio median 0.885, median reprojection 1.22 px, 2.49 ms/frame (max 13.4)
+coasting: 20 frames predicted (kept in the trajectory when relocalized), 1 relocalizations; tracked pose sigma median 0.10 px (p90 0.20), confidence p10 1.000
+landmarks: 6322 (4526 retired), re-associated 542 (50 merged)
+mean coasted tracks/frame=324.9
+ms/frame: superpoint=12.87 flow_gpu=2.54 tracking_wall=5.57 (incl. flow wait) tracking_gpu=0.296

@@ -1,0 +1,11 @@
+  vo frame 679: tracking lost: not relocalized in 38 coasted frames
+frames=2285 start=0.0s mean_detections=876
+continuation_rate=0.6779 (matched 1546227 of 2280858 previous live tracks)
+tracks=76712 mean_len=21.16 median_len=6 p90_len=59 >=10:31175 >=30:15301 >=100:3423
+frame0_cohort=960 survivors@10=868 @30=602 @60=370 @120=127 @300=13
+match_descriptor_cos median=0.973 p10=0.918 frac<0.7=0.0000
+camera pose: posed 2273/2285 frames, 309 keyframes, 1 losses, 2 segments (largest 1903 poses), inlier ratio median 0.874, median reprojection 1.08 px, 2.14 ms/frame (max 14.9)
+coasting: 38 frames predicted (kept in the trajectory when relocalized), 0 relocalizations; tracked pose sigma median 0.09 px (p90 0.14), confidence p10 1.000
+landmarks: 14684 (12823 retired), re-associated 21487 (6462 merged)
+mean coasted tracks/frame=288.5
+ms/frame: superpoint=17.13 flow_gpu=0.86 tracking_wall=4.42 (incl. flow wait) tracking_gpu=0.501

@@ -1,0 +1,11 @@
+  vo frame 848: tracking lost
+frames=1362 start=0.0s mean_detections=1032
+continuation_rate=0.6052 (matched 823575 of 1360831 previous live tracks)
+tracks=88003 mean_len=10.36 median_len=4 p90_len=28 >=10:28561 >=30:8036 >=100:187
+frame0_cohort=1000 survivors@10=657 @30=180 @60=2 @120=0 @300=0
+match_descriptor_cos median=0.958 p10=0.874 frac<0.7=0.0000
+camera pose: posed 1352/1362 frames, 246 keyframes, 1 losses, 2 segments (largest 844 poses), inlier ratio median 0.805, median reprojection 1.47 px, 2.10 ms/frame (max 12.4)
+coasting: 0 frames predicted (kept in the trajectory when relocalized), 0 relocalizations; tracked pose sigma median 0.14 px (p90 0.22), confidence p10 1.000
+landmarks: 20774 (17900 retired), re-associated 7109 (2165 merged)
+mean coasted tracks/frame=330.8
+ms/frame: superpoint=13.19 flow_gpu=0.45 tracking_wall=3.30 (incl. flow wait) tracking_gpu=0.179
