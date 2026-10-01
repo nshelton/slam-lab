@@ -1,6 +1,6 @@
 // Headless screenshot of the real workbench UI after processing some frames
 // (visual check of the panels). Not part of CTest.
-// usage: [SLAM_DEPTH_MODEL=NAME] slam-native-snapshot VIDEO ENGINE START_SECONDS FRAMES OUT.ppm
+// usage: slam-native-snapshot VIDEO ENGINE START_SECONDS FRAMES OUT.ppm
 #include "../src/app.cpp"
 #include <fstream>
 #include <iostream>
@@ -24,17 +24,8 @@ int main(int argc, char** argv) {
     config.video = argv[1];
     config.engine = argv[2];
     config.database = root / "features.db";
-    config.models_dir = std::filesystem::path(argv[2]).parent_path();
-    if (const char* model = std::getenv("SLAM_DEPTH_MODEL")) config.depth_model = model;  // preset name, "" = off
     Session session(config);
     session.runtime.realtime_pacing = false;
-    if (const char* fusion = std::getenv("SLAM_FUSION")) {  // depth fusion window: 1 side by side, 2 overlay
-      session.runtime.fusion.enabled = true;
-      session.runtime.show_trajectory = false;  // room for the fusion window
-      session.runtime.show_depth = false;
-      session.runtime.fusion.overlay = std::string(fusion) == "2";
-      if (const char* view = std::getenv("SLAM_FUSION_VIEW")) session.runtime.fusion.view = std::atoi(view);
-    }
     if (std::stod(argv[3]) > 0) {
       session.runtime.seek_seconds = std::stod(argv[3]);
       session.runtime.seek_requested = true;
@@ -43,10 +34,6 @@ int main(int argc, char** argv) {
     session.runtime.playing = true;
     const int frames = std::stoi(argv[4]);
     for (int i = 0; i < frames; ++i) session.advance();
-    if (session.depth) {  // let the last submission land
-      while (session.depth->busy()) {}
-      session.poll_depth();
-    }
     DatabaseSummary database_summary;
     int width = 0, height = 0;
     for (int pass = 0; pass < 3; ++pass) {  // first passes settle window sizes
@@ -54,15 +41,12 @@ int main(int argc, char** argv) {
       ImGui_ImplGlfw_NewFrame();
       ImGui::NewFrame();
       DatabaseStats stats = database_summary.get(session.config.database, false);
-      draw_sidebar(session.runtime, *session.decoder, *session.store, session.tracker.get(),
-                   session.flow_tracker.get(), stats, session.config.database);
+      draw_sidebar(session.runtime, *session.decoder, *session.store, *session.flow_tracker, stats,
+                   session.config.database);
       draw_video(session.runtime, true, session.decoder->duration_ns(), session.decoder->start_time_ns());
       draw_flow_diagnostics(session.runtime, *session.flow_tracker);
-      draw_depth(session.runtime);
-      if (session.runtime.show_trajectory)
-        session.trajectory_view.draw(*session.odometry, &session.runtime.show_trajectory,
-                                     session.runtime.frame_width, session.runtime.frame_height);
-      draw_fusion(session.runtime);
+      session.trajectory_view.draw(*session.odometry, &session.runtime.show_trajectory,
+                                   session.runtime.frame_width, session.runtime.frame_height);
       ImGui::Render();
       glfwGetFramebufferSize(window.get(), &width, &height);
       glViewport(0, 0, width, height);
@@ -80,17 +64,6 @@ int main(int argc, char** argv) {
     session.store->flush();
     std::cout << "odometry: " << to_string(session.odometry->last().state) << ", "
               << session.odometry->trajectory_size() << " posed frames\n";
-    const auto& depth = session.runtime.depth;
-    std::cout << "depth: " << (depth.empty() ? session.runtime.depth_error : std::to_string(depth.gpu_ms) + " ms, " +
-                 std::to_string(depth.width) + "x" + std::to_string(depth.height) + ", centre " +
-                 std::to_string(depth.at_source(depth.source_width / 2.0F, depth.source_height / 2.0F)) + " m")
-              << '\n';
-    const auto& fusion = session.runtime.fusion;
-    if (fusion.enabled)
-      std::cout << "fusion: " << (fusion.status.empty() ? "running" : fusion.status) << ", " << fusion.stats.valid
-                << " px, " << fusion.ms << " ms, flicker raw " << fusion.stats.flicker_raw << " fused "
-                << fusion.stats.flicker_fused << ", keyframe clouds " << fusion.keyframes_fused << " fused / "
-                << fusion.keyframes_raw << " raw\n";
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     return 1;

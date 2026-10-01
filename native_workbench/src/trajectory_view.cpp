@@ -48,12 +48,6 @@ void TrajectoryView::reset() {
 }
 
 void TrajectoryView::update(const VisualOdometry& odometry) {
-  if (odometry.map_generation() != map_generation_) {  // a loop correction moved old poses and points
-    map_generation_ = odometry.map_generation();
-    samples_.clear();
-    retired_.clear();
-    points_renderer_.clear();
-  }
   const std::size_t stable = std::min(odometry.stable_prefix(), samples_.size());
   if (odometry.trajectory_size() < samples_.size()) samples_.clear();  // odometry was reset
   samples_.resize(std::min(samples_.size(), stable));
@@ -85,13 +79,7 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
   ImGui::Text("Inliers %d / %d  |  keyframes %zu", last.inliers, last.correspondences, last.keyframes);
   // Active: the odometry's live landmarks (still refined); retired: final
   // positions kept for display. Their sum is what the view can draw.
-  // Live: refined by the odometry now. Held: kept for re-association or
-  // relocalization (dormant, lost segment). Retired: final. All are drawn.
-  const std::size_t live = std::min(last.map_points, active_.size());
-  ImGui::Text("Map: %zu live, %zu held, %zu retired", live, active_.size() - live, retired_.size());
-  if (ImGui::IsItemHovered())
-    ImGui::SetTooltip("Live: refined by the odometry. Held: track ended or segment lost; kept for\n"
-                      "re-association / relocalization. Retired: final positions.");
+  ImGui::Text("Map: %zu active, %zu retired", active_.size(), retired_.size());
   if (last.has_pose) ImGui::Text("Median reprojection %.2f px", last.median_reprojection_px);
   ImGui::PushTextWrapPos(0);
   if (!last.event.empty()) ImGui::TextDisabled("%s", last.event.c_str());
@@ -119,35 +107,10 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
     ImGui::SameLine();
     ImGui::Checkbox("Perspective", &perspective_);
   }
-  ImGui::Checkbox("Covisibility", &show_covisibility_);
-  if (ImGui::IsItemHovered())
-    ImGui::SetTooltip("Magenta lines between keyframes that observe common landmarks.\n"
-                      "Links far apart in time are loops / revisits the map already knows.");
-  if (show_covisibility_) {
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(90);
-    ImGui::SliderInt("shared##covis", &covisibility_min_shared_, 1, 200);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(90);
-    ImGui::SliderInt("gap (KFs)##covis", &covisibility_min_gap_, 1, 200);
-    std::uint64_t keyframe_count = 0;
-    for (const auto& s : samples_) keyframe_count += s.keyframe;
-    const std::array<std::uint64_t, 4> key{keyframe_count, map_generation_,
-        static_cast<std::uint64_t>(covisibility_min_shared_), static_cast<std::uint64_t>(covisibility_min_gap_)};
-    if (key != covisibility_key_) {
-      covisibility_ = odometry.covisibility(covisibility_min_shared_, covisibility_min_gap_);
-      covisibility_key_ = key;
-    }
-    ImGui::SameLine();
-    ImGui::Text("%zu links", covisibility_.size());
-  }
   if (show_points_) {
-    const char* colors[] = {"Plain", "Image colour", "Confidence"};
+    const char* colors[] = {"Plain", "Image colour"};
     ImGui::SetNextItemWidth(110);
     ImGui::Combo("##colour", &color_mode_, colors, IM_ARRAYSIZE(colors));
-    if (ImGui::IsItemHovered() && color_mode_ == 2)
-      ImGui::SetTooltip("Depth confidence: red = depth poorly constrained (low parallax), green = well\n"
-                        "triangulated, grey = not computed yet. Geometry only; see CONFIDENCE_DESIGN.md.");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(110);
     ImGui::SliderFloat("Point size", &point_size_, 0.001F, 0.2F, "%.3f", ImGuiSliderFlags_Logarithmic);
@@ -156,54 +119,6 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
     if (show_retired_) {
       ImGui::SameLine();
       ImGui::Checkbox("Dim retired", &dim_retired_);
-    }
-    ImGui::SetNextItemWidth(110);
-    ImGui::SliderFloat("Min confidence", &min_confidence_, 0.0F, 1.0F, "%.2f");
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hide points below this depth confidence (0 shows all).");
-    ImGui::Checkbox("Uncertainty", &uncertainty_shape_);
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("Draw each point as its uncertainty ellipsoid (geometry-only covariance,\n"
-                        "keyframes held fixed: optimistic). Long along the viewing ray = depth\n"
-                        "poorly constrained. Points without a covariance keep the point size.");
-    if (uncertainty_shape_) {
-      ImGui::SameLine();
-      ImGui::SetNextItemWidth(70);
-      ImGui::SliderFloat("sigma##ellipsoid", &sigma_scale_, 0.5F, 3.0F, "%.1fx");
-      ImGui::SameLine();
-      ImGui::SetNextItemWidth(70);
-      ImGui::SliderFloat("max##ellipsoid", &max_axis_fraction_, 0.005F, 0.5F, "%.3f", ImGuiSliderFlags_Logarithmic);
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Longest drawn half-axis, as a fraction of the trajectory's size.");
-    }
-  }
-  if (depth_store_ && !depth_store_->clouds().empty()) {
-    ImGui::Checkbox("Dense depth", &show_dense_);
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("Each keyframe's network depth, back-projected and coloured, drawn at the keyframe's\n"
-                        "current pose with its local metric scale (DEPTH_INTEGRATION.md Phase 2).\n"
-                        "Doubled surfaces = inconsistent scale, pose or depth.");
-    if (show_dense_) {
-      ImGui::SameLine();
-      ImGui::SetNextItemWidth(90);
-      ImGui::SliderFloat("Dense size", &dense_point_pixels_, 1.0F, 6.0F, "%.1f px");
-      ImGui::SameLine();
-      ImGui::Checkbox("Consistent only", &dense_consistent_only_);
-      if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Hide points that neighbouring keyframes' depth contradicts (they see through\n"
-                          "them); points no other keyframe could check stay visible.");
-      ImGui::SameLine();
-      ImGui::TextDisabled("%zu keyframes", depth_store_->clouds().size());
-      // Network-depth confidence (DepthConfidenceModel, trained on landmarks).
-      ImGui::SetNextItemWidth(110);
-      ImGui::SliderFloat("Max depth sigma", &dense_max_sigma_, 0.02F, 1.0F, "%.2f", ImGuiSliderFlags_Logarithmic);
-      if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Hide dense points whose predicted network depth error (log depth, ~relative)\n"
-                          "exceeds this. The model learns from well-triangulated landmarks at each\n"
-                          "keyframe (cues: depth edges, distance, image radius, landmark density).\n"
-                          "Colour mode 'Confidence' colours dense points by it too.");
-      const auto& model = depth_store_->confidence_model();
-      ImGui::SameLine();
-      if (model.fitted()) ImGui::TextDisabled("model: %zu refs", model.references());
-      else ImGui::TextDisabled("model: learning (%zu refs)", model.references());
     }
   }
 
@@ -354,35 +269,7 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
     line({0, 0, 0}, {0, 0, axis}, IM_COL32(60, 100, 235, 255), 2.0F);
   }
 
-  // Keyframe depth clouds at their keyframes' current poses.
-  std::vector<DenseCloudDraw> clouds;
-  if (depth_store_ && show_dense_) {
-    for (const auto& cloud : depth_store_->clouds()) {
-      if (!all_segments_ && cloud.segment != segment) continue;
-      const auto it = std::lower_bound(samples_.begin(), samples_.end(), cloud.frame_index,
-                                       [](const TrajectorySample& s, std::uint64_t f) { return s.frame_index < f; });
-      if (it == samples_.end() || it->frame_index != cloud.frame_index) continue;
-      const double scale = cloud.metres_per_unit > 0 ? cloud.metres_per_unit : odometry.segment_scale(cloud.segment);
-      if (!(scale > 0)) continue;
-      DenseCloudDraw d;
-      d.key = cloud.frame_index;
-      d.version = cloud.version;
-      d.points = &cloud.points;
-      d.colors = &cloud.colors;
-      if (dense_consistent_only_) d.shown = &cloud.shown;
-      d.sigma = &cloud.sigma;
-      d.max_sigma = dense_max_sigma_ >= 1.0F ? std::numeric_limits<float>::infinity() : dense_max_sigma_;
-      d.color_by_confidence = color_mode_ == 2;
-      const auto& R = it->pose.rotation;  // world -> camera; cloud (camera) -> world is R^T
-      for (int r = 0; r < 3; ++r)
-        for (int c = 0; c < 3; ++c) d.rotation[r * 3 + c] = static_cast<float>(R[c * 3 + r]);
-      const auto o = it->pose.center();
-      d.origin = {static_cast<float>(o[0]), static_cast<float>(o[1]), static_cast<float>(o[2])};
-      d.units_per_point_unit = static_cast<float>(1.0 / scale);
-      clouds.push_back(d);
-    }
-  }
-  if (show_points_ || !clouds.empty()) {
+  if (show_points_) {
     // Solid icosahedrons on the GPU, depth-tested among themselves and drawn
     // over the grid, under the trajectory and frustum overlays.
     PointCloudCamera camera;
@@ -398,26 +285,11 @@ void TrajectoryView::draw(const VisualOdometry& odometry, bool* open, int frame_
     camera.rotation = rotation_;
     const int only = all_segments_ ? -1 : segment;
     const auto color = static_cast<PointColor>(color_mode_);
-    const float max_axis = max_axis_fraction_ * radius;
-    const PointCloudStyle retired{point_size_, dim_retired_ ? 0.6F : 1.0F, color, only, min_confidence_,
-                                  uncertainty_shape_, sigma_scale_, max_axis};
-    const PointCloudStyle active{point_size_, 1.0F, color, only, min_confidence_, uncertainty_shape_, sigma_scale_,
-                                 max_axis};
+    const PointCloudStyle retired{point_size_, dim_retired_ ? 0.6F : 1.0F, color, only};
+    const PointCloudStyle active{point_size_, 1.0F, color, only};
     points_renderer_.render(draw, {origin.x, origin.y}, {origin.x + size.x, origin.y + size.y},
-                            io.DisplayFramebufferScale.x, camera,
-                            show_points_ && show_retired_ ? &retired_ : nullptr, retired,
-                            show_points_ ? &active_ : nullptr, active, &clouds, dense_point_pixels_,
-                            depth_store_ ? depth_store_->generation() : 0);
-  }
-  if (show_covisibility_ && !covisibility_.empty()) {
-    std::unordered_map<std::uint64_t, const TrajectorySample*> keyframe_samples;
-    for (const auto& s : samples_)
-      if (s.keyframe && visible(s)) keyframe_samples[s.frame_index] = &s;
-    for (const auto& edge : covisibility_) {
-      const auto a = keyframe_samples.find(edge.frame_a), b = keyframe_samples.find(edge.frame_b);
-      if (a == keyframe_samples.end() || b == keyframe_samples.end()) continue;
-      line(display(a->second->pose.center()), display(b->second->pose.center()), IM_COL32(255, 0, 255, 140), 1.0F);
-    }
+                            io.DisplayFramebufferScale.x, camera, show_retired_ ? &retired_ : nullptr, retired,
+                            &active_, active);
   }
   const TrajectorySample* previous = nullptr;
   for (const auto& s : samples_) {

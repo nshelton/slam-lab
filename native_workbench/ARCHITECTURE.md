@@ -1,12 +1,11 @@
 # Native workbench architecture
 
-## Start here: the tracking and pose system as of 2026-09-30
+## Start here: the tracking and pose system as of 2026-10-01
 
 This section is the handoff for work on robust camera tracking, track
 re-association after occlusion, and a camera motion model. The dated
 sections below keep the history and measurements; where they disagree, this
-section is current. Design proposals: `CONFIDENCE_DESIGN.md` (uncertainty),
-`DEPTH_INTEGRATION.md` (metric depth network → scale, dense map, occlusion).
+section is current.
 
 ### Pipeline in one picture
 
@@ -27,8 +26,9 @@ NVDEC frame (native orientation, source px, lens-distorted)
             ├─► FocalEstimator (worker thread): FOV + k1 from F-matrix consistency
             ▼
   VisualOdometry (CPU, UI thread; src/visual_odometry.cpp)
-    undistort (k1) → init (E/H RANSAC) → per-frame pose (robust LM, constant velocity)
-    → keyframes: triangulate, sliding-window BA (8 KF), cull → retire landmarks
+    undistort (k1) → init (E/H RANSAC) → per-frame pose (Huber LM from constant velocity
+    / constant position; P3P RANSAC recovery) → keyframes (incl. emergency): triangulate,
+    sliding-window BA (8 KF), cull → retire landmarks; loss → new segment
             ▼
   OdometryFrameResult (pose, inlier/outlier track IDs), trajectory, active + retired map
             ▼
@@ -49,14 +49,16 @@ NVDEC frame (native orientation, source px, lens-distorted)
   from `next_id_`; seeking or restarting creates a new tracker, so IDs
   restart and the VO/trajectory are reset (`Session::seek`). Re-association
   must not revive an old ID inside the tracker unless the VO contract is
-  changed too. The cleaner route is aliasing at the VO level (below).
+  changed too. The cleaner route is aliasing at the VO level (re-keying a
+  landmark to the new track ID).
 - **Only supported observations reach the VO.** Coasted positions (flow-only)
   are dropped in `tracked_frame_from()`.
 - **Track positions are fused, not exact detections** (since 2026-09-30,
   default `flow_sigma_px = 0.3`). Never identify "the detection a track
   used" by position equality. The bench did that and reported continuation
   0.005 instead of 0.88. Use the tracker's `kind`/`superpoint_supported`,
-  or plumb the detection index (below).
+  or the record's `detection` index (the supporting detection, −1 when
+  coasted).
 - **GPU frame lifetime.** A `GpuFrame` is valid until the next
   `VideoDecoder::next()`. Consumers on their own streams must
   `cudaStreamWaitEvent(frame.ready_event)` first.
@@ -94,175 +96,38 @@ new ID, and in the VO a new landmark, so walls get duplicated in the map.
 In `VisualOdometry::Impl` (`src/visual_odometry.cpp`):
 
 - Created at initialization (both init frames) or in `triangulate_new()` at
-  a keyframe, from the oldest window keyframe that saw the track
-  (≥ 0.5° parallax, ≤ 3 px error in both views).
+  a keyframe, from the oldest window keyframe that saw the track, i.e. the
+  widest pair (≥ 0.5° parallax, ≤ 3 px error in both views).
 - Per frame, `track()` gathers the current observations of tracks that have
   landmarks, solves the pose, and splits them into inliers/outliers
   (`OdometryFrameResult::pose_inliers/pose_outliers`; the GUI's "Pose
-  inliers" point view draws them green/red).
+  inliers" point view draws them green/red). The pose starts from a
+  constant-velocity prediction, then constant position; if neither keeps
+  half the correspondences, P3P RANSAC (`vo::p3p`, Grunert;
+  `vo::ransac_pnp`, 4 px) re-estimates it from the same correspondences
+  before the frame is declared lost.
 - At a keyframe, outlier landmarks are **deleted** (`landmarks.erase`,
   they're usually short-baseline depths and get re-triangulated).
 - `cull()`: observations that fail 2× the reprojection threshold are
   dropped; a landmark with < 2 observations is **deleted**; a landmark whose
   track is gone and which no window keyframe observes is **retired**
-  (`retire()` → `retired`, final, never refined again), or, with
-  relocalization and a descriptor, first kept **dormant** for 90 frames.
-- On loss, a segment with ≥ 3 keyframes is **suspended** for relocalization
-  (below); otherwise, and on resolution change, `clear_segment()` retires the
-  segment's landmarks. Either way the next segment starts with a new frame
-  and scale unless the old one is resumed.
+  (appended to `retired`, final, never refined again).
+- On loss, and on resolution change, `clear_segment()` retires the
+  segment's landmarks. The next segment starts from the current frame with
+  a new frame and scale.
 - `MapPoint` (public) carries: track ID, position, mean RGB of keyframe
   observations, segment, keyframe count, first/last frame.
   `active_map()`, `retired_map(first)`, `retired_count()`;
   `write_map_csv()` exports both.
-
-### Relocalization and landmark persistence (implemented 2026-09-30)
-
-Tracks still die at occlusions (the tracker's unique-ID contract is
-unchanged); the VO re-associates at the landmark level instead.
-
-- **Descriptors reach the VO.** `TrackRecord::detection` (the former `pad`)
-  is the matched detection's index; `FlowTracker::associate` fills
-  `FrameFeatures::track_descriptors` (the matched detection's 256-d
-  descriptor per track, zero rows for coasted tracks) whenever the raw
-  descriptors are on the host (live SuperPoint and cached frames both are).
-  `tracked_frame_from()` copies them into `TrackedFrame::descriptors`.
-  Tracks CSV input has no descriptors: relocalization is then inactive and
-  the VO behaves exactly as before.
-- **Landmarks keep their latest descriptor** (updated at every inlier
-  observation) and their segment. Measured on `dreamworks.MOV`, the latest
-  descriptor beats the first, a mean, a per-landmark variance/PCA model and a
-  constant-velocity Kalman prediction of the descriptor; drift is a random
-  walk (`tools/descriptor_*.py`).
-- **Dormant landmarks.** With relocalization on, a landmark whose track ended
-  and which left the window is kept for `relocalization_max_frames` (90)
-  before it is retired. Dormant and suspended landmarks are listed by
-  `active_map()` (not final); `retired` stays append-only and final.
-- **On loss** of a segment with ≥ `relocalization_min_keyframes` (3), its
-  landmarks (active + dormant), last pose and velocity are suspended. Every
-  following frame (until 90 frames after its last pose, even while a new
-  segment initializes) tries `relocalize()`: constant-velocity prediction →
-  mutual-best descriptor matches within 256 px (cosine ≥ 0.7, grid-bucketed)
-  → P3P RANSAC (`vo::p3p`, Grunert; `vo::ransac_pnp`, 4 px) → `optimize_pose`
-  → guided search within 16 px → `optimize_pose`; ≥ 30 inliers accepts.
-  `resume_lost()` retires the young segment, restores the old segment's
-  keyframes and landmarks, re-keys matched landmarks to the new track IDs,
-  adds a keyframe and runs the local BA. Segment IDs come from `next_segment`
-  and are never reused; a resumed segment keeps its ID, frame and scale.
-- **Before declaring loss**, `track()` retries a failed pose with P3P RANSAC
-  on the same correspondences (sudden motion).
-- `OdometryFrameResult::relocalized` / `relocalization_candidates`; the GUI
-  sidebar shows the count (tooltip: last event); bench key `reloc 0|1`,
-  `SLAM_VO_VERBOSE=1` prints each attempt.
-
-Result on `dreamworks.MOV` (30 fps, 882 frames, walking behind columns;
-hfov 67.1, k1 −0.031, defaults): relocalized at 3 of 4 column events
-(frames 573, 680, 786; 13–14 frames after the loss, i.e. once the column has
-passed), largest segment 557 → 826 poses, 7 → 4 segments. The camera centre
-steps across each gap at the walking speed seen before and after it. The
-unrecovered loss (855) is a partial column in front of repetitive railings
-with few recognisable landmarks. `disney_04` is unchanged (0 losses).
-Constant-velocity drift measured on this clip (`tools/pose_propagation.py`):
-≈ 8 px at 0.17 s, 20 px at 0.33 s, 40 px at 0.5 s, 140 px (5.7°, mostly
-rotation) at 1 s — hence the wide first gate plus RANSAC rather than tight
-per-landmark gates.
-
-**Re-association while tracking** (`reassociate()`, every tracked frame,
-after the pose and before the keyframe step): every landmark without an
-observation this frame — active ones whose track vanished and dormant ones
-(kept `dormant_max_frames` = 900, at most 20,000) — that projects into the
-image is reported in `OdometryFrameResult::untracked_landmarks` (distorted
-input pixels, via `distort_point`). Each takes over a track that has no
-landmark yet if that track lies within `reassociation_radius_px` (2 px) of
-the projection and the descriptors are mutual best matches (cosine ≥ 0.7);
-the landmark is re-keyed to the new track, so no duplicate is triangulated.
-The GUI's video view draws them (checkbox "Untracked landmarks"): magenta
-ring = untracked (faint: dormant), filled magenta + white ring = re-found
-this frame. The 2 px gate is measured, not guessed: on `dreamworks.MOV`,
-re-associations within 2 px of the projection were pose inliers in the next
-frames 92% of the time, 2–3 px 72%, 3–5 px 19%, beyond 5 px 3% (bench prints
-this breakdown). Relocalization only matches landmarks seen within 90 frames
-of the loss (older dormant ones have drifted and steal mutual-best matches in
-its 256 px window).
-
-Effect (bench, `reassoc 0|1`): synthetic walk with broken tracks 5,603 →
-1,420 landmarks, 9,346 re-associations, 0 joining different points.
-`disney_04`: 8,550 → 7,677 landmarks, 1,543 re-associations (90% confirmed),
-still 0 losses, inlier ratio 0.898 → 0.894. `dreamworks.MOV` is fragile
-around frames 250–300: with fusion off re-association raised the largest
-segment 538 → 814 poses, with defaults it lowered it 826 → 523 (a different
-early trajectory led to a collapse at 299) — sensitivity, not wrong merges
-(0–2 re-associations per frame there). VO cost ≈ +1 ms/frame.
-
-Not done yet: what to do with landmarks that stay untracked in view (the
-magenta rings: occluded, detector misses, or stale/drifted positions);
-relocalization against segments older than the last lost one; loop closure.
-
-### Loop closure (implemented 2026-09-30)
-
-Within a segment, at each keyframe (`detect_loop`, `src/visual_odometry.cpp`;
-maths in `src/pose_graph.{hpp,cpp}`):
-
-- **Archive.** Retired landmarks with descriptors are kept whole (`archive`:
-  position, sightings, descriptor). `retired` (the viewers' list) mirrors them
-  through `retired_index`.
-- **Candidates (spatial).** Keyframes ≥ `loop_min_keyframe_gap` (30)
-  keyframes back whose centre is within 1 × the keyframe's median landmark
-  depth and whose optical axis is within 45°. A candidate that already shares
-  over 20% of the keyframe's landmarks is continuous tracking, not a loop.
-- **Matching.** The candidate's neighbourhood (±2 keyframes; active, dormant
-  or archived landmarks) is projected with the current pose, and
-  `match_projected` finds mutual-best descriptor matches within
-  `loop_search_radius_px` (160) among this frame's tracks that carry a
-  landmark. A RANSAC similarity on the 3D-3D matches
-  (`ransac_similarity`, tolerance 5% of depth) is then checked by
-  reprojection; ≥ `loop_min_inliers` (30) verified.
-- **Correction.** A trivial Sim3 only merges. Otherwise a Sim3 pose graph
-  over the segment's keyframes (consecutive, covisibility ≥ 30 shared
-  landmarks, and the loop edge with weight 10; the candidate fixed) is solved
-  by `optimize_pose_graph` (sparse LM, numeric Jacobians), on a **worker
-  thread** (`std::async`), or synchronously with `loop_synchronous` (bench
-  `loop-sync 1`, tests: deterministic). `apply_loop` (next frame that finds
-  the future ready) applies it as a **delta** to the current estimates:
-  `W_i = S_i_new⁻¹ S_i_old` per keyframe. Keyframes added since take the
-  newest node's correction. Keyframe poses become `(pose · W⁻¹).rigid()`;
-  landmarks (all states) and their covariances move with their most recent
-  keyframe; frame records rescale their relative translation to the new
-  camera units; the loop's (current, old) pairs are merged (archived ones
-  come back via `unretire`). `map_generation()` increments; `TrajectoryView`
-  refetches. `OdometryFrameResult::keyframe_scale_changes` tells the dense
-  clouds to rescale (`KeyframeDepthStore::rescale`).
-
-Results (bench, `loop-sync 1`; `tools/trajectory_vs_gt.py`, aligned on
-the first 25%):
-
-| | ATE | end error | return to start |
-|---|---|---|---|
-| fr3 long_office, off | 0.080 m | 0.187 m | 0.238 m |
-| fr3 long_office, on (3 loops) | **0.042 m** | **0.057 m** | **0.087 m** |
-| fr2_desk, off | 0.295 m | | 0.530 m |
-| fr2_desk, on (4 loops) | 0.252 m | 0.023 m | **0.073 m** |
-
-disney_04 and dreamworks: no loops, identical results; detection costs about
-0.5 ms/frame on average there. fr1_desk: its losses split the loop across
-segments (not handled). The solve takes a few hundred ms at 300 keyframes,
-off the UI thread in the app. Synthetic test (`closes_a_loop`): a circle
-with a 0.5% focal error, ATE 0.21% → 0.10% (sync) / 0.08% (worker).
-
-**Limits / next.** Spatial candidates with a 160 px window only catch drift of
-about 1–2° rotation (synthetic: a 1% focal error is missed). Larger drift
-needs **appearance retrieval** (per-keyframe descriptor sets, GPU voting) as
-the candidate source. Also: loops across segments (map merging), information-
-weighted edges (the correction spreads error into the middle of the run: fr3
-at 50% 0.029 → 0.066 m), and a full BA after the correction.
 
 ### Where to add a camera motion model
 
 - **Current model.** `track()` predicts the pose with constant velocity
   (`velocity * last_pose`, velocity = last × previous⁻¹), falls back to
   constant position if that yields too few inliers, then runs
-  `optimize_pose()` (Huber LM, 10 iterations × 2 stages). There is no
-  covariance, no IMU, and no feedback to the tracker.
+  `optimize_pose()` (Huber LM, 10 iterations × 2 stages); P3P RANSAC is the
+  last resort. There is no covariance, no IMU, and no feedback to the
+  tracker.
 - **Pose covariance.** `optimize_pose()` builds the 6×6 Gauss-Newton
   Hessian `H = Σ w JᵀJ` internally (`src/vo_geometry.cpp`); its inverse
   at convergence is the pose covariance (up to the noise scale). Return it
@@ -300,47 +165,6 @@ KᵀFK is a valid essential matrix (Mendonça–Cipolla). The GUI's **Camera
 lens** window shows both curves and applies them. Pure translation informs
 k1 but not the FOV; pure rotation informs neither.
 
-### Live metric depth (added 2026-09-30)
-
-`DepthEstimator` (`include/slam_native/depth_estimator.hpp`,
-`src/depth_estimator.cu`) runs a monocular metric-depth TensorRT engine on its
-own CUDA stream. It is display-only so far: nothing in tracking or the VO reads
-it yet.
-
-- **Asynchronous.** `Session::submit_depth()` queues a frame whenever the
-  previous one has finished. `submit()` returns after preprocessing, so the
-  decoder may recycle the surface. `poll()` (every UI iteration) picks up the
-  result, so the map lags the video by about a frame.
-- **Upright input.** Depth networks are trained on upright images, so the
-  preprocessing kernel applies the display rotation (NV12/P010 → BT.709 RGB,
-  up to 4×4 taps per input pixel, letterbox, per-channel normalisation).
-  Each model has a landscape and a portrait engine, `<stem>-<W>x<H>.engine`.
-  Changing the model or the rotation rebuilds the estimator.
-- **Coordinates.** A `DepthMap` holds metres on the network's output grid
-  (upright, letterboxed, 0 = padding). `DepthMap::at_source(x, y)` samples it
-  at *native source pixels*, the same coordinates as tracks, so a consumer
-  (VO scale, depth-initialised landmarks) needs no extra mapping. Points are
-  lens-distorted, like the frame the network saw.
-- **Models are data.** A `DepthModelSpec` holds the tensor names, mean/std on
-  0–255 RGB, letterbox fill, clamp and an optional canonical focal length
-  (Metric3D predicts depth for f = 1000 px. It is scaled by the VO lens's
-  focal length in network pixels, so the depth follows the applied FOV).
-  Inputs and outputs may be float32 or float16, outputs `[1x[1x]]HxW` at any
-  resolution, and engines with dynamic shapes run at their profile's optimum.
-  Extra outputs (Metric3D's normals) are bound and ignored. To add a model,
-  export an ONNX, add it to `tools/build_depth_engines.sh`, and add a preset
-  to `depth_model_presets()`.
-
-| Preset (`--depth-model`) | Engine input | trtexec GPU, 2080 Ti | In-app (incl. pre/post) |
-|---|---|---|---|
-| Depth Anything V2-S (indoor / outdoor) | 518×294 / 294×518, fp16 | 2.3 ms | ~4 ms |
-| Metric3D v2 ViT-S | 1064×616 / 616×1064, fp16 | 23 ms | ~23 ms |
-
-DAv2 checkpoints: Hypersim (indoor, clamp 20 m) and VKITTI (outdoor, 80 m).
-The ONNX is exported in fp16 (`tools/export_depth_anything_onnx.py`) because
-TensorRT 11 builds strongly typed networks, so the ONNX types set the
-precision. Metric3D is the onnx-community fp16 export.
-
 ### Measuring changes
 
 No ground truth exists for the real clips. Use these, in order of fairness:
@@ -354,12 +178,12 @@ No ground truth exists for the real clips. Use these, in order of fairness:
 3. **Track continuation / median length** (bench). Continuation is now the
    share of previously live tracks supported by a detection.
 4. **Map sanity**: `export-map` + a top-down plot; duplicated walls mean
-   missed re-association.
+   points that returned as new tracks (no re-association).
 
 Baseline, `disney_04` (1920×1080, 60 fps, 1,798 frames; lens 87.9° /
 k1 −0.054; defaults, flow sigma 0.3): continuation 0.883, median track
-length 15, VO inlier ratio 0.898, median reprojection 1.12 px, epipolar RMS
-1.082 px, 0 losses, ≈8,700 map points (≈8,000 retired). With fusion off:
+length 15, VO inlier ratio 0.897, median reprojection 1.12 px, epipolar RMS
+1.082 px, 0 losses, ≈8,500 map points (≈7,700 retired). With fusion off:
 0.881 / 17 / 0.840 / 1.32 px / 1.215 px. Reproduce:
 
 ```bash
@@ -368,36 +192,33 @@ $B/slam-native-tracking-bench ~/Downloads/chopped/disney_04.mp4 \
   native_workbench/models/superpoint-1024x576-k2048.engine 0 1800 \
   hfov 87.9 k1 -0.054 export-tracks tracks.csv export-map map.csv export-trajectory traj.csv
 $B/slam-native-focal tracks.csv          # epipolar RMS curve, FOV, k1
-$B/slam-native-vo-tracks --tracks tracks.csv --hfov 87.9 --k1 -0.054 --map map.csv --output traj.csv
-$B/slam-native-two-view --tracks tracks.csv --a 1200 --b 1230 --hfov 87.9 --k1 -0.054 --points pair.csv
-.venv-cuda/bin/python native_workbench/tools/plot_two_view.py pair.csv VIDEO pair.png
 $B/slam-native-snapshot VIDEO ENGINE START_S FRAMES out.ppm   # headless render of the real UI
 ```
+
+To compare versions of the whole pipeline, `tools/baseline.py OUT --build
+BUILD_DIR` runs the bench from frame 0 over every TUM sequence and the
+dreamworks clip and writes `trajectory.csv` + `run.log` per sequence,
+`summary.csv` (`tum_eval` metrics: posed frames, segments, ATE, RPE) and
+`manifest.json` (commit, binary, command lines). Runs are deterministic, so
+two snapshots differ only by the code or the `--set KEY VALUE` options.
 
 ORB-SLAM3 is the independent reference (`scripts/run_orbslam3.sh`); on
 `disney_04` at 60° it traced the same path shape as this VO did.
 
 ### Tools and tests added 2026-09-30
 
-- `slam-native-two-view`: the VO's own two-view code on one frame pair,
-  every intermediate printed; `--sweep-hfov`, `--k1`, `--points`.
 - `slam-native-focal`: FOV + k1 estimate from a tracks CSV.
-- Bench keys: `flow-sigma`, `det-sigma`, `hfov`, `k1`, `export-map`.
-- Tracks CSV: optional `r,g,b` columns. Map CSV: see `track_io.hpp`.
+- Bench keys: `flow-sigma`, `det-sigma`, `hfov`, `k1`, `fx fy cx cy`,
+  `kf-min`, `kf-max`, `kf-emergency-ratio`, `window`, `export-map`,
+  `export-features PATH` (raw detections + descriptors in the feature-cache
+  format).
+- Tracks CSV: `frame_index,timestamp_ns,track_id,x,y[,r,g,b]`. Map CSV:
+  `track_id,segment,x,y,z,r,g,b,has_color,keyframe_observations,first_frame,last_frame,retired,landmark_id`
+  (`track_io.hpp`).
 - CTest: `native_focal_estimation` (synthetic FOV/k1 recovery, background
-  worker parity), retired-map + colour check in `native_visual_odometry`,
-  Kalman fusion check in `native_gpu_flow_tracker`.
-- Relocalization: bench keys `reloc`, `export-features PATH` (raw detections
-  + descriptors in the feature-cache format); CTest checks for P3P (exact
-  recovery, RANSAC with 60% outliers), relocalization after a synthetic full
-  occlusion with new track IDs, and per-track descriptors in the tracker.
-- Offline analysis (`tools/`, run with `.venv-cuda/bin/python` on a bench run
-  with `flow-sigma 0 export-tracks … export-features …`):
-  `descriptor_stability.py` (drift, recall vs search radius, database scale),
-  `descriptor_models.py` (per-landmark descriptor models),
-  `descriptor_dynamics.py` (MSD / Kalman on descriptors),
-  `pose_propagation.py` (motion-model drift, projection + descriptor
-  association, PnP on real events; needs the VO trajectory and map).
+  worker parity), retired-map + colour check and P3P checks (exact
+  recovery, RANSAC with 60% outliers) in `native_visual_odometry`, Kalman
+  fusion and per-track descriptor checks in `native_gpu_flow_tracker`.
 
 ## Tracking and keypoint decisions — 2026-09-24
 
@@ -531,8 +352,9 @@ starts a new tracking history.
   track-length distribution, cohort survival, loss classification,
   flow-direction sanity, and timing. Keys: `radius`, `min-sim`, `weight`,
   `coast`, `fb`, `rounds`, `tracks`, `quality`, `backward`, `k`,
-  `flow-sigma`, `det-sigma`, `hfov`, `k1`, `export-tracks`,
-  `export-trajectory`, `export-map`.
+  `flow-sigma`, `det-sigma`, `hfov`, `k1`, `fx`/`fy`/`cx`/`cy`, `kf-min`,
+  `kf-max`, `kf-emergency-ratio`, `window`, `export-tracks`,
+  `export-trajectory`, `export-map`, `export-features`.
 
 ## Camera pose: live monocular visual odometry — 2026-09-24
 
@@ -551,10 +373,10 @@ the GPU flow tracker, the old descriptor tracker (via the same
 `FrameFeatures` conversion), or tracks from another program through the
 CSV format in `track_io.hpp`:
 `frame_index,timestamp_ns,track_id,x,y`, optionally with a first line
-`# size W H`. `slam-native-vo-tracks` runs the solver on such a file and
-writes a trajectory CSV (camera centre plus camera→world quaternion).
+`# size W H`, loaded with `read_tracks_csv()`.
 `slam-native-tracking-bench ... export-tracks PATH` writes the native
-tracks in that format.
+tracks in that format, and `export-trajectory PATH` the poses (camera
+centre plus camera→world quaternion).
 
 **Algorithm** (CPU, Eigen 3.4 pinned via FetchContent; `src/visual_odometry.cpp`,
 `src/vo_geometry.cpp`):
@@ -572,19 +394,23 @@ tracks in that format.
    - Scale is set so the first keyframe's median depth is 1.
 2. *Tracking.* Each frame gets a robust pose-only Levenberg–Marquardt solve
    (Huber, 3 px) on tracks that have landmarks. It starts from a
-   constant-velocity prediction, falling back to constant position. Too few
-   inliers means lost: a new segment starts and reinitializes. Rotations are
+   constant-velocity prediction, falling back to constant position; when
+   neither keeps half the correspondences, P3P RANSAC (4 px) re-estimates
+   the pose from the same correspondences. Too few inliers after that means
+   lost: a new segment starts and reinitializes. Rotations are
    re-projected onto SO(3) after every composition. Without that, the
    prediction `A·B⁻¹·A` (with Rᵀ as inverse) amplified round-off shear
    about 2.4× per frame, which `exp(ω)·R` can never remove. This was a real
    bug found by the noise-free regression test.
 3. *Keyframes* (6–20 frames apart; earlier if inliers fall below 75% of the
-   last keyframe's landmarks):
+   last keyframe's landmarks; an emergency keyframe, ignoring the minimum
+   interval, when they fall below 40%, so the map refills in fast motion
+   before tracking is lost):
    - Add inlier observations.
    - Discard landmarks of live tracks that became outliers. They are almost
      always short-baseline depths, and they are re-triangulated.
-   - Triangulate tracks from the oldest window keyframe that saw them, with
-     ≥ 0.5° parallax and ≤ 3 px error in both views.
+   - Triangulate tracks from the oldest window keyframe that saw them (the
+     widest pair), with ≥ 0.5° parallax and ≤ 3 px error in both views.
    - Run a sliding-window bundle adjustment over the last 8 keyframes: Schur
      complement, Levenberg–Marquardt, Huber loss; the two oldest keyframes
      are fixed to hold the gauge and scale.
@@ -639,9 +465,8 @@ by *Trajectory* in the Pipeline panel) shows:
 - state, inliers, map size, keyframes and timing;
 - the current segment's path (keyframes as squares), the current camera
   frustum and the active map points;
-- live, held (dormant / lost segment) and retired map points, coloured plain,
-  by image colour or by depth confidence (`CONFIDENCE_DESIGN.md`, with a
-  minimum-confidence filter), a grid on the
+- active and retired map points (retired optionally dimmed), coloured plain
+  or by image colour, a grid on the
   X–Z plane at the first keyframe's height (monocular VO knows no floor);
   points are solid, unlit (constant-colour) icosahedrons drawn by `PointCloudRenderer`
   (`src/point_cloud_renderer.cpp`): one instanced GL draw per set into a 4×
@@ -672,9 +497,10 @@ headlessly for inspection.
 - Rolling shutter and moving people are only handled by the robust losses.
 - Keyframe mapping runs on the UI thread. It could move to a worker thread,
   and PnP/RANSAC could use the GPU-resident tracks.
-- Descriptors (already cached per SuperPoint observation) are the route to
-  relocalization, loop closure and re-association; see "Start here" for
-  the plumbing.
+- Descriptors (cached per SuperPoint observation; the tracker also fills
+  `FrameFeatures::track_descriptors` per track) are the route to
+  relocalization, loop closure and re-association. `TrackedFrame` carries
+  none today.
 - No re-association after occlusion: a returning point is a new track and a
   duplicate landmark.
 

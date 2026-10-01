@@ -29,7 +29,6 @@ FetchContent_MakeAvailable(eigen)
 add_library(slam-native-vo STATIC
   src/visual_odometry.cpp
   src/vo_geometry.cpp
-  src/pose_graph.cpp
   src/track_io.cpp
   src/focal_estimation.cpp
 )
@@ -42,17 +41,9 @@ target_compile_options(slam-native-vo PRIVATE -Wall -Wextra -Wpedantic)
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   target_compile_options(slam-native-vo PRIVATE -O2)
 endif()
-add_executable(slam-native-vo-tracks src/vo_tracks_main.cpp)
-target_link_libraries(slam-native-vo-tracks PRIVATE slam-native-vo)
-target_compile_options(slam-native-vo-tracks PRIVATE -Wall -Wextra -Wpedantic)
 add_executable(slam-native-focal src/focal_main.cpp)
 target_link_libraries(slam-native-focal PRIVATE slam-native-vo)
 target_compile_options(slam-native-focal PRIVATE -Wall -Wextra -Wpedantic)
-add_executable(slam-native-two-view src/two_view_main.cpp)
-target_link_libraries(slam-native-two-view PRIVATE slam-native-vo)
-target_include_directories(slam-native-two-view PRIVATE src)
-target_include_directories(slam-native-two-view SYSTEM PRIVATE ${eigen_SOURCE_DIR})
-target_compile_options(slam-native-two-view PRIVATE -Wall -Wextra -Wpedantic -O2)
 
 add_library(slam-native-recents STATIC src/recent_sessions.cpp)
 target_include_directories(slam-native-recents PUBLIC include)
@@ -81,21 +72,6 @@ if(BUILD_TESTING)
   target_link_libraries(slam-native-recents-test PRIVATE slam-native-recents)
   target_compile_options(slam-native-recents-test PRIVATE -Wall -Wextra -Wpedantic)
   add_test(NAME native_recent_sessions COMMAND slam-native-recents-test)
-  add_executable(slam-native-depth-confidence-test tests/test_depth_confidence.cpp src/depth_confidence.cpp)
-  target_include_directories(slam-native-depth-confidence-test PRIVATE include)
-  target_compile_options(slam-native-depth-confidence-test PRIVATE -Wall -Wextra -Wpedantic)
-  add_test(NAME native_depth_confidence COMMAND slam-native-depth-confidence-test)
-  add_executable(slam-native-depth-filter-test tests/test_depth_filter.cpp src/depth_filter.cpp src/depth_confidence.cpp)
-  target_link_libraries(slam-native-depth-filter-test PRIVATE slam-native-vo)
-  target_compile_options(slam-native-depth-filter-test PRIVATE -Wall -Wextra -Wpedantic -O2)
-  add_test(NAME native_depth_filter COMMAND slam-native-depth-filter-test)
-  add_executable(slam-native-diagnostics-test
-    tests/test_descriptor_projection.cpp
-    src/descriptor_projection.cpp
-  )
-  target_include_directories(slam-native-diagnostics-test PRIVATE include)
-  target_compile_options(slam-native-diagnostics-test PRIVATE -Wall -Wextra -Wpedantic)
-  add_test(NAME native_descriptor_projection COMMAND slam-native-diagnostics-test)
 endif()
 
 if(SLAM_NATIVE_BUILD_APP)
@@ -133,14 +109,11 @@ if(SLAM_NATIVE_BUILD_APP)
   )
   FetchContent_MakeAvailable(imgui)
 
-  # The depth filter runs per pixel on the CPU in the app: optimised even in Debug builds.
-  set_source_files_properties(src/depth_filter.cpp PROPERTIES COMPILE_OPTIONS "-O2")
   add_executable(slam-native-workbench
     src/main.cpp
     src/app.cpp
     src/launcher.cpp
     src/video_thumbnail.cpp
-    src/descriptor_projection.cpp
     src/ffmpeg_cuda_decoder.cpp
     src/tensorrt_superpoint.cu
     src/online_tracker.cu
@@ -151,11 +124,6 @@ if(SLAM_NATIVE_BUILD_APP)
     src/point_cloud_renderer.cpp
     src/fov_view.cpp
     src/color_sampler.cu
-    src/depth_estimator.cu
-    src/depth_sampling.cpp
-    src/keyframe_depth.cpp
-    src/depth_confidence.cpp
-    src/depth_filter.cpp
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
@@ -213,13 +181,6 @@ if(SLAM_NATIVE_BUILD_APP)
     add_executable(slam-native-gpu-tracker-test tests/test_flow_tracker.cpp src/flow_association.cu)
     target_link_libraries(slam-native-gpu-tracker-test PRIVATE slam-native-store CUDA::cudart)
     add_test(NAME native_gpu_flow_tracker COMMAND slam-native-gpu-tracker-test)
-    # Depth sampling and keyframe clouds on synthetic maps (no engine or video needed).
-    add_executable(slam-native-depth-test tests/test_depth.cpp src/depth_estimator.cu src/depth_sampling.cpp
-      src/keyframe_depth.cpp src/depth_confidence.cpp)
-    target_include_directories(slam-native-depth-test PRIVATE include ${TENSORRT_INCLUDE_DIR})
-    target_link_libraries(slam-native-depth-test PRIVATE slam-native-vo CUDA::cudart ${TENSORRT_LIBRARY}
-      ${CMAKE_DL_LIBS})
-    add_test(NAME native_depth COMMAND slam-native-depth-test)
     add_executable(slam-native-display-test
       tests/test_display.cpp
       src/ffmpeg_cuda_decoder.cpp
@@ -245,12 +206,7 @@ if(SLAM_NATIVE_BUILD_APP)
       src/optical_flow.cu
       src/flow_association.cu
       src/color_sampler.cu
-      src/depth_estimator.cu
-      src/depth_sampling.cpp
-      src/keyframe_depth.cpp
-      src/depth_confidence.cpp
-      src/depth_filter.cpp
-    )
+              )
     target_include_directories(slam-native-tracking-bench PRIVATE include third_party/nvof ${TENSORRT_INCLUDE_DIR})
     target_link_libraries(slam-native-tracking-bench PRIVATE slam-native-store slam-native-vo PkgConfig::FFMPEG
       CUDA::cudart CUDA::cuda_driver ${TENSORRT_LIBRARY} ${CMAKE_DL_LIBS})

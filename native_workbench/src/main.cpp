@@ -30,8 +30,6 @@ void usage() {
          "  --video PATH              source video\n"
          "  --engine PATH             TensorRT SuperPoint engine (default: models/superpoint-1024x576-k2048.engine)\n"
          "  --db PATH                 use this point cache instead of the automatic one\n"
-         "  --depth-model NAME        live depth: 'Depth Anything V2-S (indoor)' (default),\n"
-         "                            'Depth Anything V2-S (outdoor)', 'Metric3D v2 ViT-S' or off\n"
          "  --input-width N           TensorRT input width (default: 1024)\n"
          "  --input-height N          TensorRT input height (default: 576)\n"
          "  --max-keypoints N         fixed engine output count (default: 2048)\n"
@@ -69,9 +67,6 @@ int main(int argc, char** argv) {
         has_video = true;
       } else if (option == "--engine") {
         config.engine = value();
-      } else if (option == "--depth-model") {
-        config.depth_model = value();
-        if (config.depth_model == "off") config.depth_model.clear();
       } else if (option == "--db") {
         config.database = value();
       } else if (option == "--input-width") {

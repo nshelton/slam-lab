@@ -65,26 +65,12 @@ double parallax(const SE3& T1, const SE3& T2, const Vec3& X);
 
 // Robust (Huber, pixels) pose-only optimization. `inliers` marks observations
 // with reprojection error below `inlier_threshold` pixels after optimization.
-// Each residual is weighted by 1 / sigma^2 (sigma: pixel noise of u); the
-// Huber knee and the inlier test stay in pixels. sigma = 1 everywhere is the
-// unweighted problem, bit for bit.
-// landmark_covariance (px^2): X's own uncertainty projected into the image.
-// When set, the residual is measured as a Mahalanobis distance in sigma-pixels,
-// d^2 = e^T M e with M = sigma^2 (sigma^2 I + C)^-1, and d replaces |e| in the
-// weight, the Huber knee and the inlier test: error along the direction in
-// which the landmark is uncertain is neither penalised nor rejected, while
-// error across it still is. Zero (default): M = I, the code above exactly.
 struct PoseObservation {
   Vec3 X;
   Vec2 u;
-  double sigma{1};
-  Eigen::Matrix2d landmark_covariance{Eigen::Matrix2d::Zero()};
 };
-// pixel_gate: classify inliers by the plain pixel error |e| even for
-// observations with a landmark covariance (which then only shapes weights).
 int optimize_pose(const Intrinsics& K, const std::vector<PoseObservation>& observations, SE3& pose,
-                  double inlier_threshold, std::vector<char>& inliers, int iterations = 10,
-                  bool pixel_gate = false);
+                  double inlier_threshold, std::vector<char>& inliers, int iterations = 10);
 
 // Perspective-three-point (Grunert's quartic). `bearings` are unit rays in the
 // camera frame towards the world points X. Returns up to four candidate
@@ -101,7 +87,6 @@ struct BundleObservation {
   int camera;
   int point;
   Vec2 u;
-  double sigma{1};  // pixel noise of u: weight 1 / sigma^2, as in optimize_pose
 };
 struct BundleProblem {
   std::vector<SE3> cameras;
@@ -115,19 +100,4 @@ struct BundleReport {
 };
 BundleReport bundle_adjust(const Intrinsics& K, BundleProblem& problem, int iterations, double huber_px);
 
-// Uncertainty: Gauss-Newton information sum J^T J / sigma^2. Diagnostics
-// only: no solver uses them.
-// Information of a 3D point from its observations with the cameras held fixed.
-// Its inverse is the point covariance (world^2 per px^2), which ignores camera
-// uncertainty and so is optimistic, but ranks points correctly.
-struct PointView {
-  SE3 camera;
-  Vec2 u;
-  double sigma{1};
-};
-Mat3 point_information(const Intrinsics& K, const Vec3& X, const std::vector<PointView>& views);
-// Information of a pose (left perturbation delta = (omega, v), see perturb)
-// from the observations marked in `inliers` (all when empty).
-Eigen::Matrix<double, 6, 6> pose_information(const Intrinsics& K, const std::vector<PoseObservation>& observations,
-                                             const SE3& pose, const std::vector<char>& inliers);
 }  // namespace slam_native::vo

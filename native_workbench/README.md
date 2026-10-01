@@ -60,7 +60,9 @@ segment starts with its own scale. Seeking resets the trajectory.
 - `--intrinsics FX FY CX CY`: known intrinsics in source-video pixels.
 
 The solver is independent of the tracker. To get poses from other tracks,
-write them as CSV and run the headless tool:
+build `TrackedFrame`s (track ID and pixel per observation; only real
+observations, no predicted positions) and call `VisualOdometry::process()`.
+`read_tracks_csv` in `track_io.hpp` loads tracks written as CSV:
 
 ```text
 # size 1920 1080
@@ -69,18 +71,14 @@ frame_index,timestamp_ns,track_id,x,y
 ...
 ```
 
-```bash
-native_workbench/build/app-debug/slam-native-vo-tracks --tracks tracks.csv \
-  --output trajectory.csv [--hfov 60 | --intrinsics FX FY CX CY] [--verbose]
-```
-
-The output CSV has one row per posed frame: `frame_index`, `timestamp_ns`,
-`segment`, `keyframe`, the camera centre (`cx,cy,cz`) and the
-camera-to-world quaternion (`qw,qx,qy,qz`). In C++, build `TrackedFrame`s
-and call `VisualOdometry::process()` directly. To export the native tracks,
-use `slam-native-tracking-bench VIDEO ENGINE START FRAMES export-tracks
-tracks.csv export-trajectory trajectory.csv [export-map map.csv]
-[hfov DEG] [k1 K1]`. See
+Headless, `slam-native-tracking-bench VIDEO ENGINE START FRAMES
+export-tracks tracks.csv export-trajectory trajectory.csv
+[export-map map.csv] [hfov DEG] [k1 K1]` runs the whole pipeline and writes
+the tracks, poses and map. The trajectory CSV has one row per posed frame:
+`frame_index`, `timestamp_ns`, `segment`, `keyframe`, the camera centre
+(`cx,cy,cz`) and the camera-to-world quaternion (`qw,qx,qy,qz`). VO options
+on the bench: `hfov`, `k1`, `fx fy cx cy` (all four), `kf-min`, `kf-max`,
+`kf-emergency-ratio` and `window`. See
 [ARCHITECTURE.md](ARCHITECTURE.md#camera-pose-live-monocular-visual-odometry--2026-09-24)
 for the algorithm, measurements and limitations.
 
@@ -91,26 +89,14 @@ are retired when tracking is lost. Each landmark stores the mean image colour
 of its keyframe observations (sampled on the GPU with a 3×3 mean), its track
 ID, and its first and last frames. The trajectory view draws retired points
 dimmer than active ones, optionally in their image colour.
-`slam-native-vo-tracks --map map.csv` and the bench's `export-map` write the
-map as CSV (format in `track_io.hpp`). Track exports now carry optional
-`r,g,b` columns.
+The bench's `export-map` writes the map as CSV (format in `track_io.hpp`).
+Track exports carry optional `r,g,b` columns.
 
 SuperPoint descriptors are not stored per landmark. The feature cache keeps
 every raw detection and its descriptor per frame. A supported track point
 sits exactly on the detection it snapped to, so a landmark's descriptors can
 be recovered from its track ID, the track export (frame and pixel of each
 observation) and the cache.
-
-To debug the geometry on a single frame pair, run the VO's own two-view
-code (essential matrix, decomposition, triangulation) on exported tracks.
-The tool prints every intermediate result, and `--sweep-hfov` repeats the
-fit for a range of focal-length guesses:
-
-```text
-native_workbench/build/app-debug/slam-native-two-view --tracks tracks.csv \
-  --a 1200 --b 1230 [--hfov 60] [--sweep-hfov] [--points pair.csv]
-.venv-cuda/bin/python native_workbench/tools/plot_two_view.py pair.csv VIDEO pair.png
-```
 
 ### Lens: field of view and distortion
 
@@ -135,8 +121,8 @@ the current frame with the undistorted tracks; **Restart** replays the clip.
 Evidence survives seeks. Square pixels and a centred principal point are
 assumed. The FOV is defined by the central focal length.
 
-The pose also takes `--hfov` and `--k1` on the command line (the workbench,
-`slam-native-vo-tracks` and `slam-native-two-view`). Headless estimate on
+The workbench also takes `--hfov` and `--k1` on the command line (the bench:
+`hfov`, `k1`). Headless estimate on
 exported tracks: `slam-native-focal tracks.csv [FIRST] [LAST]`. On
 `disney_04`: 87.9° with k1 = −0.054 (84.5° if k1 is forced to 0); the k1
 curve is shallow, so the lens is close to undistorted. Synthetic checks
@@ -179,7 +165,7 @@ The run script:
 - Runs ORB-SLAM3 without its viewer.
 - Saves `orbslam3-live.csv` (per-frame tracked poses) and
   `orbslam3-final.csv` (largest map after bundle adjustment and loop closure)
-  in the same trajectory CSV format as `slam-native-vo-tracks`, plus
+  in the workbench's trajectory CSV format (`track_io.hpp`), plus
   ORB-SLAM3's own EuRoC-format files.
 
 First Osaka runs (30 s clips at 640×360):
@@ -285,13 +271,6 @@ trtexec --onnx=native_workbench/models/superpoint-1024x576-k2048.onnx \
   --saveEngine=native_workbench/models/superpoint-1024x576-k2048.engine --skipInference
 ```
 
-Live depth (the **Depth** window; `--depth-model NAME|off`) needs its own
-engines. `tools/build_depth_engines.sh` (VS Code task **Native: build depth
-engines**) downloads the Depth Anything V2-S metric checkpoints and the
-Metric3D v2 ViT-S ONNX, then exports and builds landscape and portrait
-engines into `models/`. Its design is described in ARCHITECTURE.md, "Live
-metric depth".
-
 Development dependencies: CMake, C++20, CUDA, TensorRT, FFmpeg, SQLite, GLFW,
 and OpenGL. CMake fetches pinned Dear ImGui and Eigen 3.4 (header-only). The reviewed Ubuntu installer is
 `tools/install_ubuntu2604_system.sh`. Workspace VS Code tasks and CMake presets
@@ -331,4 +310,15 @@ repeatability. For headless tracking metrics on real video:
 ```bash
 native_workbench/build/app-debug/slam-native-tracking-bench \
   /path/to/video.mp4 native_workbench/models/superpoint-1024x576-k2048.engine 120 600
+```
+
+To snapshot a version of the whole pipeline, `tools/baseline.py` runs the
+bench from frame 0 over every TUM sequence and the dreamworks clip. It writes
+`trajectory.csv` and `run.log` per sequence, `summary.csv` (`tum_eval`
+metrics) and `manifest.json` (commit, binary, command lines) into OUT; two
+snapshots compare versions:
+
+```bash
+.venv-cuda/bin/python native_workbench/tools/baseline.py OUT --build native_workbench/build/app-release \
+  [--only SUBSTRING] [--set KEY VALUE ...]
 ```
