@@ -1,7 +1,10 @@
 # Every-frame spline bundle adjustment: design and milestones
 
-Status 2026-10-02: proposal. Nothing here is implemented. The numeric gates
-are first proposals and are meant to be argued with before milestone 0 starts.
+Status 2026-10-02: proposal; milestone 0's metric and bench option are
+implemented (`tools/landmark_depth_vs_gt.py`, bench keys `export-landmarks`
+and `resolve-landmarks`, `tools/baseline.py --landmarks`,
+`include/slam_native/landmark_depth.hpp`), the measurement itself is pending.
+The numeric gates are first proposals and are meant to be argued with.
 
 Keep every frame's landmark observations, model the camera trajectory as a
 spline whose control points are the unknowns, and refine the map with bundle

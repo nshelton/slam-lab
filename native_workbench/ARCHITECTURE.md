@@ -374,11 +374,23 @@ ORB-SLAM3 is the independent reference (`scripts/run_orbslam3.sh`); on
   `kf-min`, `kf-max`, `kf-emergency-ratio`, `window`, `place-interval`,
   `place-ratio`, `place-inliers`, `place-sync`, `place-correct`, `export-map`,
   `export-features PATH` (raw detections + descriptors in the feature-cache
-  format).
+  format), `export-landmarks PATH` and `resolve-landmarks 1` (SPLINE_BA.md
+  milestone 0: one row per (landmark, keyframe) sighting with the landmark's
+  depth in that keyframe; with `resolve-landmarks 1` every frame's
+  observations are kept and, poses fixed at their final values, each landmark
+  is re-solved from 2, 4, 8 and all of them, fused positions and raw
+  detections, as extra depth columns; `tools/landmark_depth_vs_gt.py` scores
+  the file against TUM depth images and `tools/baseline.py --landmarks`
+  exports it per run. `FrameFeatures::track_detections` gives the raw
+  detection behind each track; `VisualOdometry::landmark_merges()` follows
+  landmarks through merges. `include/slam_native/landmark_depth.hpp`.)
 - Tracks CSV: `frame_index,timestamp_ns,track_id,x,y[,r,g,b]`. Map CSV:
   `track_id,segment,x,y,z,r,g,b,has_color,keyframe_observations,first_frame,last_frame,local,landmark_id`
   (`track_io.hpp`).
-- CTest: `native_focal_estimation` (synthetic FOV/k1 recovery, background
+- CTest: `native_landmark_depth` (fixed-pose re-solve: exact without noise,
+  all frames beat the two ends, Huber absorbs an outlier; attribution of
+  observations through merges and deletions; the export on a noise-free walk
+  through the VO), `native_focal_estimation` (synthetic FOV/k1 recovery, background
   worker parity), map + colour check, segment resume without a pose prior
   (on the calling thread and on the worker), segment merge, re-association
   outside the local map and P3P checks (exact

@@ -33,6 +33,7 @@ add_library(slam-native-vo STATIC
   src/pose_graph.cpp
   src/track_io.cpp
   src/focal_estimation.cpp
+  src/landmark_depth.cpp
 )
 find_package(Threads REQUIRED)
 target_include_directories(slam-native-vo PUBLIC include PRIVATE src)
@@ -81,6 +82,11 @@ if(BUILD_TESTING)
     target_compile_options(slam-native-vo-test PRIVATE -O2)
   endif()
   add_test(NAME native_visual_odometry COMMAND slam-native-vo-test)
+  add_executable(slam-native-landmark-depth-test tests/test_landmark_depth.cpp)
+  target_link_libraries(slam-native-landmark-depth-test PRIVATE slam-native-vo)
+  target_include_directories(slam-native-landmark-depth-test SYSTEM PRIVATE ${eigen_SOURCE_DIR})
+  target_compile_options(slam-native-landmark-depth-test PRIVATE -Wall -Wextra -Wpedantic -O2)
+  add_test(NAME native_landmark_depth COMMAND slam-native-landmark-depth-test)
   add_executable(slam-native-focal-test tests/test_focal_estimation.cpp)
   target_link_libraries(slam-native-focal-test PRIVATE slam-native-vo)
   target_include_directories(slam-native-focal-test SYSTEM PRIVATE ${eigen_SOURCE_DIR})

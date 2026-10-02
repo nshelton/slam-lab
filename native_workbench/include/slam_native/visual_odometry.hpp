@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace slam_native {
@@ -313,6 +314,10 @@ class VisualOdometry {
   [[nodiscard]] std::size_t map_size() const;
   // The keyframes that observe each landmark of map(), by landmark id, then frame.
   [[nodiscard]] std::vector<LandmarkObservation> landmark_observations() const;
+  // Every landmark merge of the run so far, (absorbed id, surviving id), in
+  // order. Landmark ids are never reused, so following the pairs maps any id a
+  // landmark ever had to the one it has now (or to none, when it was deleted).
+  [[nodiscard]] const std::vector<std::pair<std::uint64_t, std::uint64_t>>& landmark_merges() const;
   // Track IDs that currently have a 3D landmark (for display).
   [[nodiscard]] bool has_landmark(std::uint64_t track_id) const;
   // Those tracks with their landmarks, by track id (a few hundred: cheaper

@@ -203,6 +203,9 @@ struct VisualOdometry::Impl {
   // the landmark is local: a track missing from a frame may resume.
   std::unordered_map<std::uint64_t, std::uint64_t> track_landmark;
   std::uint64_t next_landmark_id{};
+  // Every merge of the run, (absorbed, kept), in order: measurement tools
+  // that keep per-landmark records follow landmarks through merges with it.
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> merges;
   std::unordered_map<std::uint64_t, std::array<std::uint8_t, 3>> colors;  // this frame's, by track
   std::unordered_map<std::uint64_t, const float*> descriptors;            // this frame's, by track
   int descriptor_dimension{};
@@ -1292,6 +1295,7 @@ struct VisualOdometry::Impl {
   // Absorb landmark `absorbed` into `kept` (the same point): sightings of
   // keyframes both saw keep `kept`'s.
   void merge_landmarks(std::uint64_t kept, std::uint64_t absorbed) {
+    merges.emplace_back(absorbed, kept);
     auto node = landmarks.extract(absorbed);
     Landmark& gone = node.mapped();
     if (auto t = track_landmark.find(gone.track); t != track_landmark.end() && t->second == absorbed)
@@ -1814,6 +1818,9 @@ std::vector<LandmarkObservation> VisualOdometry::landmark_observations() const {
     return l.landmark_id != r.landmark_id ? l.landmark_id < r.landmark_id : l.frame_index < r.frame_index;
   });
   return observations;
+}
+const std::vector<std::pair<std::uint64_t, std::uint64_t>>& VisualOdometry::landmark_merges() const {
+  return impl_->merges;
 }
 bool VisualOdometry::has_landmark(std::uint64_t track_id) const { return impl_->track_landmark.count(track_id) > 0; }
 std::vector<TrackedLandmark> VisualOdometry::tracked_landmarks() const {

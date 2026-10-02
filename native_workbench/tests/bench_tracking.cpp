@@ -4,6 +4,7 @@
 #include "slam_native/color_sampler.hpp"
 #include "slam_native/feature_store.hpp"
 #include "slam_native/flow_tracker.hpp"
+#include "slam_native/landmark_depth.hpp"
 #include "slam_native/optical_flow.hpp"
 #include "slam_native/superpoint.hpp"
 #include "slam_native/track_io.hpp"
@@ -15,6 +16,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -46,7 +48,8 @@ int main(int argc, char** argv) {
     SuperPointConfig sp_config;
     VisualOdometryConfig vo_config;
     vo_config.place_synchronous = true;  // deterministic runs; "place-sync 0" uses the worker thread
-    std::string export_tracks, export_trajectory, export_map, export_features;
+    std::string export_tracks, export_trajectory, export_map, export_features, export_landmarks;
+    bool resolve_landmarks = false;
     int skip = 0;  // frames decoded and dropped first (frame-exact, unlike a seek); indices count them
     for (int a = 5; a + 1 < argc; a += 2) {
       const std::string key = argv[a];
@@ -55,8 +58,16 @@ int main(int argc, char** argv) {
       if (key == "export-map") { export_map = argv[a + 1]; continue; }
       // Raw SuperPoint detections + descriptors (f16), in the app's feature-cache format.
       if (key == "export-features") { export_features = argv[a + 1]; continue; }
+      // Landmark depth export (SPLINE_BA.md milestone 0): one row per (landmark,
+      // keyframe) sighting with the landmark's depth in that keyframe, scored
+      // against TUM depth by tools/landmark_depth_vs_gt.py.
+      if (key == "export-landmarks") { export_landmarks = argv[a + 1]; continue; }
       const float value = std::stof(argv[a + 1]);
       if (key == "skip") skip = static_cast<int>(value);
+      // With export-landmarks: every frame's observations are kept and, poses
+      // fixed at their final values, each landmark is re-solved from 2, 4, 8 and
+      // all of them (fused positions and raw detections), as extra depth columns.
+      else if (key == "resolve-landmarks") resolve_landmarks = value != 0;
       else if (key == "hfov") vo_config.horizontal_fov_degrees = value;
       else if (key == "k1") vo_config.distortion_k1 = value;
       else if (key == "fx" || key == "fy" || key == "cx" || key == "cy") {  // full intrinsics (all four)
@@ -106,6 +117,9 @@ int main(int argc, char** argv) {
     }
     std::ofstream tracks_out;
     if (!export_tracks.empty()) tracks_out.open(export_tracks);
+    std::optional<LandmarkObservationLog> landmark_log;
+    if (!export_landmarks.empty()) landmark_log.emplace();
+    std::vector<Keypoint> raw_detections;  // this frame's detections before tracking
     bool tracks_header = false;
 
     int vo_posed = 0, vo_keyframes = 0, vo_losses = 0, vo_reassociated = 0, vo_merged = 0, vo_coasted = 0,
@@ -139,6 +153,7 @@ int main(int argc, char** argv) {
       const DeviceDetections device = superpoint->device_detections();
       detections += features.keypoints.size();
       if (feature_store) feature_store->enqueue(features);
+      if (landmark_log) raw_detections = features.keypoints;
       tracker.associate(features, device_field ? &*device_field : nullptr, &device);
       const auto tracked = tracked_frame_from(features, color_sampler.sample(image, features.keypoints));
       if (tracks_out) {
@@ -146,6 +161,24 @@ int main(int argc, char** argv) {
         write_tracks(tracks_out, tracked, true);
       }
       const auto pose = odometry.process(tracked);
+      if (landmark_log) {
+        // The raw supporting detection of each supported track, aligned with
+        // tracked.observations (the same filter as tracked_frame_from).
+        std::vector<std::array<float, 2>> raw;
+        raw.reserve(tracked.observations.size());
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        const std::size_t count = std::min(features.keypoints.size(), features.landmark_ids.size());
+        for (std::size_t k = 0; k < count; ++k) {
+          if (k < features.superpoint_supported.size() && !features.superpoint_supported[k]) continue;
+          const int d = k < features.track_detections.size() ? features.track_detections[k] : -1;
+          if (d >= 0 && static_cast<std::size_t>(d) < raw_detections.size())
+            raw.push_back({raw_detections[static_cast<std::size_t>(d)].x, raw_detections[static_cast<std::size_t>(d)].y});
+          else
+            raw.push_back({nan, nan});
+        }
+        if (raw.size() != tracked.observations.size()) throw std::logic_error("raw detections misaligned with tracks");
+        landmark_log->record(tracked, raw, odometry);
+      }
       vo_posed += pose.has_pose;
       vo_keyframes += pose.keyframe;
       vo_losses += pose.state == OdometryState::lost;
@@ -258,6 +291,16 @@ int main(int argc, char** argv) {
     if (!export_trajectory.empty()) {
       std::ofstream out(export_trajectory);
       write_trajectory_csv(out, odometry.trajectory());
+    }
+    if (landmark_log) {
+      const auto t0 = std::chrono::steady_clock::now();
+      std::ofstream out(export_landmarks);
+      write_landmark_depth_csv(out, odometry, *landmark_log,
+                               resolve_landmarks ? std::vector<std::size_t>{2, 4, 8, 0} : std::vector<std::size_t>{});
+      std::printf("landmark depth export: %zu observations logged, %s, %.1f s\n", landmark_log->size(),
+                  resolve_landmarks ? "landmarks re-solved from 2, 4, 8 and all observations with poses fixed"
+                                    : "keyframes-only depths",
+                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
     std::printf("mean coasted tracks/frame=%.1f\n", double(coasted) / processed);
     std::printf("ms/frame: superpoint=%.2f flow_gpu=%.2f tracking_wall=%.2f (incl. flow wait) tracking_gpu=%.3f\n",

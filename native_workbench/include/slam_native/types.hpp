@@ -75,6 +75,11 @@ struct FrameFeatures {
   // Kalman posterior. Empty when the tracker has no noise model.
   std::vector<float> track_sigmas_px;
   std::vector<bool> superpoint_supported;
+  // Index into this frame's raw detections (the keypoints handed to the
+  // tracker, before tracking) of the detection supporting each track; -1 when
+  // coasted. Fused track positions are not detections (see ARCHITECTURE.md):
+  // this is how the raw observation of a track is found. Filled by FlowTracker.
+  std::vector<int> track_detections;
   std::vector<Keypoint> flow_predictions;
   std::vector<float> correction_distances;
   // After tracking, when the detections' descriptors were on the host: the
