@@ -15,6 +15,9 @@ only differences larger than the spread are real. Writes
 
   .venv-cuda/bin/python native_workbench/tools/baseline.py OUT --build BUILD_DIR [--only SUBSTRING] [--skips 0,150,300]
       [--set KEY VALUE ...]   (extra bench options, e.g. --set window 10)
+      [--landmarks]           (also write landmarks[-from-N].csv per run: the landmark depth
+                               export with every landmark re-solved from 2, 4, 8 and all
+                               observations, poses fixed; score it with landmark_depth_vs_gt.py)
 """
 
 from __future__ import annotations
@@ -64,6 +67,8 @@ def main() -> int:
     parser.add_argument("--only", default="", help="run sequences whose name contains this")
     parser.add_argument("--skips", default="0", help="start frames, e.g. 0,150,300")
     parser.add_argument("--set", nargs=2, action="append", default=[], metavar=("KEY", "VALUE"))
+    parser.add_argument("--landmarks", action="store_true",
+                        help="export-landmarks + resolve-landmarks 1 per run (trajectories are unaffected)")
     args = parser.parse_args()
     bench = args.build / "slam-native-tracking-bench"
     extra = [x for kv in args.set for x in kv]
@@ -99,6 +104,8 @@ def main() -> int:
             trajectory = out / f"trajectory{suffix}.csv"
             command = [str(bench), str(video), str(ENGINE), "0", "1000000", *intrinsics, *extra,
                        *(["skip", str(skip)] if skip else []), "export-trajectory", str(trajectory)]
+            if args.landmarks:
+                command += ["export-landmarks", str(out / f"landmarks{suffix}.csv"), "resolve-landmarks", "1"]
             # The bench writes the trajectory only when it finishes: an existing one is a complete run.
             if trajectory.exists() and (dataset, name, skip) in previous:
                 run = previous[(dataset, name, skip)]

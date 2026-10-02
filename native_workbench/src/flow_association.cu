@@ -637,6 +637,7 @@ void FlowTracker::associate(FrameFeatures& frame, const DeviceFlowField* flow,
   frame.landmark_updates.clear();
   frame.track_sigmas_px.clear();
   frame.superpoint_supported.clear();
+  frame.track_detections.clear();
   frame.flow_predictions.clear();
   frame.correction_distances.clear();
   frame.matched_landmarks = static_cast<std::uint32_t>(counts.matched);
@@ -650,6 +651,7 @@ void FlowTracker::associate(FrameFeatures& frame, const DeviceFlowField* flow,
     frame.landmark_ids.push_back(record.id);
     frame.landmark_similarities.push_back(record.similarity);
     frame.superpoint_supported.push_back(record.kind != kCoasted);
+    frame.track_detections.push_back(record.detection);
     frame.flow_predictions.push_back(record.kind == kNew ? Keypoint{nan, nan, 0} :
         Keypoint{record.prediction_x, record.prediction_y, 0});
     frame.correction_distances.push_back(record.correction);
